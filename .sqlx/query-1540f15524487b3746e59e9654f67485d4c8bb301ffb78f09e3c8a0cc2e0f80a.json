@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO contacts (followee, follower, updated_at)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (followee, follower) DO UPDATE SET updated_at = $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1540f15524487b3746e59e9654f67485d4c8bb301ffb78f09e3c8a0cc2e0f80a"
+}

@@ -1,0 +1,59 @@
+# A compose file to ease local development
+services:
+  server:
+    build:
+      context: .
+      target: final
+    ports:
+      - 8000:8000
+    environment:
+      - APP__PG_DBNAME=followers
+      - APP__PG_HOST=db
+      - APP__PG_USER=postgres
+      - APP__PG_PASSWORD=mydevpassword
+      - RUST_LOG=nos_followers=info
+    volumes:
+      - ./config:/app/config
+      - ./migrations:/app/migrations
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git/db
+      - build-cache:/app/target
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+
+  relay:
+    image: ghcr.io/planetary-social/nosrelay:latest
+    ports:
+      - "7777:7777"
+    logging:
+      driver: "none"
+
+  db:
+    image: postgres
+    restart: always
+    user: postgres
+    secrets:
+      - db-password
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=followers
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db-password
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD", "pg_isready" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+volumes:
+  db-data:
+  cargo-registry:
+  cargo-git:
+  build-cache:
+secrets:
+  db-password:
+    file: db/password.txt
+
