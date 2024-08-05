@@ -7,6 +7,11 @@ Then you can `psql "postgres://postgres:mydevpassword@localhost:5432/followers"`
 The DB will be created if not present and any pending migration will be run each time the server starts
 The local relay will be available at `ws://localhost:7777`
 
+Once the server is running, an easy way to test is using nak with kind 3 events that add different npubs to the list:
+```
+nak event -k 3 -t 'p=7286f8fc095cfa1de9b08afcf8adacdccf75e8c337a09407ec713c751202d894' -t 'p=7286f8fc095cfa1de9b08afcf8adacdccf75e8c337a09407ec713c751202d897' ws://localhost:7777
+```
+
 ## Contributing
 Contributions are welcome! Fork the project, submit pull requests, or report issues.
 
