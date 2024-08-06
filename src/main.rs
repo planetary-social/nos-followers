@@ -10,9 +10,10 @@ use anyhow::Result;
 use follows_differ::FollowChange;
 use follows_differ::FollowsDiffer;
 use nostr_sdk::prelude::*;
-use relay_subscriber::start_nostr_subscription;
+use relay_subscriber::{create_client, start_nostr_subscription};
 use repo::Repo;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -43,6 +44,8 @@ async fn main() -> Result<()> {
 
     let worker_tracker =
         WorkerPool::start(4, event_rx, cancellation_token.clone(), follows_differ)?;
+
+    let nostr_client = Arc::new(create_client());
 
     let follow_change_task = tokio::spawn(async move {
         while let Some(follow_change) = follow_change_rx.recv().await {
@@ -81,7 +84,14 @@ async fn main() -> Result<()> {
         .since(five_minutes_ago)
         .kind(Kind::ContactList)];
 
-    start_nostr_subscription(&[relay], filters, event_tx, cancellation_token.clone()).await?;
+    start_nostr_subscription(
+        nostr_client,
+        &[relay],
+        filters,
+        event_tx,
+        cancellation_token.clone(),
+    )
+    .await?;
     worker_tracker.wait().await;
     follow_change_task.await?;
 

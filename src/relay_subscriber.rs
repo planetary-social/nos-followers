@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use futures::future::join_all;
 use nostr_sdk::prelude::*;
 use signal::unix::{signal, SignalKind};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::mpsc::Sender;
@@ -9,12 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info};
 
-pub async fn start_nostr_subscription(
-    relays: &[String],
-    filters: Vec<Filter>,
-    event_tx: Sender<Box<Event>>,
-    cancellation_token: CancellationToken,
-) -> Result<()> {
+pub fn create_client() -> Client {
     let opts = Options::new()
         .skip_disconnected_relays(true)
         .wait_for_send(false)
@@ -22,8 +18,16 @@ pub async fn start_nostr_subscription(
         .send_timeout(Some(Duration::from_secs(5)))
         .wait_for_subscription(true);
 
-    let nostr_client = ClientBuilder::new().opts(opts).build();
+    ClientBuilder::new().opts(opts).build()
+}
 
+pub async fn start_nostr_subscription(
+    nostr_client: Arc<Client>,
+    relays: &[String],
+    filters: Vec<Filter>,
+    event_tx: Sender<Box<Event>>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
     for relay in relays {
         if let Err(e) = nostr_client.add_relay(relay).await {
             bail!("Failed to add relay: {}", e);
