@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use futures::future::join_all;
 use nostr_sdk::prelude::*;
+use signal::unix::{signal, SignalKind};
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::mpsc::Sender;
@@ -31,7 +32,7 @@ pub async fn start_nostr_subscription(
 
     let token_clone = cancellation_token.clone();
     tokio::spawn(async move {
-        if let Err(e) = listen_stop_signals(token_clone).await {
+        if let Err(e) = cancel_on_stop_signals(token_clone).await {
             error!("Failed to listen stop signals: {}", e);
         }
     });
@@ -85,13 +86,9 @@ async fn start_subscription(
                 return Ok(true);
             }
 
-            if let RelayPoolNotification::Event {
-                event: contacts_event,
-                ..
-            } = notification
-            {
-                debug!("Received event: {}", contacts_event.id);
-                event_tx.send(contacts_event).await?;
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                debug!("Received event: {}", event.id);
+                event_tx.send(event).await?;
             }
 
             // True would exit from the loop
@@ -103,10 +100,10 @@ async fn start_subscription(
 }
 
 // Listen to ctrl-c, terminate and cancellation token
-async fn listen_stop_signals(cancellation_token: CancellationToken) -> Result<()> {
+async fn cancel_on_stop_signals(cancellation_token: CancellationToken) -> Result<()> {
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
+        signal(SignalKind::terminate())
             .expect("Failed to install signal handler")
             .recv()
             .await;

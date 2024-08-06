@@ -1,14 +1,14 @@
 mod config;
-mod contacts_differ;
 mod domain;
+mod follows_differ;
 mod relay_subscriber;
 mod repo;
 mod worker_pool;
 
 use crate::config::Config;
 use anyhow::Result;
-use contacts_differ::ContactsDiffer;
-use contacts_differ::FollowChange;
+use follows_differ::FollowChange;
+use follows_differ::FollowsDiffer;
 use nostr_sdk::prelude::*;
 use relay_subscriber::start_nostr_subscription;
 use repo::Repo;
@@ -38,11 +38,11 @@ async fn main() -> Result<()> {
 
     let repo = Repo::new(db_pool.clone());
     let (follow_change_tx, mut follow_change_rx) = mpsc::channel::<FollowChange>(100);
-    let contacts_differ = ContactsDiffer::new(repo, follow_change_tx);
+    let follows_differ = FollowsDiffer::new(repo, follow_change_tx);
     let cancellation_token = CancellationToken::new();
 
     let worker_tracker =
-        WorkerPool::start(4, event_rx, cancellation_token.clone(), contacts_differ)?;
+        WorkerPool::start(4, event_rx, cancellation_token.clone(), follows_differ)?;
 
     let follow_change_task = tokio::spawn(async move {
         while let Some(follow_change) = follow_change_rx.recv().await {

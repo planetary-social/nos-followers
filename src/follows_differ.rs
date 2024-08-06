@@ -24,12 +24,12 @@ pub enum FollowChange {
     },
 }
 
-pub struct ContactsDiffer {
+pub struct FollowsDiffer {
     repo: Repo,
     diff_result_tx: Sender<FollowChange>,
 }
 
-impl ContactsDiffer {
+impl FollowsDiffer {
     pub fn new(repo: Repo, diff_result_tx: Sender<FollowChange>) -> Self {
         Self {
             repo,
@@ -38,12 +38,11 @@ impl ContactsDiffer {
     }
 }
 
-impl WorkerTask<Box<Event>> for ContactsDiffer {
+impl WorkerTask<Box<Event>> for FollowsDiffer {
     async fn call(&self, event: Box<Event>) {
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
-        let first_seen: bool;
         let follower = event.pubkey;
         let mut follows_diff: HashMap<PublicKey, FollowsDiff> = HashMap::new();
 
@@ -63,7 +62,7 @@ impl WorkerTask<Box<Event>> for ContactsDiffer {
             }
         }
 
-        first_seen = follows_diff.is_empty();
+        let first_seen = follows_diff.is_empty();
 
         // Populate new follows
         for tag in event.tags.iter() {
