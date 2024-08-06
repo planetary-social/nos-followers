@@ -2,7 +2,7 @@ use ::time::PrimitiveDateTime;
 use nostr_sdk::prelude::*;
 use sqlx::{postgres::PgRow, FromRow, Row};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Follow {
     pub followee: PublicKey,
     pub follower: PublicKey,

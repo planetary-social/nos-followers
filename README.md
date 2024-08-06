@@ -5,7 +5,11 @@ A server that listens to Nostr [Follow List](https://github.com/nostr-protocol/n
 The server, a nostr relay and a postgres db are created through `docker compose --build`.
 Then you can `psql "postgres://postgres:mydevpassword@localhost:5432/followers"` to explore the DB.
 The DB will be created if not present and any pending migration will be run each time the server starts
-The local relay will be available at `ws://localhost:7777`
+The local relay will be available at `ws://localhost:7777`, ensure that you have a `config/settings.development.yml` connected to the local relay:
+
+```
+relay: "ws://relay:7777"
+```
 
 Once the server is running, an easy way to test is using nak with kind 3 events that add different npubs to the list:
 ```

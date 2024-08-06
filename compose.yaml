@@ -27,8 +27,7 @@ services:
     image: ghcr.io/planetary-social/nosrelay:latest
     ports:
       - "7777:7777"
-    logging:
-      driver: "none"
+    attach: false
 
   db:
     image: postgres
@@ -48,6 +47,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    attach: false
+
 volumes:
   db-data:
   cargo-registry:

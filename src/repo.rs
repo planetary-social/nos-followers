@@ -16,7 +16,7 @@ impl Repo {
 
     pub async fn upsert_follow(
         &self,
-        follow: Follow,
+        follow: &Follow,
         maybe_tx: Option<Transaction<'static, Postgres>>,
     ) -> Result<()> {
         let mut tx = match maybe_tx {
@@ -54,8 +54,8 @@ impl Repo {
 
     pub async fn delete_follow(
         &self,
-        followee: PublicKey,
-        follower: PublicKey,
+        followee: &PublicKey,
+        follower: &PublicKey,
         maybe_tx: Option<Transaction<'static, Postgres>>,
     ) -> Result<()> {
         let mut tx = match maybe_tx {
@@ -85,7 +85,7 @@ impl Repo {
         Ok(())
     }
 
-    pub async fn get_follows(&self, follower: PublicKey) -> Result<Vec<Follow>> {
+    pub async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<Follow>> {
         let follower_hex = follower.to_hex();
         let follows = sqlx::query_as::<_, Follow>(
             r#"

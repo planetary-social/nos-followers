@@ -8,14 +8,14 @@ mod worker_pool;
 use crate::config::Config;
 use anyhow::Result;
 use contacts_differ::ContactsDiffer;
-use contacts_differ::{FollowChange, FollowChangeType};
+use contacts_differ::FollowChange;
 use nostr_sdk::prelude::*;
 use relay_subscriber::start_nostr_subscription;
 use repo::Repo;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use worker_pool::WorkerPool;
 
@@ -46,20 +46,28 @@ async fn main() -> Result<()> {
 
     let follow_change_task = tokio::spawn(async move {
         while let Some(follow_change) = follow_change_rx.recv().await {
-            match follow_change.follow_type {
-                FollowChangeType::Followed(at) => {
-                    info!(
+            match follow_change {
+                FollowChange::Followed {
+                    at,
+                    follower,
+                    followee,
+                } => {
+                    debug!(
                         "Followed: {} -> {} at {}",
-                        follow_change.follower,
-                        follow_change.followee,
+                        follower,
+                        followee,
                         at.to_human_datetime()
                     );
                 }
-                FollowChangeType::Unfollowed(at) => {
-                    info!(
+                FollowChange::Unfollowed {
+                    at,
+                    follower,
+                    followee,
+                } => {
+                    debug!(
                         "Unfollowed: {} -> {} at {}",
-                        follow_change.follower,
-                        follow_change.followee,
+                        follower,
+                        followee,
                         at.to_human_datetime()
                     )
                 }
