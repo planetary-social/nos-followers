@@ -76,7 +76,10 @@ async fn main() -> Result<()> {
     });
 
     let relay = config.get_by_key::<String>("relay")?;
-    let filters = vec![Filter::new().limit(0).kind(Kind::ContactList)];
+    let five_minutes_ago = Timestamp::now() - 60 * 5;
+    let filters = vec![Filter::new()
+        .since(five_minutes_ago)
+        .kind(Kind::ContactList)];
 
     start_nostr_subscription(&[relay], filters, event_tx, cancellation_token.clone()).await?;
     worker_tracker.wait().await;
