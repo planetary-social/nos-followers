@@ -7,11 +7,11 @@ services:
     ports:
       - 8000:8000
     environment:
-      - APP__PG_DBNAME=followers
-      - APP__PG_HOST=db
-      - APP__PG_USER=postgres
-      - APP__PG_PASSWORD=mydevpassword
+      - APP__NEO4J_URI=db:7687
+      - APP__NEO4J_USER=neo4j
+      - APP__NEO4J_PASSWORD=mydevpassword
       - RUST_LOG=nos_followers=info
+      - RUST_BACKTRACE=1
     volumes:
       - ./config:/app/config
       - ./migrations:/app/migrations
@@ -27,34 +27,36 @@ services:
     image: ghcr.io/planetary-social/nosrelay:latest
     ports:
       - "7777:7777"
-    attach: false
 
   db:
-    image: postgres
-    restart: always
-    user: postgres
-    secrets:
-      - db-password
-    volumes:
-      - db-data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_DB=followers
-      - POSTGRES_PASSWORD_FILE=/run/secrets/db-password
+    image: neo4j:latest
+    platform: linux/amd64
     ports:
-      - "5432:5432"
+      - 7474:7474
+      - 7687:7687
+    environment:
+      - NEO4J_AUTH=neo4j/mydevpassword
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+    volumes:
+      - db-data:/data
+      - db-logs:/logs
+      - db-import:/var/lib/neo4j/import
+      - db-plugins:/plugins
     healthcheck:
-      test: [ "CMD", "pg_isready" ]
+      test: wget http://localhost:7474 || exit 1
       interval: 10s
-      timeout: 5s
-      retries: 5
-    attach: false
+      timeout: 10s
+      retries: 10
+      start_period: 60s
 
 volumes:
   db-data:
+  db-logs:
+  db-import:
+  db-plugins:
   cargo-registry:
   cargo-git:
   build-cache:
-secrets:
-  db-password:
-    file: db/password.txt
-

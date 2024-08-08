@@ -1,6 +1,7 @@
 mod config;
 mod domain;
 mod follows_differ;
+mod migrations;
 mod relay_subscriber;
 mod repo;
 mod worker_pool;
@@ -11,35 +12,38 @@ use cached::proc_macro::cached;
 use cached::TimedSizedCache;
 use follows_differ::FollowChange;
 use follows_differ::FollowsDiffer;
+use migrations::apply_migrations;
+use neo4rs::Graph;
 use nostr_sdk::prelude::*;
 use relay_subscriber::{create_client, start_nostr_subscription};
 use repo::Repo;
-use sqlx::postgres::PgPoolOptions;
+use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use worker_pool::WorkerPool;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn Error>> {
+    info!("Starting followers server");
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
 
     let config = Config::new("config")?;
-
-    let connection_string = get_connection_string(&config);
-    let db_pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&connection_string)
-        .await?;
+    let uri = config.get_by_key::<String>("NEO4J_URI")?;
+    let user = config.get_by_key::<String>("NEO4J_USER")?;
+    let password = config.get_by_key::<String>("NEO4J_PASSWORD")?;
+    info!("Connecting to Neo4j at {}", uri);
+    let graph = Graph::new(uri, user, password).await?;
+    apply_migrations(&graph).await?;
 
     let (event_tx, event_rx) = mpsc::channel::<Box<Event>>(100);
 
-    let repo = Repo::new(db_pool.clone());
+    let repo = Repo::new(graph);
     let (follow_change_tx, mut follow_change_rx) = mpsc::channel::<FollowChange>(100);
     let follows_differ = FollowsDiffer::new(repo, follow_change_tx);
     let cancellation_token = CancellationToken::new();
@@ -135,10 +139,10 @@ async fn fetch_friendly_id(client: &Client, public_key: &PublicKey) -> String {
         return npub_or_pubkey;
     };
 
-    let name_or_npub_or_pubkey = metadata.name.unwrap_or_else(|| npub_or_pubkey);
+    let name_or_npub_or_pubkey = metadata.name.unwrap_or(npub_or_pubkey);
 
     if let Some(nip05_value) = metadata.nip05 {
-        let Ok(verified) = nip05::verify(&public_key, &nip05_value, None).await else {
+        let Ok(verified) = nip05::verify(public_key, &nip05_value, None).await else {
             debug!("Failed to verify Nip05 for public key: {}", public_key);
             return name_or_npub_or_pubkey;
         };
@@ -153,25 +157,4 @@ async fn fetch_friendly_id(client: &Client, public_key: &PublicKey) -> String {
     }
 
     name_or_npub_or_pubkey
-}
-
-fn get_connection_string(config: &Config) -> String {
-    let user = config.get_by_key::<String>("PG_USER").unwrap();
-    let password = config.get_by_key::<String>("PG_PASSWORD").unwrap();
-    let host = config.get_by_key::<String>("PG_HOST").unwrap();
-    let db_name = config.get_by_key::<String>("PG_DBNAME").unwrap();
-
-    let redacted = get_connection_string_from_parts(&user, "*****", &host, &db_name);
-    info!("Connecting to {}", redacted);
-
-    get_connection_string_from_parts(&user, &password, &host, &db_name)
-}
-
-fn get_connection_string_from_parts(
-    user: &str,
-    password: &str,
-    host: &str,
-    dbname: &str,
-) -> String {
-    format!("postgres://{}:{}@{}/{}", user, password, host, dbname)
 }

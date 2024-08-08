@@ -20,12 +20,6 @@ WORKDIR /app
 RUN apk update \
     && apk add --no-cache --purge pkgconfig clang lld musl-dev git openssl-dev openssl-libs-static libc-dev
 
-ENTRYPOINT ["/usr/local/cargo/bin/sqlx"]
-
-RUN cargo install sqlx-cli \
-    --no-default-features \
-    --features native-tls,postgres
-
 # Build the application.
 # Leverage a cache mount to /usr/local/cargo/registry/
 # for downloaded dependencies, a cache mount to /usr/local/cargo/git/db
@@ -59,7 +53,6 @@ RUN --mount=type=bind,source=src,target=src \
 # (e.g., alpine@sha256:664888ac9cfd28068e062c991ebcff4b4c7307dc8dd4df9e728bedde5c449d91).
 FROM alpine:3.18 AS final
 
-RUN apk add --no-cache openssl postgresql-client
 WORKDIR /app
 
 # Create a non-privileged user that the app will run under.
@@ -77,10 +70,8 @@ USER appuser
 
 # Copy the executable from the "build" stage.
 COPY --from=build /bin/server /bin/
-COPY --from=build /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
 
 # Expose the port that the application listens on.
 EXPOSE 8000
 
-COPY ./entrypoint.sh /app/entrypoint.sh
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/bin/server"]

@@ -1,5 +1,6 @@
 use crate::repo::Repo;
 use crate::{domain::follow::Follow, worker_pool::WorkerTask};
+use chrono::{DateTime, FixedOffset};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
@@ -86,23 +87,23 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
             match maybe_stored_follow {
                 // We have a DB entry for this followee
                 Some(mut stored_follow) => {
-                    if event.created_at <= stored_follow.updated_at {
+                    if event.created_at.as_u64() <= stored_follow.updated_at.timestamp() as u64 {
                         // We only process follow lists that are newer than the last update
                         continue;
                     }
 
                     if exists_in_latest_contact_list {
                         // Still following same followee, run an upsert that just updates the date
-                        stored_follow.updated_at = event.created_at;
+                        stored_follow.updated_at = timestamp_to_datetime(event.created_at);
 
-                        if let Err(e) = self.repo.upsert_follow(&stored_follow, None).await {
+                        if let Err(e) = self.repo.upsert_follow(&stored_follow).await {
                             error!("Failed to upsert follow: {}", e);
                         }
 
                         unchanged += 1;
                     } else {
                         // Doesn't exist in the new follows list so we delete the follow
-                        if let Err(e) = self.repo.delete_follow(&followee, &follower, None).await {
+                        if let Err(e) = self.repo.delete_follow(&followee, &follower).await {
                             error!("Failed to delete follow: {}", e);
                         }
 
@@ -125,11 +126,11 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                     let follow = Follow {
                         followee,
                         follower,
-                        updated_at: event.created_at,
-                        created_at: event.created_at,
+                        updated_at: timestamp_to_datetime(event.created_at),
+                        created_at: timestamp_to_datetime(event.created_at),
                     };
 
-                    if let Err(e) = self.repo.upsert_follow(&follow, None).await {
+                    if let Err(e) = self.repo.upsert_follow(&follow).await {
                         error!("Failed to upsert follow: {}", e);
                     }
 
@@ -167,4 +168,10 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
             );
         }
     }
+}
+
+fn timestamp_to_datetime(timestamp: Timestamp) -> DateTime<FixedOffset> {
+    DateTime::from_timestamp(timestamp.as_u64() as i64, 0)
+        .unwrap()
+        .fixed_offset()
 }

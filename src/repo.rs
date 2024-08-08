@@ -1,103 +1,104 @@
 use crate::domain::follow::Follow;
-use ::time::{OffsetDateTime, PrimitiveDateTime};
-use nostr_sdk::prelude::*;
-use sqlx::postgres::Postgres;
-use sqlx::Transaction;
+use anyhow::Result;
+use chrono::{DateTime, FixedOffset};
+use neo4rs::{query, Graph};
+use nostr_sdk::prelude::PublicKey;
 use tracing::debug;
 
 pub struct Repo {
-    pool: sqlx::PgPool,
+    graph: Graph,
 }
 
 impl Repo {
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+    pub fn new(graph: Graph) -> Self {
+        Self { graph }
     }
 
-    pub async fn upsert_follow(
-        &self,
-        follow: &Follow,
-        maybe_tx: Option<Transaction<'static, Postgres>>,
-    ) -> Result<()> {
-        let mut tx = match maybe_tx {
-            Some(tx) => tx,
-            None => self.pool.begin().await?,
-        };
-
-        let updated_at =
-            OffsetDateTime::from_unix_timestamp(follow.updated_at.as_u64() as i64).unwrap();
-        let updated_at_dt = PrimitiveDateTime::new(updated_at.date(), updated_at.time());
-        let followee_hex = follow.followee.to_hex();
-        let follower_hex = follow.follower.to_hex();
-
+    pub async fn upsert_follow(&self, follow: &Follow) -> Result<()> {
         debug!(
             "Upserting follow: followee={}, follower={}, updated_at={}",
-            followee_hex, follower_hex, updated_at_dt
+            follow.followee, follow.follower, follow.updated_at
         );
-        sqlx::query(
-            r#"
-            INSERT INTO follows (followee, follower, updated_at, created_at)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (followee, follower) DO UPDATE SET updated_at = $3
-            "#,
-        )
-        .bind(followee_hex)
-        .bind(follower_hex)
-        .bind(updated_at_dt)
-        .bind(updated_at_dt)
-        .execute(&mut *tx)
-        .await?;
 
-        tx.commit().await?;
+        let statement = r#"
+            MERGE (followee:User {pubkey: $followee_val})
+            MERGE (follower:User {pubkey: $follower_val})
+            MERGE (follower)-[r:FOLLOWS]->(followee)
+            ON CREATE SET r.created_at = $updated_at, r.updated_at = $updated_at
+            ON MATCH SET r.updated_at = $updated_at
+            "#;
+
+        let query = query(statement)
+            .param("updated_at", follow.updated_at)
+            .param("followee_val", follow.followee.to_hex())
+            .param("follower_val", follow.follower.to_hex());
+
+        self.graph.run(query).await?;
+
         Ok(())
     }
 
-    pub async fn delete_follow(
-        &self,
-        followee: &PublicKey,
-        follower: &PublicKey,
-        maybe_tx: Option<Transaction<'static, Postgres>>,
-    ) -> Result<()> {
-        let mut tx = match maybe_tx {
-            Some(tx) => tx,
-            None => self.pool.begin().await?,
-        };
-
-        let followee_hex = followee.to_hex();
-        let follower_hex = follower.to_hex();
-
+    pub async fn delete_follow(&self, followee: &PublicKey, follower: &PublicKey) -> Result<()> {
         debug!(
             "Deleting follow: followee={}, follower={}",
-            followee_hex, follower_hex
+            followee, follower
         );
-        sqlx::query(
-            r#"
-            DELETE FROM follows
-            WHERE followee = $1 AND follower = $2
-            "#,
-        )
-        .bind(followee_hex)
-        .bind(follower_hex)
-        .execute(&mut *tx)
-        .await?;
 
-        tx.commit().await?;
+        let statement = r#"
+            MATCH (follower:User {pubkey: $follower_val})-[r:FOLLOWS]->(followee:User {pubkey: $followee_val})
+            DELETE r
+            "#;
+
+        let query = query(statement)
+            .param("followee_val", followee.to_hex())
+            .param("follower_val", follower.to_hex());
+
+        self.graph.run(query).await?;
         Ok(())
     }
 
     pub async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<Follow>> {
-        let follower_hex = follower.to_hex();
-        let follows = sqlx::query_as::<_, Follow>(
-            r#"
-            SELECT followee, follower, updated_at, created_at
-            FROM follows
-            WHERE follower = $1
-            "#,
-        )
-        .bind(follower_hex)
-        .fetch_all(&self.pool)
-        .await?;
+        let statement = r#"
+            MATCH (follower:User {pubkey: $follower_val})-[r:FOLLOWS]->(followee:User)
+            RETURN followee.pubkey AS followee, follower.pubkey AS follower, r.created_at AS created_at, r.updated_at AS updated_at
+            "#;
+
+        let query = query(statement).param("follower_val", follower.to_hex());
+
+        let mut records = self.graph.execute(query).await?;
+
+        let mut follows: Vec<Follow> = Vec::new();
+        while let Ok(Some(row)) = records.next().await {
+            let followee = row.get::<String>("followee")?;
+            let follower = row.get::<String>("follower")?;
+            let updated_at = row.get::<DateTime<FixedOffset>>("updated_at")?;
+            let created_at = row.get::<DateTime<FixedOffset>>("created_at")?;
+
+            follows.push(Follow {
+                followee: PublicKey::from_hex(&followee)?,
+                follower: PublicKey::from_hex(&follower)?,
+                updated_at,
+                created_at,
+            });
+        }
 
         Ok(follows)
+
+        // let follows = records[0]
+        //     .fields()
+        //     .iter()
+        //     .map(|value| Follow {
+        //         followee: PublicKey::from_val(value.get::<String>("followee").unwrap()).unwrap(),
+        //         follower: PublicKey::from_val(value.get::<String>("follower").unwrap()).unwrap(),
+        //         created_at: value
+        //             .get::<String>("created_at")
+        //             .map(|dt| DateTime::parse_from_rfc3339(&dt).unwrap())
+        //             .unwrap(),
+        //         updated_at: value
+        //             .get::<String>("updated_at")
+        //             .map(|dt| DateTime::parse_from_rfc3339(&dt).unwrap())
+        //             .unwrap(),
+        //     })
+        //     .collect::<Vec<Follow>>();
     }
 }
