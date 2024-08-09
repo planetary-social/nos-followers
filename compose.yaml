@@ -4,13 +4,11 @@ services:
     build:
       context: .
       target: final
-    ports:
-      - 8000:8000
     environment:
       - APP__NEO4J_URI=db:7687
       - APP__NEO4J_USER=neo4j
       - APP__NEO4J_PASSWORD=mydevpassword
-      - RUST_LOG=nos_followers=info
+      - RUST_LOG=nos_followers=debug
       - RUST_BACKTRACE=1
     volumes:
       - ./config:/app/config
@@ -22,6 +20,7 @@ services:
       db:
         condition: service_healthy
     restart: always
+    attach: true
 
   relay:
     image: ghcr.io/planetary-social/nosrelay:latest

@@ -1,3 +1,4 @@
+use crate::send_with_checks::SendWithChecks;
 use anyhow::{bail, Result};
 use futures::future::join_all;
 use nostr_sdk::prelude::*;
@@ -29,6 +30,7 @@ pub async fn start_nostr_subscription(
     cancellation_token: CancellationToken,
 ) -> Result<()> {
     for relay in relays {
+        info!("Connecting to relay: {}", relay);
         if let Err(e) = nostr_client.add_relay(relay).await {
             bail!("Failed to add relay: {}", e);
         }
@@ -92,7 +94,10 @@ async fn start_subscription(
 
             if let RelayPoolNotification::Event { event, .. } = notification {
                 debug!("Received event: {}", event.id);
-                event_tx.send(event).await?;
+                if let Err(e) = event_tx.send_with_checks(event) {
+                    error!("Failed to send nostr event: {:?}", e);
+                    return Ok(true);
+                }
             }
 
             // True would exit from the loop

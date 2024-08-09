@@ -1,10 +1,12 @@
 use crate::repo::Repo;
+use crate::send_with_checks::SendWithChecks;
 use crate::{domain::follow::Follow, worker_pool::WorkerTask};
+use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
-use tracing::{error, info};
+use tracing::{debug, info};
 
 #[derive(Default, Debug)]
 struct FollowsDiff {
@@ -40,7 +42,7 @@ impl FollowsDiffer {
 }
 
 impl WorkerTask<Box<Event>> for FollowsDiffer {
-    async fn call(&self, event: Box<Event>) {
+    async fn call(&self, event: Box<Event>) -> Result<()> {
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
@@ -48,19 +50,17 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
         let mut follows_diff: HashMap<PublicKey, FollowsDiff> = HashMap::new();
 
         // Populate stored follows
-        match self.repo.get_follows(&follower).await {
-            Ok(stored_follows) => {
-                for stored_follow in stored_follows {
-                    follows_diff
-                        .entry(stored_follow.followee)
-                        .or_default()
-                        .stored_follow = Some(stored_follow.clone());
-                }
-            }
-            Err(e) => {
-                error!("Failed to get follows: {}", e);
-                return;
-            }
+        let stored_follows = self
+            .repo
+            .get_follows(&follower)
+            .await
+            .context("Failed to get follows")?;
+
+        for stored_follow in stored_follows {
+            follows_diff
+                .entry(stored_follow.followee)
+                .or_default()
+                .stored_follow = Some(stored_follow.clone());
         }
 
         let first_seen = follows_diff.is_empty();
@@ -89,6 +89,10 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                 Some(mut stored_follow) => {
                     if event.created_at.as_u64() <= stored_follow.updated_at.timestamp() as u64 {
                         // We only process follow lists that are newer than the last update
+                        debug!(
+                            "Skipping follow list for {} as it's older than the last update",
+                            followee
+                        );
                         continue;
                     }
 
@@ -96,32 +100,36 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                         // Still following same followee, run an upsert that just updates the date
                         stored_follow.updated_at = timestamp_to_datetime(event.created_at);
 
-                        if let Err(e) = self.repo.upsert_follow(&stored_follow).await {
-                            error!("Failed to upsert follow: {}", e);
-                        }
+                        self.repo
+                            .upsert_follow(&stored_follow)
+                            .await
+                            .context(format!("Failed to upsert follow {}", follower))?;
 
                         unchanged += 1;
                     } else {
                         // Doesn't exist in the new follows list so we delete the follow
-                        if let Err(e) = self.repo.delete_follow(&followee, &follower).await {
-                            error!("Failed to delete follow: {}", e);
-                        }
-
-                        if let Err(e) = self
-                            .diff_result_tx
-                            .send(FollowChange::Unfollowed {
-                                at: event.created_at,
-                                follower,
-                                followee,
-                            })
+                        self.repo
+                            .delete_follow(&followee, &follower)
                             .await
-                        {
-                            error!("Failed to send follow change: {}", e);
-                        }
+                            .context(format!("Failed to delete follow for {}", follower))?;
+
+                        let follow_change = FollowChange::Unfollowed {
+                            at: event.created_at,
+                            follower,
+                            followee,
+                        };
+                        self.diff_result_tx
+                            .send_with_checks(follow_change)
+                            .context(format!("Failed to send follow change for {}", follower))?;
                         unfollowed_counter += 1;
                     }
                 }
                 None => {
+                    if followee == follower {
+                        debug!("Skipping self-follow for {}", followee);
+                        continue;
+                    }
+
                     // There's no existing follow entry for this followee so this is a new follow
                     let follow = Follow {
                         followee,
@@ -130,21 +138,20 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                         created_at: timestamp_to_datetime(event.created_at),
                     };
 
-                    if let Err(e) = self.repo.upsert_follow(&follow).await {
-                        error!("Failed to upsert follow: {}", e);
-                    }
-
-                    if let Err(e) = self
-                        .diff_result_tx
-                        .send(FollowChange::Followed {
-                            at: event.created_at,
-                            follower,
-                            followee,
-                        })
+                    self.repo
+                        .upsert_follow(&follow)
                         .await
-                    {
-                        error!("Failed to send follow change: {}", e);
-                    }
+                        .context(format!("Failed to upsert follow {}", follower))?;
+
+                    let follow_change = FollowChange::Followed {
+                        at: event.created_at,
+                        follower,
+                        followee,
+                    };
+
+                    self.diff_result_tx
+                        .send_with_checks(follow_change)
+                        .context(format!("Failed to send follow change for {}", follower))?;
                     followed_counter += 1;
                 }
             }
@@ -155,18 +162,22 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                 "Pubkey {}: date {}, {} followed, new follows list",
                 follower,
                 event.created_at.to_human_datetime(),
-                followed_counter
-            );
-        } else {
-            info!(
-                "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
-                follower,
-                event.created_at.to_human_datetime(),
                 followed_counter,
-                unfollowed_counter,
-                unchanged
             );
+
+            return Ok(());
         }
+
+        info!(
+            "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
+            follower,
+            event.created_at.to_human_datetime(),
+            followed_counter,
+            unfollowed_counter,
+            unchanged
+        );
+
+        Ok(())
     }
 }
 

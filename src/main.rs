@@ -4,6 +4,7 @@ mod follows_differ;
 mod migrations;
 mod relay_subscriber;
 mod repo;
+mod send_with_checks;
 mod worker_pool;
 
 use crate::config::Config;
@@ -41,15 +42,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let graph = Graph::new(uri, user, password).await?;
     apply_migrations(&graph).await?;
 
-    let (event_tx, event_rx) = mpsc::channel::<Box<Event>>(100);
+    let (event_tx, event_rx) = mpsc::channel::<Box<Event>>(200);
 
     let repo = Repo::new(graph);
-    let (follow_change_tx, mut follow_change_rx) = mpsc::channel::<FollowChange>(100);
+    let (follow_change_tx, mut follow_change_rx) = mpsc::channel::<FollowChange>(10000);
     let follows_differ = FollowsDiffer::new(repo, follow_change_tx);
     let cancellation_token = CancellationToken::new();
 
     let worker_tracker =
-        WorkerPool::start(4, event_rx, cancellation_token.clone(), follows_differ)?;
+        WorkerPool::start(8, event_rx, cancellation_token.clone(), follows_differ)?;
 
     let nostr_client = Arc::new(create_client());
 
@@ -121,11 +122,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// Try to return an identifier that is not the public key.// Define a cached async function with a 5-minute expiration
-// We cache 10000 entries and each entry expires after 5 minutes
+// Try to return an identifier that is not the public key.
+// Define a cached async function with a 5-minute expiration
+// We cache 1000000 entries and each entry expires after 50 minutes
 #[cached(
     ty = "TimedSizedCache<String, String>",
-    create = "{ TimedSizedCache::with_size_and_lifespan(10000, 300) }",
+    create = "{ TimedSizedCache::with_size_and_lifespan(1000000, 3000) }",
     convert = r#"{ public_key.to_hex() }"#
 )]
 async fn fetch_friendly_id(client: &Client, public_key: &PublicKey) -> String {
@@ -135,7 +137,6 @@ async fn fetch_friendly_id(client: &Client, public_key: &PublicKey) -> String {
     };
 
     let Some(metadata) = client.metadata(*public_key).await.ok() else {
-        debug!("Failed to get metadata for public key: {}", public_key);
         return npub_or_pubkey;
     };
 
@@ -143,16 +144,13 @@ async fn fetch_friendly_id(client: &Client, public_key: &PublicKey) -> String {
 
     if let Some(nip05_value) = metadata.nip05 {
         let Ok(verified) = nip05::verify(public_key, &nip05_value, None).await else {
-            debug!("Failed to verify Nip05 for public key: {}", public_key);
             return name_or_npub_or_pubkey;
         };
 
         if !verified {
-            debug!("Nip05 for public key: {} is not verified", public_key);
             return name_or_npub_or_pubkey;
         }
 
-        debug!("Nip05 for public key: {} is: {}", public_key, nip05_value);
         return nip05_value;
     }
 

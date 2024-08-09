@@ -15,11 +15,6 @@ impl Repo {
     }
 
     pub async fn upsert_follow(&self, follow: &Follow) -> Result<()> {
-        debug!(
-            "Upserting follow: followee={}, follower={}, updated_at={}",
-            follow.followee, follow.follower, follow.updated_at
-        );
-
         let statement = r#"
             MERGE (followee:User {pubkey: $followee_val})
             MERGE (follower:User {pubkey: $follower_val})
@@ -39,11 +34,6 @@ impl Repo {
     }
 
     pub async fn delete_follow(&self, followee: &PublicKey, follower: &PublicKey) -> Result<()> {
-        debug!(
-            "Deleting follow: followee={}, follower={}",
-            followee, follower
-        );
-
         let statement = r#"
             MATCH (follower:User {pubkey: $follower_val})-[r:FOLLOWS]->(followee:User {pubkey: $followee_val})
             DELETE r
@@ -83,22 +73,5 @@ impl Repo {
         }
 
         Ok(follows)
-
-        // let follows = records[0]
-        //     .fields()
-        //     .iter()
-        //     .map(|value| Follow {
-        //         followee: PublicKey::from_val(value.get::<String>("followee").unwrap()).unwrap(),
-        //         follower: PublicKey::from_val(value.get::<String>("follower").unwrap()).unwrap(),
-        //         created_at: value
-        //             .get::<String>("created_at")
-        //             .map(|dt| DateTime::parse_from_rfc3339(&dt).unwrap())
-        //             .unwrap(),
-        //         updated_at: value
-        //             .get::<String>("updated_at")
-        //             .map(|dt| DateTime::parse_from_rfc3339(&dt).unwrap())
-        //             .unwrap(),
-        //     })
-        //     .collect::<Vec<Follow>>();
     }
 }
