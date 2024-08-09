@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let graph = Graph::new(uri, user, password).await?;
     apply_migrations(&graph).await?;
 
-    let (event_tx, event_rx) = mpsc::channel::<Box<Event>>(200);
+    let (event_tx, event_rx) = mpsc::channel::<Box<Event>>(100);
 
     let repo = Repo::new(graph);
     let (follow_change_tx, mut follow_change_rx) = mpsc::channel::<FollowChange>(10000);

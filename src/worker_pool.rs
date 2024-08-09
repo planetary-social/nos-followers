@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error};
+use tracing::error;
 pub struct WorkerPool {}
 
 // A channel based worker pool that distributes work to a pool of workers.
@@ -29,7 +29,7 @@ impl WorkerPool {
 
         let worker_clone = Arc::new(worker);
         for _ in 0..num_workers {
-            let (worker_tx, mut worker_rx) = mpsc::channel::<Item>(300);
+            let (worker_tx, mut worker_rx) = mpsc::channel::<Item>(10);
             worker_txs.push(worker_tx);
 
             let tracker = tracker.clone();

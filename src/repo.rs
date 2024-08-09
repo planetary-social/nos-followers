@@ -3,7 +3,6 @@ use anyhow::Result;
 use chrono::{DateTime, FixedOffset};
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
-use tracing::debug;
 
 pub struct Repo {
     graph: Graph,

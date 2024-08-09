@@ -21,7 +21,7 @@ impl<T> SendWithChecks<T> for Sender<T> {
                     let used_capacity = max_capacity - capacity;
 
                     // Warn if we are already using 80% of the buffer
-                    if capacity < max_capacity * 1 / 5 {
+                    if capacity < max_capacity * 5 {
                         warn!(
                             "Channel buffer is almost full! used {} from {}",
                             used_capacity, max_capacity
