@@ -1,5 +1,6 @@
 mod config;
 mod domain;
+mod fetch_friendly_id;
 mod follows_differ;
 mod migrations;
 mod relay_subscriber;
@@ -8,9 +9,8 @@ mod send_with_checks;
 mod worker_pool;
 
 use crate::config::Config;
+use crate::fetch_friendly_id::fetch_friendly_id;
 use anyhow::Result;
-use cached::proc_macro::cached;
-use cached::TimedSizedCache;
 use follows_differ::FollowChange;
 use follows_differ::FollowsDiffer;
 use migrations::apply_migrations;
@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let uri = config.get_by_key::<String>("NEO4J_URI")?;
     let user = config.get_by_key::<String>("NEO4J_USER")?;
     let password = config.get_by_key::<String>("NEO4J_PASSWORD")?;
+
     info!("Connecting to Neo4j at {}", uri);
     let graph = Graph::new(uri, user, password).await?;
     apply_migrations(&graph).await?;
@@ -125,43 +126,4 @@ async fn main() -> Result<(), Box<dyn Error>> {
     follow_change_task.await?;
 
     Ok(())
-}
-
-// Try to return an identifier that is not the public key.
-// Define a cached async function with a 5-minute expiration
-// We cache 1000000 entries and each entry expires after 50 minutes
-#[cached(
-    ty = "TimedSizedCache<String, String>",
-    create = "{ TimedSizedCache::with_size_and_lifespan(1000000, 3000) }",
-    convert = r#"{ public_key.to_hex() }"#
-)]
-async fn fetch_friendly_id(client: &Client, public_key: &PublicKey, verify: bool) -> String {
-    let npub_or_pubkey = match public_key.to_bech32() {
-        Ok(npub) => npub,
-        Err(_) => return public_key.to_hex(),
-    };
-
-    let Some(metadata) = client.metadata(*public_key).await.ok() else {
-        return npub_or_pubkey;
-    };
-
-    let name_or_npub_or_pubkey = metadata.name.unwrap_or(npub_or_pubkey);
-
-    if let Some(nip05_value) = metadata.nip05 {
-        if verify {
-            let Ok(verified) = nip05::verify(public_key, &nip05_value, None).await else {
-                return name_or_npub_or_pubkey;
-            };
-
-            if !verified {
-                return name_or_npub_or_pubkey;
-            }
-
-            return nip05_value;
-        }
-
-        return nip05_value;
-    }
-
-    name_or_npub_or_pubkey
 }

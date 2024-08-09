@@ -93,6 +93,7 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                             "Skipping follow list for {} as it's older than the last update",
                             followee
                         );
+                        unchanged += 1;
                         continue;
                     }
 
