@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let repo = Repo::new(graph);
     let (follow_change_tx, mut follow_change_rx) = mpsc::channel::<FollowChange>(10000);
-    let follows_differ = FollowsDiffer::new(repo, follow_change_tx);
+    let follows_differ = FollowsDiffer::new(repo, follow_change_tx.clone());
     let cancellation_token = CancellationToken::new();
 
     let worker_tracker =
@@ -57,6 +57,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let nostr_client_clone = nostr_client.clone();
     let follow_change_task = tokio::spawn(async move {
         while let Some(follow_change) = follow_change_rx.recv().await {
+            // We stop verification for nip05 if the channel is 80% full
+            let verify = follow_change_tx.capacity() > follow_change_tx.max_capacity() / 5;
+
             match follow_change {
                 FollowChange::Followed {
                     at,
@@ -64,8 +67,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     followee,
                 } => {
                     let (friendly_follower, friendly_followee) = tokio::join!(
-                        fetch_friendly_id(&nostr_client_clone, &follower),
-                        fetch_friendly_id(&nostr_client_clone, &followee)
+                        fetch_friendly_id(&nostr_client_clone, &follower, verify),
+                        fetch_friendly_id(&nostr_client_clone, &followee, verify)
                     );
 
                     debug!(
@@ -84,8 +87,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     followee,
                 } => {
                     let (friendly_follower, friendly_followee) = tokio::join!(
-                        fetch_friendly_id(&nostr_client_clone, &follower),
-                        fetch_friendly_id(&nostr_client_clone, &followee)
+                        fetch_friendly_id(&nostr_client_clone, &follower, verify),
+                        fetch_friendly_id(&nostr_client_clone, &followee, verify)
                     );
 
                     debug!(
@@ -100,6 +103,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+
+        info!("Follow change task ended");
     });
 
     let relay = config.get_by_key::<String>("relay")?;
@@ -130,7 +135,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     create = "{ TimedSizedCache::with_size_and_lifespan(1000000, 3000) }",
     convert = r#"{ public_key.to_hex() }"#
 )]
-async fn fetch_friendly_id(client: &Client, public_key: &PublicKey) -> String {
+async fn fetch_friendly_id(client: &Client, public_key: &PublicKey, verify: bool) -> String {
     let npub_or_pubkey = match public_key.to_bech32() {
         Ok(npub) => npub,
         Err(_) => return public_key.to_hex(),
@@ -143,12 +148,16 @@ async fn fetch_friendly_id(client: &Client, public_key: &PublicKey) -> String {
     let name_or_npub_or_pubkey = metadata.name.unwrap_or(npub_or_pubkey);
 
     if let Some(nip05_value) = metadata.nip05 {
-        let Ok(verified) = nip05::verify(public_key, &nip05_value, None).await else {
-            return name_or_npub_or_pubkey;
-        };
+        if verify {
+            let Ok(verified) = nip05::verify(public_key, &nip05_value, None).await else {
+                return name_or_npub_or_pubkey;
+            };
 
-        if !verified {
-            return name_or_npub_or_pubkey;
+            if !verified {
+                return name_or_npub_or_pubkey;
+            }
+
+            return nip05_value;
         }
 
         return nip05_value;

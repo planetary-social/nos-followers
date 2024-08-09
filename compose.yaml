@@ -8,8 +8,7 @@ services:
       - APP__NEO4J_URI=db:7687
       - APP__NEO4J_USER=neo4j
       - APP__NEO4J_PASSWORD=mydevpassword
-      - RUST_LOG=nos_followers=debug
-      - RUST_BACKTRACE=1
+      - RUST_LOG=nos_followers=info
     volumes:
       - ./config:/app/config
       - ./migrations:/app/migrations

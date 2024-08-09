@@ -15,13 +15,13 @@ impl<T> SendWithChecks<T> for Sender<T> {
                 let current_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
                 // Every 10 seconds we check if the channel buffer is almost full
-                if current_seconds % 10 == 0 {
+                if current_seconds % 5 == 0 {
                     let max_capacity = self.max_capacity();
                     let capacity = self.capacity();
                     let used_capacity = max_capacity - capacity;
 
                     // Warn if we are already using 80% of the buffer
-                    if capacity < max_capacity * 5 {
+                    if capacity < max_capacity / 5 {
                         warn!(
                             "Channel buffer is almost full! used {} from {}",
                             used_capacity, max_capacity
