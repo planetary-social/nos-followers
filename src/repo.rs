@@ -13,6 +13,22 @@ impl Repo {
         Self { graph }
     }
 
+    pub async fn add_friendly_id(&self, public_key: &PublicKey, friendly_id: &str) -> Result<()> {
+        let statement = r#"
+            MERGE (user:User {pubkey: $pubkey_val})
+            ON CREATE SET user.friendly_id = $friendly_id_val
+            ON MATCH SET user.friendly_id = $friendly_id_val
+            "#;
+
+        let query = query(statement)
+            .param("pubkey_val", public_key.to_hex())
+            .param("friendly_id_val", friendly_id);
+
+        self.graph.run(query).await?;
+
+        Ok(())
+    }
+
     pub async fn upsert_follow(&self, follow: &Follow) -> Result<()> {
         let statement = r#"
             MERGE (followee:User {pubkey: $followee_val})

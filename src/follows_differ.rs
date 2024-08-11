@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info};
 
@@ -28,12 +29,12 @@ pub enum FollowChange {
 }
 
 pub struct FollowsDiffer {
-    repo: Repo,
+    repo: Arc<Repo>,
     diff_result_tx: Sender<FollowChange>,
 }
 
 impl FollowsDiffer {
-    pub fn new(repo: Repo, diff_result_tx: Sender<FollowChange>) -> Self {
+    pub fn new(repo: Arc<Repo>, diff_result_tx: Sender<FollowChange>) -> Self {
         Self {
             repo,
             diff_result_tx,
@@ -56,7 +57,19 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
             .await
             .context("Failed to get follows")?;
 
+        let mut maybe_latest_stored_updated_at: Option<Timestamp> = None;
         for stored_follow in stored_follows {
+            if let Some(ref mut latest_stored_updated_at) = maybe_latest_stored_updated_at {
+                if (stored_follow.updated_at.timestamp() as u64) > latest_stored_updated_at.as_u64()
+                {
+                    *latest_stored_updated_at =
+                        Timestamp::from(stored_follow.updated_at.timestamp() as u64);
+                }
+            } else {
+                maybe_latest_stored_updated_at =
+                    Some(Timestamp::from(stored_follow.updated_at.timestamp() as u64));
+            };
+
             follows_diff
                 .entry(stored_follow.followee)
                 .or_default()
@@ -75,6 +88,16 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
             }
         }
 
+        if let Some(latest_stored_updated_at) = maybe_latest_stored_updated_at {
+            if event.created_at <= latest_stored_updated_at {
+                debug!(
+                    "Skipping follow list for {} as it's older than the last update",
+                    follower
+                );
+                return Ok(());
+            }
+        }
+
         // Process follows_diff
         for (
             followee,
@@ -87,16 +110,6 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
             match maybe_stored_follow {
                 // We have a DB entry for this followee
                 Some(mut stored_follow) => {
-                    if event.created_at.as_u64() <= stored_follow.updated_at.timestamp() as u64 {
-                        // We only process follow lists that are newer than the last update
-                        debug!(
-                            "Skipping follow list for {} as it's older than the last update",
-                            followee
-                        );
-                        unchanged += 1;
-                        continue;
-                    }
-
                     if exists_in_latest_contact_list {
                         // Still following same followee, run an upsert that just updates the date
                         stored_follow.updated_at = timestamp_to_datetime(event.created_at);
@@ -158,7 +171,8 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
             }
         }
 
-        if first_seen {
+        // If we have a new follow list, we log it if it has any follows to avoid noise
+        if first_seen && followed_counter > 0 {
             info!(
                 "Pubkey {}: date {}, {} followed, new follows list",
                 follower,
@@ -169,14 +183,17 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
             return Ok(());
         }
 
-        info!(
-            "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
-            follower,
-            event.created_at.to_human_datetime(),
-            followed_counter,
-            unfollowed_counter,
-            unchanged
-        );
+        // If nothing changed, we don't log anything, it's just noise from older events
+        if followed_counter > 0 || unfollowed_counter > 0 {
+            info!(
+                "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
+                follower,
+                event.created_at.to_human_datetime(),
+                followed_counter,
+                unfollowed_counter,
+                unchanged
+            );
+        }
 
         Ok(())
     }
