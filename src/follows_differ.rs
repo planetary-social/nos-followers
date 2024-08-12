@@ -1,7 +1,7 @@
 use crate::repo::Repo;
 use crate::send_with_checks::SendWithChecks;
 use crate::{domain::follow::Follow, worker_pool::WorkerTask};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
@@ -49,6 +49,7 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
         let mut unchanged = 0;
         let follower = event.pubkey;
         let mut follows_diff: HashMap<PublicKey, FollowsDiff> = HashMap::new();
+        let event_created_at = timestamp_to_datetime(event.created_at)?;
 
         // Populate stored follows
         let stored_follows = self
@@ -112,7 +113,7 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                 Some(mut stored_follow) => {
                     if exists_in_latest_contact_list {
                         // Still following same followee, run an upsert that just updates the date
-                        stored_follow.updated_at = timestamp_to_datetime(event.created_at);
+                        stored_follow.updated_at = event_created_at;
 
                         self.repo
                             .upsert_follow(&stored_follow)
@@ -148,8 +149,8 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                     let follow = Follow {
                         followee,
                         follower,
-                        updated_at: timestamp_to_datetime(event.created_at),
-                        created_at: timestamp_to_datetime(event.created_at),
+                        updated_at: event_created_at,
+                        created_at: event_created_at,
                     };
 
                     self.repo
@@ -199,8 +200,14 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
     }
 }
 
-fn timestamp_to_datetime(timestamp: Timestamp) -> DateTime<FixedOffset> {
-    DateTime::from_timestamp(timestamp.as_u64() as i64, 0)
-        .unwrap()
-        .fixed_offset()
+fn timestamp_to_datetime(timestamp: Timestamp) -> Result<DateTime<FixedOffset>> {
+    match DateTime::from_timestamp(timestamp.as_u64() as i64, 0) {
+        Some(dt) => Ok(dt.fixed_offset()),
+        None => {
+            bail!(
+                "Failed to convert timestamp to datetime: {}",
+                timestamp.as_u64()
+            )
+        }
+    }
 }
