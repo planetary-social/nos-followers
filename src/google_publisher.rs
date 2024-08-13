@@ -77,7 +77,7 @@ impl GooglePublisher {
                 google_full_topic,
             };
 
-            let mut interval = time::interval(Duration::from_secs(5));
+            let mut interval = time::interval(Duration::from_secs(seconds));
 
             loop {
                 select! {
@@ -88,7 +88,7 @@ impl GooglePublisher {
 
                     _ = interval.tick() => {
                         if !buffer.is_empty() {
-                            info!("Publishing {} follow changes after {} seconds of inactivity", buffer.len(), seconds);
+                            info!("Publishing batch of {} follow changes", buffer.len());
                             if let Err(e) = client.publish_events(buffer.split_off(0)).await {
                                 error!("Failed to publish events: {:?}", e);
                                 break;
@@ -111,8 +111,8 @@ impl GooglePublisher {
 
                 if buffer.len() >= size_threshold {
                     info!(
-                        "Publishing {} follow changes after reaching threshold",
-                        buffer.len()
+                        "Publishing batch of {} follow changes after reaching threshold of {} items",
+                        buffer.len(), size_threshold
                     );
                     if let Err(e) = client.publish_events(buffer.split_off(0)).await {
                         error!("Failed to publish events: {:?}", e);
