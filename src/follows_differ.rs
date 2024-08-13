@@ -1,6 +1,9 @@
 use crate::repo::Repo;
 use crate::send_with_checks::SendWithChecks;
-use crate::{domain::follow::Follow, worker_pool::WorkerTask};
+use crate::{
+    domain::{follow::Follow, follow_change::FollowChange},
+    worker_pool::{WorkerTask, WorkerTaskItem},
+};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset};
 use nostr_sdk::prelude::*;
@@ -15,35 +18,33 @@ struct FollowsDiff {
     exists_in_latest_contact_list: bool,
 }
 
-pub enum FollowChange {
-    Followed {
-        at: Timestamp,
-        follower: PublicKey,
-        followee: PublicKey,
-    },
-    Unfollowed {
-        at: Timestamp,
-        follower: PublicKey,
-        followee: PublicKey,
-    },
-}
-
 pub struct FollowsDiffer {
     repo: Arc<Repo>,
-    diff_result_tx: Sender<FollowChange>,
+    follow_change_sender: Sender<FollowChange>,
 }
 
 impl FollowsDiffer {
-    pub fn new(repo: Arc<Repo>, diff_result_tx: Sender<FollowChange>) -> Self {
+    pub fn new(repo: Arc<Repo>, follow_change_sender: Sender<FollowChange>) -> Self {
         Self {
             repo,
-            diff_result_tx,
+            follow_change_sender,
         }
     }
 }
 
 impl WorkerTask<Box<Event>> for FollowsDiffer {
-    async fn call(&self, event: Box<Event>) -> Result<()> {
+    async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
+        let WorkerTaskItem {
+            item: event,
+            channel_load,
+            max_capacity,
+        } = worker_task_item;
+
+        info!(
+            "Processing follow list for {} with channel load of {}% of {}",
+            event.pubkey, channel_load, max_capacity
+        );
+
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
@@ -128,12 +129,9 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                             .await
                             .context(format!("Failed to delete follow for {}", follower))?;
 
-                        let follow_change = FollowChange::Unfollowed {
-                            at: event.created_at,
-                            follower,
-                            followee,
-                        };
-                        self.diff_result_tx
+                        let follow_change =
+                            FollowChange::new_unfollowed(event.created_at, follower, followee);
+                        self.follow_change_sender
                             .send_with_checks(follow_change)
                             .context(format!("Failed to send follow change for {}", follower))?;
                         unfollowed_counter += 1;
@@ -158,13 +156,10 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                         .await
                         .context(format!("Failed to upsert follow {}", follower))?;
 
-                    let follow_change = FollowChange::Followed {
-                        at: event.created_at,
-                        follower,
-                        followee,
-                    };
+                    let follow_change =
+                        FollowChange::new_followed(event.created_at, follower, followee);
 
-                    self.diff_result_tx
+                    self.follow_change_sender
                         .send_with_checks(follow_change)
                         .context(format!("Failed to send follow change for {}", follower))?;
                     followed_counter += 1;

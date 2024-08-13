@@ -1,52 +1,34 @@
-use anyhow::{bail, Result};
-use std::time::{SystemTime, UNIX_EPOCH};
+use rand::Rng;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 pub trait SendWithChecks<T> {
-    fn send_with_checks(&self, item: T) -> Result<()>;
+    fn send_with_checks(&self, item: T) -> Result<(), TrySendError<T>>;
 }
 
 impl<T> SendWithChecks<T> for Sender<T> {
-    fn send_with_checks(&self, item: T) -> Result<()> {
-        match self.try_send(item) {
-            Ok(_) => {
-                let current_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    fn send_with_checks(&self, item: T) -> Result<(), TrySendError<T>> {
+        let max_capacity = self.max_capacity();
+        let capacity = self.capacity();
 
-                // Every 10 seconds we check if the channel buffer is almost full
-                if current_seconds % 5 == 0 {
-                    let max_capacity = self.max_capacity();
-                    let capacity = self.capacity();
-                    let used_capacity = max_capacity - capacity;
-
-                    // Warn if we are already using 80% of the buffer
-                    if capacity < max_capacity / 5 {
-                        warn!(
-                            "Channel buffer is almost full! used {} from {}",
-                            used_capacity, max_capacity
-                        );
-                    } else {
-                        debug!(
-                            "Channel buffer is healthy, used {} from {}",
-                            used_capacity, max_capacity
-                        );
-                    }
-                }
-
-                Ok(())
+        let mut rng = rand::thread_rng();
+        if rng.gen_bool(0.05) {
+            if capacity < max_capacity / 10 {
+                warn!(
+                    "Channel buffer is at 90%! used {} of {} slots",
+                    max_capacity - capacity,
+                    max_capacity
+                );
+            } else {
+                info!(
+                    "Channel buffer is at a healthy level, used {} of {} slots",
+                    max_capacity - capacity,
+                    max_capacity
+                );
             }
-            Err(e) => match e {
-                TrySendError::Closed(_) => {
-                    bail!("Failed to send follow change: channel closed");
-                }
-                TrySendError::Full(_) => {
-                    bail!(
-                        "Failed to send follow change: channel full, max capacity: {}",
-                        self.max_capacity()
-                    );
-                }
-            },
         }
+
+        self.try_send(item)
     }
 }

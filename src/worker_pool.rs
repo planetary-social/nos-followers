@@ -14,7 +14,7 @@ pub struct WorkerPool {}
 impl WorkerPool {
     pub fn start<Item, Worker>(
         num_workers: usize,
-        mut item_rx: mpsc::Receiver<Item>,
+        mut item_receiver: mpsc::Receiver<Item>,
         cancellation_token: CancellationToken,
         worker: Worker,
     ) -> Result<TaskTracker>
@@ -28,8 +28,9 @@ impl WorkerPool {
         let mut worker_txs = Vec::new();
 
         let worker_clone = Arc::new(worker);
+
         for _ in 0..num_workers {
-            let (worker_tx, mut worker_rx) = mpsc::channel::<Item>(10);
+            let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerTaskItem<Item>>(10);
             worker_txs.push(worker_tx);
 
             let tracker = tracker.clone();
@@ -51,8 +52,9 @@ impl WorkerPool {
             async move {
                 // Simple cycle iterator to distribute work to workers in a round-robin fashion.
                 let mut worker_txs_cycle = worker_txs.iter().cycle();
+                let max_capacity = item_receiver.max_capacity();
 
-                while let Some(item) = item_rx.recv().await {
+                while let Some(item) = item_receiver.recv().await {
                     if token_clone.is_cancelled() {
                         break;
                     }
@@ -62,7 +64,14 @@ impl WorkerPool {
                         break;
                     };
 
-                    if let Err(e) = worker_tx.send_with_checks(item) {
+                    let channel_load =
+                        ((max_capacity - item_receiver.capacity()) * 100 / max_capacity) as u8;
+                    let worker_item = WorkerTaskItem {
+                        item,
+                        channel_load,
+                        max_capacity,
+                    };
+                    if let Err(e) = worker_tx.send_with_checks(worker_item) {
                         error!("Failed to send to worker: {:?}", e);
                         break;
                     }
@@ -75,5 +84,13 @@ impl WorkerPool {
 }
 
 pub trait WorkerTask<T> {
-    fn call(&self, args: T) -> impl Future<Output = Result<()>> + std::marker::Send;
+    fn call(&self, args: WorkerTaskItem<T>)
+        -> impl Future<Output = Result<()>> + std::marker::Send;
+}
+
+pub struct WorkerTaskItem<T> {
+    pub item: T,
+    // The percentage of the channel's capacity that was used when this item was sent.
+    pub channel_load: u8,
+    pub max_capacity: usize,
 }

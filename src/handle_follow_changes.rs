@@ -1,97 +1,64 @@
+use crate::domain::follow_change::FollowChange;
 use crate::fetch_friendly_id::fetch_friendly_id;
-use crate::follows_differ::FollowChange;
+use crate::google_publisher::GooglePublisher;
 use crate::repo::Repo;
 use cached::proc_macro::cached;
 use cached::TimedSizedCache;
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
-pub fn handle_follow_changes(
+pub async fn handle_follow_changes(
     nostr_client: Arc<Client>,
     repo: Arc<Repo>,
-    follow_change_tx: Sender<FollowChange>,
-    mut follow_change_rx: Receiver<FollowChange>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut verify = true;
-        let mut fetch_nip05 = true;
+    mut follow_change_receiver: Receiver<FollowChange>,
+) -> Result<JoinHandle<()>> {
+    let mut google_publisher = GooglePublisher::create().await?;
 
-        while let Some(follow_change) = follow_change_rx.recv().await {
-            let current_seconds = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(duration) => duration.as_secs(),
-                Err(e) => {
-                    error!("Failed to get current time: {}", e);
-                    continue;
-                }
-            };
+    let task = tokio::spawn(async move {
+        let mut verify: bool;
+        let mut fetch_nip05: bool;
+        let max_capacity = follow_change_receiver.max_capacity();
 
+        while let Some(mut follow_change) = follow_change_receiver.recv().await {
             // Handle backpressure through graceful degradation
-            // Every 5 seconds we check if the channel buffer is almost full
             // TODO: Move this to the worker pool, it can then periodically send
             // the ratio to the workers
-            if current_seconds % 5 == 0 {
-                let capacity = follow_change_tx.capacity();
-                let max_capacity = follow_change_tx.max_capacity();
+            let capacity = follow_change_receiver.capacity();
 
-                // We stop verification for nip05 if the channel is 80% full
-                verify = capacity > max_capacity / 5;
+            // We stop verification for nip05 if the channel is 80% full
+            verify = capacity > max_capacity * 8 / 10;
 
-                // We stop fetching nip05 if the channel is 90% full. So in the
-                // worse scenario we just convert the pubkey to npub and send
-                // that
-                fetch_nip05 = capacity > max_capacity / 10;
-            }
+            // We stop fetching nip05 if the channel is 90% full. So in the
+            // worst scenario we just convert the pubkey to npub and send
+            // that
+            fetch_nip05 = capacity > max_capacity * 9 / 10;
 
-            match follow_change {
-                FollowChange::Followed {
-                    at,
-                    follower,
-                    followee,
-                } => {
-                    let (friendly_follower, friendly_followee) = tokio::join!(
-                        handle_friendly_id(&repo, &nostr_client, &follower, verify, fetch_nip05),
-                        handle_friendly_id(&repo, &nostr_client, &followee, verify, fetch_nip05),
-                    );
+            let FollowChange {
+                follower, followee, ..
+            } = &follow_change;
 
-                    debug!(
-                        "Followed: {}({}) -> {}({}) at {}",
-                        follower,
-                        friendly_follower,
-                        followee,
-                        friendly_followee,
-                        at.to_human_datetime()
-                    );
-                    // TODO: Send to pubsub
-                }
-                FollowChange::Unfollowed {
-                    at,
-                    follower,
-                    followee,
-                } => {
-                    let (friendly_follower, friendly_followee) = tokio::join!(
-                        handle_friendly_id(&repo, &nostr_client, &follower, verify, fetch_nip05),
-                        handle_friendly_id(&repo, &nostr_client, &followee, verify, fetch_nip05),
-                    );
+            let (friendly_follower, friendly_followee) = tokio::join!(
+                handle_friendly_id(&repo, &nostr_client, follower, verify, fetch_nip05),
+                handle_friendly_id(&repo, &nostr_client, followee, verify, fetch_nip05),
+            );
 
-                    debug!(
-                        "Unfollowed: {}({}) -> {}({}) at {}",
-                        follower,
-                        friendly_follower,
-                        followee,
-                        friendly_followee,
-                        at.to_human_datetime()
-                    )
-                    // TODO: Send to pubsub
-                }
+            follow_change.friendly_follower = Some(friendly_follower);
+            follow_change.friendly_followee = Some(friendly_followee);
+
+            debug!("{}", follow_change);
+
+            if let Err(e) = google_publisher.queue_publication(follow_change).await {
+                error!("Failed to publish follow change: {}", e);
             }
         }
 
         info!("Follow change task ended");
-    })
+    });
+
+    Ok(task)
 }
 
 // Try to return an identifier that is not the public key.

@@ -10,6 +10,7 @@ chrono = { version = "0.4.38", features = ["serde"] }
 config = "0.14.0"
 env_logger = "0.11.5"
 futures = "0.3.30"
+gcloud-sdk = { version = "0.25.5", features = ["google-pubsub-v1"] }
 neo4rs = "0.8.0"
 nostr-sdk = "0.33.0"
 rand = { version = "0.8.5", features = ["std"] }

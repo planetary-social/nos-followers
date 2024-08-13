@@ -2,6 +2,7 @@ mod config;
 mod domain;
 mod fetch_friendly_id;
 mod follows_differ;
+mod google_publisher;
 mod handle_follow_changes;
 mod migrations;
 mod relay_subscriber;
@@ -10,7 +11,7 @@ mod send_with_checks;
 mod worker_pool;
 
 use crate::config::Config;
-use crate::follows_differ::FollowChange;
+use crate::domain::follow_change::FollowChange;
 use follows_differ::FollowsDiffer;
 use handle_follow_changes::handle_follow_changes;
 use migrations::apply_migrations;
@@ -45,12 +46,12 @@ async fn main() -> Result<()> {
     let repo = Arc::new(Repo::new(graph));
 
     info!("Initializing workers for follower list diff calculation");
-    let (follow_change_sender, follow_change_receiver) = mpsc::channel::<FollowChange>(100000);
-    let follows_differ_worker = FollowsDiffer::new(repo.clone(), follow_change_sender.clone());
+    let (follow_change_sender, follow_change_receiver) = mpsc::channel::<FollowChange>(1000);
+    let follows_differ_worker = FollowsDiffer::new(repo.clone(), follow_change_sender);
     let cancellation_token = CancellationToken::new();
-    let (event_sender, event_receiver) = mpsc::channel::<Box<Event>>(100);
+    let (event_sender, event_receiver) = mpsc::channel::<Box<Event>>(10);
     let worker_pool_handle = WorkerPool::start(
-        8,
+        2,
         event_receiver,
         cancellation_token.clone(),
         follows_differ_worker,
@@ -61,9 +62,9 @@ async fn main() -> Result<()> {
     let follow_change_handler_task = handle_follow_changes(
         shared_nostr_client.clone(),
         repo.clone(),
-        follow_change_sender,
         follow_change_receiver,
-    );
+    )
+    .await?;
 
     info!("Subscribing to kind 3 events");
     let five_minutes_ago = Timestamp::now() - 60 * 5;
