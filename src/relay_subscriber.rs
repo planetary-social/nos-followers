@@ -132,11 +132,3 @@ async fn cancel_on_stop_signals(cancellation_token: CancellationToken) -> Result
 
     Ok(())
 }
-
-// Check if all relays disconnected
-async fn all_disconnected(client: &Client) -> bool {
-    let relays = client.pool().relays().await;
-    let futures: Vec<_> = relays.values().map(|relay| relay.is_connected()).collect();
-    let results = join_all(futures).await;
-    results.iter().all(|&is_connected| !is_connected)
-}
