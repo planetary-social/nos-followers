@@ -13,8 +13,9 @@ impl<T> SendWithChecks<T> for Sender<T> {
         if rng.gen_bool(0.05) {
             let max_capacity = self.max_capacity();
             let capacity = self.capacity();
+            let threshold = std::cmp::max(1, max_capacity / 10);
 
-            if capacity < max_capacity / 10 {
+            if capacity < threshold {
                 warn!(
                     "Channel buffer is at 90%! used {} of {} slots",
                     max_capacity - capacity,

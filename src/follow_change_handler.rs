@@ -77,11 +77,10 @@ impl WorkerTask<FollowChange> for FollowChangeHandler {
 
         debug!("{}", follow_change);
 
-        if let Err(e) = self.google_publisher.queue_publication(follow_change).await {
-            error!("Failed to publish follow change: {}", e);
-        }
-
-        Ok(())
+        self.google_publisher
+            .queue_publication(follow_change)
+            .await
+            .map_err(|e| e.into())
     }
 }
 

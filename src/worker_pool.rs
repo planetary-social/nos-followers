@@ -1,8 +1,8 @@
-use crate::send_with_checks::SendWithChecks;
 use futures::Future;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info};
@@ -14,6 +14,7 @@ pub struct WorkerPool {}
 impl WorkerPool {
     pub fn start<Item, Worker>(
         num_workers: usize,
+        worker_timeout_secs: u64,
         mut item_receiver: mpsc::Receiver<Item>,
         cancellation_token: CancellationToken,
         worker: Worker,
@@ -47,9 +48,17 @@ impl WorkerPool {
                         }
 
                         Some(item) = worker_rx.recv() => {
-                            if let Err(e) = worker.call(item).await {
-                                error!("Worker failed: {:?}", e);
-                            }
+                              let result = timeout(Duration::from_secs(worker_timeout_secs), worker.call(item)).await;
+
+                              match result {
+                                  Ok(Ok(())) => {},
+                                  Ok(Err(e)) => {
+                                      error!("Worker failed: {:?}", e);
+                                  },
+                                  Err(_) => {
+                                      error!("Worker task timed out after {} seconds", worker_timeout_secs);
+                                  }
+                              }
                         }
                     }
                 }

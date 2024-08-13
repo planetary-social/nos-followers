@@ -5,7 +5,7 @@ use gcloud_sdk::{
     *,
 };
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -65,8 +65,7 @@ impl GooglePublisher {
             )
             .await?;
 
-        let (publication_sender, mut publication_receiver) =
-            tokio::sync::mpsc::channel::<FollowChange>(1);
+        let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
         tokio::spawn(async move {
             let mut buffer = Vec::new();
@@ -128,10 +127,10 @@ impl GooglePublisher {
         })
     }
 
-    pub async fn queue_publication(&self, follow_change: FollowChange) -> Result<()> {
-        self.sender
-            .send(follow_change)
-            .await
-            .context("Failed to queue follow change")
+    pub async fn queue_publication(
+        &self,
+        follow_change: FollowChange,
+    ) -> Result<(), SendError<FollowChange>> {
+        self.sender.send(follow_change).await
     }
 }

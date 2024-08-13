@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
     let event_workers = config.get_by_key::<usize>("event_workers")?;
     let follow_change_channel_size = config.get_by_key::<usize>("follow_change_channel_size")?;
     let follow_change_workers = config.get_by_key::<usize>("follow_change_workers")?;
+    let worker_timeout_secs = config.get_by_key::<u64>("worker_timeout_secs")?;
 
     info!("Initializing repository at {}", uri);
     let graph = Graph::new(uri, user, password).await?;
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
     let (event_sender, event_receiver) = mpsc::channel::<Box<Event>>(event_channnel_size);
     let event_worker_pool_handle = WorkerPool::start(
         event_workers,
+        worker_timeout_secs,
         event_receiver,
         cancellation_token.clone(),
         follows_differ_worker,
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
 
     let follow_change_handler_task = WorkerPool::start(
         follow_change_workers,
+        worker_timeout_secs,
         follow_change_receiver,
         cancellation_token.clone(),
         follow_change_handler,
