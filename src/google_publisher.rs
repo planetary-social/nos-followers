@@ -7,7 +7,8 @@ use gcloud_sdk::{
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use tracing::{error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info};
 
 struct GooglePublisherClient {
     pubsub_client: GoogleApi<PublisherClient<GoogleAuthMiddleware>>,
@@ -51,7 +52,7 @@ pub struct GooglePublisher {
 }
 
 impl GooglePublisher {
-    pub async fn create() -> Result<Self> {
+    pub async fn create(cancellation_token: CancellationToken) -> Result<Self> {
         let google_project_id = "pub-verse-app";
         let google_topic = "follow-changes";
         let google_full_topic = format!("projects/{}/topics/{}", google_project_id, google_topic);
@@ -81,6 +82,11 @@ impl GooglePublisher {
 
             loop {
                 select! {
+                    _ = cancellation_token.cancelled() => {
+                        debug!("Cancellation token is cancelled, stopping Google publisher");
+                        break;
+                    }
+
                     _ = interval.tick() => {
                         if !buffer.is_empty() {
                             info!("Publishing {} follow changes after {} seconds of inactivity", buffer.len(), seconds);
@@ -91,12 +97,16 @@ impl GooglePublisher {
                         }
                     }
 
-                    Some(follow_change) = publication_receiver.recv() => {
-                        buffer.push(follow_change);
-                    }
-
-                    else => {
-                        break;
+                    recv_result = publication_receiver.recv() => {
+                        match recv_result {
+                            Some(follow_change) => {
+                                buffer.push(follow_change);
+                            }
+                            None => {
+                                debug!("Publication receiver closed, stopping Google publisher");
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -118,7 +128,7 @@ impl GooglePublisher {
         })
     }
 
-    pub async fn queue_publication(&mut self, follow_change: FollowChange) -> Result<()> {
+    pub async fn queue_publication(&self, follow_change: FollowChange) -> Result<()> {
         self.sender
             .send(follow_change)
             .await

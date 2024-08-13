@@ -10,6 +10,7 @@ services:
       - APP__NEO4J_PASSWORD=mydevpassword
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcloud/application_default_credentials.json
       - RUST_LOG=nos_followers=info
+      - RUST_BACKTRACE=1
     volumes:
       - ./config:/app/config
       - ./migrations:/app/migrations

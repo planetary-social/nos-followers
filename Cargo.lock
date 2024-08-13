@@ -1522,6 +1522,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "thiserror",
  "time",
  "tokio",
  "tokio-util",

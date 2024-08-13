@@ -3,12 +3,10 @@ use anyhow::{bail, Result};
 use futures::future::join_all;
 use nostr_sdk::prelude::*;
 use signal::unix::{signal, SignalKind};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info};
 
 pub fn create_client() -> Client {
@@ -23,7 +21,7 @@ pub fn create_client() -> Client {
 }
 
 pub async fn start_nostr_subscription(
-    nostr_client: Arc<Client>,
+    nostr_client: Client,
     relays: &[String],
     filters: Vec<Filter>,
     event_tx: Sender<Box<Event>>,
@@ -43,24 +41,16 @@ pub async fn start_nostr_subscription(
         }
     });
 
-    let tracker = TaskTracker::new();
+    start_subscription(
+        &nostr_client,
+        &filters,
+        event_tx.clone(),
+        cancellation_token.clone(),
+    )
+    .await?;
 
-    while all_disconnected(&nostr_client).await && !cancellation_token.is_cancelled() {
-        start_subscription(
-            &nostr_client,
-            &filters,
-            event_tx.clone(),
-            cancellation_token.clone(),
-        )
-        .await?;
+    info!("Subscription ended");
 
-        if !cancellation_token.is_cancelled() {
-            info!("Subscription ended, waiting 5 seconds before reconnecting");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    }
-
-    tracker.wait().await;
     Ok(())
 }
 
@@ -77,6 +67,7 @@ async fn start_subscription(
     tokio::spawn(async move {
         token_clone.cancelled().await;
         debug!("Cancelling relay subscription worker");
+        client_clone.unsubscribe_all().await;
         if let Err(e) = client_clone.shutdown().await {
             error!("Failed to shutdown client: {}", e);
         }
@@ -94,8 +85,9 @@ async fn start_subscription(
 
             if let RelayPoolNotification::Event { event, .. } = notification {
                 debug!("Received event: {}", event.id);
-                if let Err(e) = event_tx.send_with_checks(event) {
+                if let Err(e) = event_tx.send_with_checks(event).await {
                     error!("Failed to send nostr event: {:?}", e);
+                    cancellation_token.cancel();
                     return Ok(true);
                 }
             }

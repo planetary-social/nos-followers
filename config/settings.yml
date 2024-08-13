@@ -1,1 +1,5 @@
 relay: wss://relay.nos.social
+event_channel_size: 10
+event_workers: 2
+follow_change_channel_size: 5000
+follow_change_workers: 8

@@ -1,19 +1,19 @@
-use rand::Rng;
-use tokio::sync::mpsc::error::TrySendError;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
 pub trait SendWithChecks<T> {
-    fn send_with_checks(&self, item: T) -> Result<(), TrySendError<T>>;
+    async fn send_with_checks(&self, item: T) -> Result<(), SendError<T>>;
 }
 
 impl<T> SendWithChecks<T> for Sender<T> {
-    fn send_with_checks(&self, item: T) -> Result<(), TrySendError<T>> {
-        let max_capacity = self.max_capacity();
-        let capacity = self.capacity();
-
-        let mut rng = rand::thread_rng();
+    async fn send_with_checks(&self, item: T) -> Result<(), SendError<T>> {
+        let mut rng = StdRng::from_entropy();
         if rng.gen_bool(0.05) {
+            let max_capacity = self.max_capacity();
+            let capacity = self.capacity();
+
             if capacity < max_capacity / 10 {
                 warn!(
                     "Channel buffer is at 90%! used {} of {} slots",
@@ -29,6 +29,6 @@ impl<T> SendWithChecks<T> for Sender<T> {
             }
         }
 
-        self.try_send(item)
+        self.send(item).await
     }
 }

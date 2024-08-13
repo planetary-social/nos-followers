@@ -1,11 +1,11 @@
 use crate::send_with_checks::SendWithChecks;
-use anyhow::Result;
 use futures::Future;
+use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::error;
+use tracing::{error, info};
 pub struct WorkerPool {}
 
 // A channel based worker pool that distributes work to a pool of workers.
@@ -17,7 +17,7 @@ impl WorkerPool {
         mut item_receiver: mpsc::Receiver<Item>,
         cancellation_token: CancellationToken,
         worker: Worker,
-    ) -> Result<TaskTracker>
+    ) -> Result<TaskTracker, Box<dyn Error>>
     where
         Item: Send + 'static,
         Worker: WorkerTask<Item> + Send + Sync + 'static,
@@ -28,55 +28,73 @@ impl WorkerPool {
         let mut worker_txs = Vec::new();
 
         let worker_clone = Arc::new(worker);
+        let token_clone = cancellation_token.clone();
 
         for _ in 0..num_workers {
-            let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerTaskItem<Item>>(10);
+            let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerTaskItem<Item>>(1);
             worker_txs.push(worker_tx);
 
-            let tracker = tracker.clone();
+            //let tracker = tracker.clone();
 
-            let w = worker_clone.clone();
+            let worker = worker_clone.clone();
+            let token_clone = token_clone.clone();
             tracker.spawn(async move {
-                while let Some(item) = worker_rx.recv().await {
-                    if let Err(e) = w.call(item).await {
-                        error!("Worker failed: {:?}", e);
+                loop {
+                    tokio::select! {
+                        _ = token_clone.cancelled() => {
+                            info!("Cancellation token is cancelled, stopping worker");
+                            break;
+                        }
+
+                        Some(item) = worker_rx.recv() => {
+                            if let Err(e) = worker.call(item).await {
+                                error!("Worker failed: {:?}", e);
+                            }
+                        }
                     }
                 }
+
+                token_clone.cancel();
+                info!("Worker task finished");
             });
         }
 
-        let token_clone = cancellation_token.clone();
+        let token_clone = token_clone.clone();
 
         // Dispatcher task to worker pool
-        tracker.clone().spawn({
-            async move {
-                // Simple cycle iterator to distribute work to workers in a round-robin fashion.
-                let mut worker_txs_cycle = worker_txs.iter().cycle();
-                let max_capacity = item_receiver.max_capacity();
+        tracker.spawn(async move {
+            // Simple cycle iterator to distribute work to workers in a round-robin fashion.
+            let mut worker_txs_cycle = worker_txs.iter().cycle();
+            let max_capacity = item_receiver.max_capacity();
 
-                while let Some(item) = item_receiver.recv().await {
-                    if token_clone.is_cancelled() {
+            loop {
+                tokio::select! {
+                    _ = token_clone.cancelled() => {
+                        info!("Cancellation token is cancelled, stopping worker pool");
                         break;
                     }
 
-                    let Some(worker_tx) = worker_txs_cycle.next() else {
-                        error!("Failed to get worker");
-                        break;
-                    };
+                    Some(item) = item_receiver.recv() => {
+                        let Some(worker_tx) = worker_txs_cycle.next() else {
+                            error!("Failed to get worker");
+                            break;
+                        };
 
-                    let channel_load =
-                        ((max_capacity - item_receiver.capacity()) * 100 / max_capacity) as u8;
-                    let worker_item = WorkerTaskItem {
-                        item,
-                        channel_load,
-                        max_capacity,
-                    };
-                    if let Err(e) = worker_tx.send_with_checks(worker_item) {
-                        error!("Failed to send to worker: {:?}", e);
-                        break;
+                        let channel_load = ((max_capacity - item_receiver.capacity()) * 100 / max_capacity) as u8;
+                        let worker_item = WorkerTaskItem { item, channel_load };
+
+                        // This is a single item channel so we don't use send_with_checks
+                        if let Err(e) = worker_tx.send(worker_item).await {
+                            error!("Failed to send to worker: {:?}", e);
+                            break;
+                        }
                     }
                 }
+
             }
+
+            token_clone.cancel();
+            info!("Worker pool finished");
         });
 
         Ok(tracker)
@@ -84,13 +102,14 @@ impl WorkerPool {
 }
 
 pub trait WorkerTask<T> {
-    fn call(&self, args: WorkerTaskItem<T>)
-        -> impl Future<Output = Result<()>> + std::marker::Send;
+    fn call(
+        &self,
+        args: WorkerTaskItem<T>,
+    ) -> impl Future<Output = Result<(), Box<dyn Error>>> + std::marker::Send;
 }
 
 pub struct WorkerTaskItem<T> {
     pub item: T,
     // The percentage of the channel's capacity that was used when this item was sent.
     pub channel_load: u8,
-    pub max_capacity: usize,
 }

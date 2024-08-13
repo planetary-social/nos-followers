@@ -4,8 +4,7 @@ use crate::{
     domain::{follow::Follow, follow_change::FollowChange},
     worker_pool::{WorkerTask, WorkerTaskItem},
 };
-use anyhow::{bail, Context, Result};
-use chrono::{DateTime, FixedOffset};
+use chrono::DateTime;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,28 +35,21 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
         let WorkerTaskItem {
             item: event,
-            channel_load,
-            max_capacity,
+            channel_load: _,
         } = worker_task_item;
-
-        info!(
-            "Processing follow list for {} with channel load of {}% of {}",
-            event.pubkey, channel_load, max_capacity
-        );
 
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
         let follower = event.pubkey;
         let mut follows_diff: HashMap<PublicKey, FollowsDiff> = HashMap::new();
-        let event_created_at = timestamp_to_datetime(event.created_at)?;
+
+        let date_time = DateTime::from_timestamp(event.created_at.as_u64() as i64, 0)
+            .ok_or("Failed to convert timestamp to datetime")?;
+        let event_created_at = date_time.fixed_offset();
 
         // Populate stored follows
-        let stored_follows = self
-            .repo
-            .get_follows(&follower)
-            .await
-            .context("Failed to get follows")?;
+        let stored_follows = self.repo.get_follows(&follower).await?;
 
         let mut maybe_latest_stored_updated_at: Option<Timestamp> = None;
         for stored_follow in stored_follows {
@@ -116,24 +108,18 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                         // Still following same followee, run an upsert that just updates the date
                         stored_follow.updated_at = event_created_at;
 
-                        self.repo
-                            .upsert_follow(&stored_follow)
-                            .await
-                            .context(format!("Failed to upsert follow {}", follower))?;
+                        self.repo.upsert_follow(&stored_follow).await?;
 
                         unchanged += 1;
                     } else {
                         // Doesn't exist in the new follows list so we delete the follow
-                        self.repo
-                            .delete_follow(&followee, &follower)
-                            .await
-                            .context(format!("Failed to delete follow for {}", follower))?;
+                        self.repo.delete_follow(&followee, &follower).await?;
 
                         let follow_change =
                             FollowChange::new_unfollowed(event.created_at, follower, followee);
                         self.follow_change_sender
                             .send_with_checks(follow_change)
-                            .context(format!("Failed to send follow change for {}", follower))?;
+                            .await?;
                         unfollowed_counter += 1;
                     }
                 }
@@ -151,17 +137,14 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                         created_at: event_created_at,
                     };
 
-                    self.repo
-                        .upsert_follow(&follow)
-                        .await
-                        .context(format!("Failed to upsert follow {}", follower))?;
+                    self.repo.upsert_follow(&follow).await?;
 
                     let follow_change =
                         FollowChange::new_followed(event.created_at, follower, followee);
 
                     self.follow_change_sender
                         .send_with_checks(follow_change)
-                        .context(format!("Failed to send follow change for {}", follower))?;
+                        .await?;
                     followed_counter += 1;
                 }
             }
@@ -192,17 +175,5 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
         }
 
         Ok(())
-    }
-}
-
-fn timestamp_to_datetime(timestamp: Timestamp) -> Result<DateTime<FixedOffset>> {
-    match DateTime::from_timestamp(timestamp.as_u64() as i64, 0) {
-        Some(dt) => Ok(dt.fixed_offset()),
-        None => {
-            bail!(
-                "Failed to convert timestamp to datetime: {}",
-                timestamp.as_u64()
-            )
-        }
     }
 }
