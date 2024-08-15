@@ -73,6 +73,6 @@ COPY --from=build /bin/server /bin/
 COPY ./migrations /app/migrations
 
 # Expose the port that the application listens on.
-EXPOSE 8000
+EXPOSE 3000
 
 ENTRYPOINT ["/bin/server"]
