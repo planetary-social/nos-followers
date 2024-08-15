@@ -1,6 +1,5 @@
 use crate::send_with_checks::SendWithChecks;
 use anyhow::{bail, Result};
-use futures::future::join_all;
 use nostr_sdk::prelude::*;
 use signal::unix::{signal, SignalKind};
 use std::time::Duration;
