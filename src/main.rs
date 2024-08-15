@@ -4,6 +4,7 @@ mod fetch_friendly_id;
 mod follow_change_handler;
 mod follows_differ;
 mod google_publisher;
+mod http_server;
 mod migrations;
 mod relay_subscriber;
 mod repo;
@@ -14,6 +15,7 @@ use crate::config::Config;
 use crate::domain::follow_change::FollowChange;
 use follow_change_handler::FollowChangeHandler;
 use follows_differ::FollowsDiffer;
+use http_server::HttpServer;
 use migrations::apply_migrations;
 use neo4rs::Graph;
 use nostr_sdk::prelude::*;
@@ -89,14 +91,21 @@ async fn main() -> Result<()> {
         .since(five_minutes_ago)
         .kind(Kind::ContactList)];
 
-    start_nostr_subscription(
+    let nostr_sub = start_nostr_subscription(
         shared_nostr_client,
-        &[relay],
+        [relay].into(),
         filters,
         event_sender,
         cancellation_token.clone(),
-    )
-    .await?;
+    );
+
+    let http_server = HttpServer::run(cancellation_token.clone());
+
+    tokio::select! {
+        _ = nostr_sub => info!("Nostr subscription ended"),
+        _ = http_server => info!("HTTP server ended"),
+        _ = cancellation_token.cancelled() => info!("Cancellation token cancelled"),
+    }
 
     info!("Finished Nostr subscription");
 

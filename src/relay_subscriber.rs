@@ -21,7 +21,7 @@ pub fn create_client() -> Client {
 
 pub async fn start_nostr_subscription(
     nostr_client: Client,
-    relays: &[String],
+    relays: Vec<String>,
     filters: Vec<Filter>,
     event_tx: Sender<Box<Event>>,
     cancellation_token: CancellationToken,
