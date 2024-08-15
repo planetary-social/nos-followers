@@ -13,7 +13,6 @@ services:
       - RUST_BACKTRACE=1
     volumes:
       - ./config:/app/config
-      - ./migrations:/app/migrations
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git/db
       - build-cache:/app/target
