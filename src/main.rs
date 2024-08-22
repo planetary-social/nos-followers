@@ -1,14 +1,13 @@
 mod config;
 mod domain;
-mod fetch_friendly_id;
 mod follow_change_handler;
 mod follows_differ;
 mod google_publisher;
 mod http_server;
 mod migrations;
+mod refresh_friendly_id;
 mod relay_subscriber;
 mod repo;
-mod send_with_checks;
 mod worker_pool;
 
 use crate::config::Config;
@@ -22,7 +21,7 @@ use nostr_sdk::prelude::*;
 use relay_subscriber::{create_client, start_nostr_subscription};
 use repo::Repo;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -55,11 +54,10 @@ async fn main() -> Result<()> {
     let repo = Arc::new(Repo::new(graph));
 
     info!("Initializing workers for follower list diff calculation");
-    let (follow_change_sender, follow_change_receiver) =
-        mpsc::channel::<FollowChange>(follow_change_channel_size);
-    let follows_differ_worker = FollowsDiffer::new(repo.clone(), follow_change_sender);
+    let (follow_change_sender, _) = broadcast::channel::<FollowChange>(follow_change_channel_size);
+    let follows_differ_worker = FollowsDiffer::new(repo.clone(), follow_change_sender.clone());
     let cancellation_token = CancellationToken::new();
-    let (event_sender, event_receiver) = mpsc::channel::<Box<Event>>(event_channnel_size);
+    let (event_sender, event_receiver) = broadcast::channel::<Box<Event>>(event_channnel_size);
     let event_worker_pool_handle = WorkerPool::start(
         event_workers,
         worker_timeout_secs,
@@ -74,13 +72,14 @@ async fn main() -> Result<()> {
         repo.clone(),
         shared_nostr_client.clone(),
         cancellation_token.clone(),
+        worker_timeout_secs,
     )
     .await?;
 
     let follow_change_handler_task = WorkerPool::start(
         follow_change_workers,
-        worker_timeout_secs,
-        follow_change_receiver,
+        worker_timeout_secs * 2,
+        follow_change_sender.subscribe(),
         cancellation_token.clone(),
         follow_change_handler,
     )?;

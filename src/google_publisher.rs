@@ -167,7 +167,7 @@ impl GooglePublisher {
             return Ok(());
         }
 
-        return self.sender.send(follow_change).await;
+        self.sender.send(follow_change).await
     }
 }
 

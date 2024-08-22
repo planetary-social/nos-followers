@@ -1,11 +1,14 @@
 use futures::Future;
 use std::error::Error;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{
+    broadcast::{self, error::RecvError},
+    mpsc,
+};
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 pub struct WorkerPool {}
 
 // A channel based worker pool that distributes work to a pool of workers.
@@ -15,12 +18,12 @@ impl WorkerPool {
     pub fn start<Item, Worker>(
         num_workers: usize,
         worker_timeout_secs: u64,
-        mut item_receiver: mpsc::Receiver<Item>,
+        mut item_receiver: broadcast::Receiver<Item>,
         cancellation_token: CancellationToken,
         worker: Worker,
     ) -> Result<TaskTracker, Box<dyn Error>>
     where
-        Item: Send + 'static,
+        Item: Send + Clone + 'static,
         Worker: WorkerTask<Item> + Send + Sync + 'static,
     {
         let tracker = TaskTracker::new();
@@ -74,7 +77,6 @@ impl WorkerPool {
         tracker.spawn(async move {
             // Simple cycle iterator to distribute work to workers in a round-robin fashion.
             let mut worker_txs_cycle = worker_txs.iter().cycle();
-            let max_capacity = item_receiver.max_capacity();
 
             loop {
                 tokio::select! {
@@ -83,23 +85,32 @@ impl WorkerPool {
                         break;
                     }
 
-                    Some(item) = item_receiver.recv() => {
-                        let Some(worker_tx) = worker_txs_cycle.next() else {
-                            error!("Failed to get worker");
-                            break;
-                        };
+                    result = item_receiver.recv() => {
+                        match result {
+                            Ok(item) => {
+                                let Some(worker_tx) = worker_txs_cycle.next() else {
+                                    error!("Failed to get worker");
+                                    break;
+                                };
 
-                        let channel_load = ((max_capacity - item_receiver.capacity()) * 100 / max_capacity) as u8;
-                        let worker_item = WorkerTaskItem { item, channel_load };
+                                let worker_item = WorkerTaskItem { item };
 
-                        // This is a single item channel so we don't use send_with_checks
-                        if let Err(e) = worker_tx.send(worker_item).await {
-                            error!("Failed to send to worker: {:?}", e);
-                            break;
+                                // This is a single item channel so we don't use send_with_checks
+                                if let Err(e) = worker_tx.send(worker_item).await {
+                                    error!("Failed to send to worker: {:?}", e);
+                                    break;
+                                }
+                            }
+                            Err(RecvError::Lagged(n)) => {
+                                warn!("Receiver lagged and missed {} messages", n);
+                            }
+                            Err(RecvError::Closed) => {
+                                error!("Item receiver channel closed");
+                                break;
+                            }
                         }
                     }
                 }
-
             }
 
             token_clone.cancel();
@@ -119,6 +130,4 @@ pub trait WorkerTask<T> {
 
 pub struct WorkerTaskItem<T> {
     pub item: T,
-    // The percentage of the channel's capacity that was used when this item was sent.
-    pub channel_load: u8,
 }

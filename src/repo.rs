@@ -13,6 +13,33 @@ impl Repo {
         Self { graph }
     }
 
+    pub async fn get_friendly_id(
+        &self,
+        public_key: &PublicKey,
+    ) -> Result<Option<String>, RepoError> {
+        let statement = r#"
+            MATCH (user:User {pubkey: $pubkey_val})
+            RETURN user.friendly_id AS friendly_id
+            "#;
+
+        let query = query(statement).param("pubkey_val", public_key.to_hex());
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::GetFriendlyId)?;
+
+        if let Ok(Some(row)) = records.next().await {
+            let friendly_id = row
+                .get::<String>("friendly_id")
+                .map_err(RepoError::Deserialization)?;
+            Ok(Some(friendly_id))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn add_friendly_id(
         &self,
         public_key: &PublicKey,
@@ -97,16 +124,16 @@ impl Repo {
         while let Ok(Some(row)) = records.next().await {
             let followee = row
                 .get::<String>("followee")
-                .map_err(RepoError::GetFollowsDeserialization)?;
+                .map_err(RepoError::Deserialization)?;
             let follower = row
                 .get::<String>("follower")
-                .map_err(RepoError::GetFollowsDeserialization)?;
+                .map_err(RepoError::Deserialization)?;
             let updated_at = row
                 .get::<DateTime<FixedOffset>>("updated_at")
-                .map_err(RepoError::GetFollowsDeserialization)?;
+                .map_err(RepoError::Deserialization)?;
             let created_at = row
                 .get::<DateTime<FixedOffset>>("created_at")
-                .map_err(RepoError::GetFollowsDeserialization)?;
+                .map_err(RepoError::Deserialization)?;
 
             follows.push(Follow {
                 followee: PublicKey::from_hex(&followee).map_err(RepoError::GetFollowsPubkey)?,
@@ -131,7 +158,9 @@ pub enum RepoError {
     #[error("Failed to get follows: {0}")]
     GetFollows(neo4rs::Error),
     #[error("Failed to get follows: {0}")]
-    GetFollowsDeserialization(neo4rs::DeError),
-    #[error("Failed to get follows: {0}")]
     GetFollowsPubkey(nostr_sdk::key::Error),
+    #[error("Failed to get friendly_id: {0}")]
+    GetFriendlyId(neo4rs::Error),
+    #[error("Failed to deserialize: {0}")]
+    Deserialization(neo4rs::DeError),
 }

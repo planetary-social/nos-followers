@@ -1,5 +1,4 @@
 use crate::repo::Repo;
-use crate::send_with_checks::SendWithChecks;
 use crate::{
     domain::{follow::Follow, follow_change::FollowChange},
     worker_pool::{WorkerTask, WorkerTaskItem},
@@ -8,7 +7,7 @@ use chrono::DateTime;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::broadcast::Sender;
 use tracing::{debug, info};
 
 #[derive(Default, Debug)]
@@ -33,10 +32,7 @@ impl FollowsDiffer {
 
 impl WorkerTask<Box<Event>> for FollowsDiffer {
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
-        let WorkerTaskItem {
-            item: event,
-            channel_load: _,
-        } = worker_task_item;
+        let WorkerTaskItem { item: event } = worker_task_item;
 
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
@@ -117,9 +113,7 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
 
                         let follow_change =
                             FollowChange::new_unfollowed(event.created_at, follower, followee);
-                        self.follow_change_sender
-                            .send_with_checks(follow_change)
-                            .await?;
+                        self.follow_change_sender.send(follow_change)?;
                         unfollowed_counter += 1;
                     }
                 }
@@ -142,9 +136,7 @@ impl WorkerTask<Box<Event>> for FollowsDiffer {
                     let follow_change =
                         FollowChange::new_followed(event.created_at, follower, followee);
 
-                    self.follow_change_sender
-                        .send_with_checks(follow_change)
-                        .await?;
+                    self.follow_change_sender.send(follow_change)?;
                     followed_counter += 1;
                 }
             }

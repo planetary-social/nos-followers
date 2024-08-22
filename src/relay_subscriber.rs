@@ -1,10 +1,9 @@
-use crate::send_with_checks::SendWithChecks;
 use anyhow::{bail, Result};
 use nostr_sdk::prelude::*;
 use signal::unix::{signal, SignalKind};
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -84,7 +83,7 @@ async fn start_subscription(
 
             if let RelayPoolNotification::Event { event, .. } = notification {
                 debug!("Received event: {}", event.id);
-                if let Err(e) = event_tx.send_with_checks(event).await {
+                if let Err(e) = event_tx.send(event) {
                     error!("Failed to send nostr event: {:?}", e);
                     cancellation_token.cancel();
                     return Ok(true);
