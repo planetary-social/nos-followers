@@ -19,7 +19,10 @@ pub async fn fetch_friendly_id(
         return npub_or_pubkey;
     };
 
-    let name_or_npub_or_pubkey = metadata.name.unwrap_or(npub_or_pubkey);
+    let name_or_npub_or_pubkey = metadata
+        .name
+        .filter(|name| !name.is_empty())
+        .unwrap_or(npub_or_pubkey);
 
     if let Some(nip05_value) = metadata.nip05 {
         if verify {
