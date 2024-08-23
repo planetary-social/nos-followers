@@ -44,6 +44,8 @@ impl WorkerTask<FollowChange> for FollowChangeHandler {
             item: mut follow_change,
         } = worker_task_item;
 
+        // Fetch friendly IDs for the pubkeys or get it from DB if it takes more
+        // than timeout_secs
         let (friendly_follower, friendly_followee) = tokio::select!(
             result = fetch_friendly_ids(
                 &self.repo,
@@ -87,7 +89,7 @@ async fn get_friendly_ids_from_db(
     timeout_secs: u64,
 ) -> (String, String) {
     // Wait some seconds to give some time to the friendly follower and
-    // followee to be found
+    // followee to be found from nostr metadata or nip05 servers
     sleep(std::time::Duration::from_secs(timeout_secs)).await;
 
     let (friendly_follower, friendly_followee) = tokio::join!(
