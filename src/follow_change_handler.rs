@@ -1,7 +1,7 @@
 use crate::domain::follow_change::FollowChange;
 use crate::google_publisher::GooglePublisher;
 use crate::refresh_friendly_id::refresh_friendly_id;
-use crate::repo::Repo;
+use crate::repo::{Repo, RepoTrait};
 use crate::worker_pool::{WorkerTask, WorkerTaskItem};
 use nostr_sdk::prelude::*;
 use std::error::Error;
@@ -10,6 +10,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+/// Fetches friendly ids and then sends follow change to google pubsub
 pub struct FollowChangeHandler {
     repo: Arc<Repo>,
     google_publisher: GooglePublisher,
@@ -45,7 +46,7 @@ impl WorkerTask<FollowChange> for FollowChangeHandler {
         } = worker_task_item;
 
         // Fetch friendly IDs for the pubkeys or get it from DB if it takes more
-        // than timeout_secs
+        // than timeout_secs. Whatever if found through the network is cached.
         let (friendly_follower, friendly_followee) = tokio::select!(
             result = fetch_friendly_ids(
                 &self.repo,
@@ -70,6 +71,7 @@ impl WorkerTask<FollowChange> for FollowChangeHandler {
     }
 }
 
+/// Get pubkey info from Nostr metadata or nip05 servers
 async fn fetch_friendly_ids(
     repo: &Arc<Repo>,
     nostr_client: &Client,
@@ -83,13 +85,14 @@ async fn fetch_friendly_ids(
     (friendly_follower, friendly_followee)
 }
 
+/// Waits some seconds (to give some time for the pubkey info to be found from
+/// nostr metadata or nip05 servers) and then just fetches whatever is found in
+/// the DB
 async fn get_friendly_ids_from_db(
     repo: &Arc<Repo>,
     follow_change: &FollowChange,
     timeout_secs: u64,
 ) -> (String, String) {
-    // Wait some seconds to give some time to the friendly follower and
-    // followee to be found from nostr metadata or nip05 servers
     sleep(std::time::Duration::from_secs(timeout_secs)).await;
 
     let (friendly_follower, friendly_followee) = tokio::join!(

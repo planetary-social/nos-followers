@@ -2,14 +2,14 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub enum ChangeType {
     Followed,
     Unfollowed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct FollowChange {
     pub change_type: ChangeType,
@@ -72,6 +72,22 @@ impl fmt::Display for FollowChange {
                 .clone()
                 .unwrap_or_else(|| "N/A".to_string()),
             self.at.to_human_datetime()
+        )
+    }
+}
+
+impl fmt::Debug for FollowChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}{} at {}",
+            &self.follower.to_hex()[..3],
+            match self.change_type {
+                ChangeType::Followed => "--->",
+                ChangeType::Unfollowed => "-x->",
+            },
+            &self.followee.to_hex()[..3],
+            self.at
         )
     }
 }

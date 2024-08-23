@@ -1,3 +1,5 @@
+use core::panic;
+
 use crate::domain::follow::Follow;
 use chrono::{DateTime, FixedOffset};
 use neo4rs::{query, Graph};
@@ -12,11 +14,43 @@ impl Repo {
     pub fn new(graph: Graph) -> Self {
         Self { graph }
     }
+}
 
-    pub async fn get_friendly_id(
+pub trait RepoTrait {
+    async fn get_friendly_id(&self, _public_key: &PublicKey) -> Result<Option<String>, RepoError> {
+        panic!("Not implemented")
+    }
+    async fn add_friendly_id(
         &self,
-        public_key: &PublicKey,
-    ) -> Result<Option<String>, RepoError> {
+        _public_key: &PublicKey,
+        _friendly_id: &str,
+    ) -> Result<(), RepoError> {
+        panic!("Not implemented")
+    }
+    fn upsert_follow(
+        &self,
+        _follow: &Follow,
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
+
+    fn delete_follow(
+        &self,
+        _followee: &PublicKey,
+        _follower: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
+    fn get_follows(
+        &self,
+        _follower: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<Vec<Follow>, RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
+}
+
+impl RepoTrait for Repo {
+    async fn get_friendly_id(&self, public_key: &PublicKey) -> Result<Option<String>, RepoError> {
         let statement = r#"
             MATCH (user:User {pubkey: $pubkey_val})
             RETURN user.friendly_id AS friendly_id
@@ -40,7 +74,7 @@ impl Repo {
         }
     }
 
-    pub async fn add_friendly_id(
+    async fn add_friendly_id(
         &self,
         public_key: &PublicKey,
         friendly_id: &str,
@@ -63,7 +97,7 @@ impl Repo {
         Ok(())
     }
 
-    pub async fn upsert_follow(&self, follow: &Follow) -> Result<(), RepoError> {
+    async fn upsert_follow(&self, follow: &Follow) -> Result<(), RepoError> {
         let statement = r#"
             MERGE (followee:User {pubkey: $followee_val})
             MERGE (follower:User {pubkey: $follower_val})
@@ -85,7 +119,7 @@ impl Repo {
         Ok(())
     }
 
-    pub async fn delete_follow(
+    async fn delete_follow(
         &self,
         followee: &PublicKey,
         follower: &PublicKey,
@@ -106,7 +140,7 @@ impl Repo {
         Ok(())
     }
 
-    pub async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<Follow>, RepoError> {
+    async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<Follow>, RepoError> {
         let statement = r#"
             MATCH (follower:User {pubkey: $follower_val})-[r:FOLLOWS]->(followee:User)
             RETURN followee.pubkey AS followee, follower.pubkey AS follower, r.created_at AS created_at, r.updated_at AS updated_at

@@ -131,3 +131,9 @@ pub trait WorkerTask<T> {
 pub struct WorkerTaskItem<T> {
     pub item: T,
 }
+
+impl<T> WorkerTaskItem<T> {
+    pub fn new(item: T) -> Self {
+        Self { item }
+    }
+}

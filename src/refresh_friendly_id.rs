@@ -1,4 +1,4 @@
-use crate::repo::Repo;
+use crate::repo::{Repo, RepoTrait};
 use cached::proc_macro::cached;
 use cached::TimedSizedCache;
 use nostr_sdk::prelude::*;
@@ -34,11 +34,9 @@ struct Nip05Verifier;
 
 impl VerifyNip05 for Nip05Verifier {
     async fn verify_nip05(&self, public_key: &PublicKey, nip05_value: &str) -> bool {
-        if let Ok(verified) = nip05::verify(public_key, nip05_value, None).await {
-            return verified;
-        }
-
-        return false;
+        nip05::verify(public_key, nip05_value, None)
+            .await
+            .unwrap_or(false)
     }
 }
 

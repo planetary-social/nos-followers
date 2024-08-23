@@ -65,6 +65,9 @@ impl GooglePublisherClient {
     }
 }
 
+/// Google publisher for follow changes. It batches follow changes and publishes
+/// them to Google PubSub after certain time is elapsed or a size threshold is
+/// hit.
 pub struct GooglePublisher {
     sender: mpsc::Sender<FollowChange>,
 }

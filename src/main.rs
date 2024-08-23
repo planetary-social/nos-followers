@@ -10,8 +10,8 @@ mod relay_subscriber;
 mod repo;
 mod worker_pool;
 
-use crate::config::Config;
-use crate::domain::follow_change::FollowChange;
+use config::Config;
+use domain::follow_change::FollowChange;
 use follow_change_handler::FollowChangeHandler;
 use follows_differ::FollowsDiffer;
 use http_server::HttpServer;
@@ -20,6 +20,7 @@ use neo4rs::Graph;
 use nostr_sdk::prelude::*;
 use relay_subscriber::{create_client, start_nostr_subscription};
 use repo::Repo;
+
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
