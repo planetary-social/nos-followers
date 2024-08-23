@@ -1,7 +1,7 @@
 use core::panic;
 
 use crate::domain::follow::Follow;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
 use thiserror::Error;
@@ -65,9 +65,9 @@ impl RepoTrait for Repo {
             .map_err(RepoError::GetFriendlyId)?;
 
         if let Ok(Some(row)) = records.next().await {
-            let friendly_id = row
-                .get::<String>("friendly_id")
-                .map_err(RepoError::Deserialization)?;
+            let friendly_id = row.get::<String>("friendly_id").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'friendly_id' field")
+            })?;
             Ok(Some(friendly_id))
         } else {
             Ok(None)
@@ -107,7 +107,7 @@ impl RepoTrait for Repo {
             "#;
 
         let query = query(statement)
-            .param("updated_at", follow.updated_at.naive_utc())
+            .param("updated_at", (follow.updated_at.naive_utc(), "Etc/UTC"))
             .param("followee_val", follow.followee.to_hex())
             .param("follower_val", follow.follower.to_hex());
 
@@ -156,18 +156,14 @@ impl RepoTrait for Repo {
 
         let mut follows: Vec<Follow> = Vec::new();
         while let Ok(Some(row)) = records.next().await {
-            let followee = row
-                .get::<String>("followee")
-                .map_err(RepoError::Deserialization)?;
-            let follower = row
-                .get::<String>("follower")
-                .map_err(RepoError::Deserialization)?;
-            let updated_at = row
-                .get::<DateTime<Utc>>("updated_at")
-                .map_err(RepoError::Deserialization)?;
-            let created_at = row
-                .get::<DateTime<Utc>>("created_at")
-                .map_err(RepoError::Deserialization)?;
+            let followee = row.get::<String>("followee").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'followee' field")
+            })?;
+            let follower = row.get::<String>("follower").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'follower' field")
+            })?;
+            let updated_at = parse_datetime(&row, "updated_at")?;
+            let created_at = parse_datetime(&row, "created_at")?;
 
             follows.push(Follow {
                 followee: PublicKey::from_hex(&followee).map_err(RepoError::GetFollowsPubkey)?,
@@ -179,6 +175,15 @@ impl RepoTrait for Repo {
 
         Ok(follows)
     }
+}
+
+/// A function to read as DateTime<Utc> a value stored either as LocalDatetime or DateTime<Utc>
+fn parse_datetime(row: &neo4rs::Row, field: &str) -> Result<DateTime<Utc>, RepoError> {
+    row.get::<DateTime<Utc>>(field)
+        .or_else(|_| row.get::<NaiveDateTime>(field).map(|naive| naive.and_utc()))
+        .map_err(|e| {
+            RepoError::deserialization_with_context(e, format!("deserializing '{}' field", field))
+        })
 }
 
 #[derive(Error, Debug)]
@@ -195,6 +200,20 @@ pub enum RepoError {
     GetFollowsPubkey(nostr_sdk::key::Error),
     #[error("Failed to get friendly_id: {0}")]
     GetFriendlyId(neo4rs::Error),
-    #[error("Failed to deserialize: {0}")]
-    Deserialization(neo4rs::DeError),
+    #[error("Failed to deserialize: {source} ({context})")]
+    Deserialization {
+        source: neo4rs::DeError,
+        context: String,
+    },
+}
+impl RepoError {
+    pub fn deserialization_with_context<S: Into<String>>(
+        source: neo4rs::DeError,
+        context: S,
+    ) -> Self {
+        RepoError::Deserialization {
+            source,
+            context: context.into(),
+        }
+    }
 }

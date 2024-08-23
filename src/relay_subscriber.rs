@@ -84,7 +84,7 @@ async fn start_subscription(
             if let RelayPoolNotification::Event { event, .. } = notification {
                 debug!("Received event: {}", event.id);
                 if let Err(e) = event_tx.send(event) {
-                    error!("Failed to send nostr event: {:?}", e);
+                    error!("Failed to send nostr event: {}", e);
                     cancellation_token.cancel();
                     return Ok(true);
                 }

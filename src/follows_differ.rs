@@ -78,6 +78,7 @@ where
             }
         }
     }
+
     async fn process_follows_diff(
         &self,
         follows_diff: HashMap<PublicKey, FollowsDiff>,
@@ -96,7 +97,7 @@ where
                         self.repo.upsert_follow(&stored_follow).await?;
                         unchanged += 1;
                     } else {
-                        self.repo.delete_follow(&followee, &follower).await?;
+                        self.repo.delete_follow(&followee, follower).await?;
                         self.send_follow_change(FollowChange::new_unfollowed(
                             Timestamp::from(event_created_at.timestamp() as u64),
                             *follower,
@@ -216,6 +217,12 @@ fn log_line(
             follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged,
         ));
     }
+
+    debug!(
+        "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged, first seen: {}",
+        follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged, first_seen
+    );
+
     None
 }
 

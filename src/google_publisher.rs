@@ -147,7 +147,7 @@ impl GooglePublisher {
                         buffer.len(), size_threshold
                     );
                     if let Err(e) = client.publish_events(buffer.split_off(0)).await {
-                        error!("Failed to publish events: {:?}", e);
+                        error!("Failed to publish events: {}", e);
                         break;
                     }
                 }

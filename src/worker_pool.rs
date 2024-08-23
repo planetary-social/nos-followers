@@ -56,7 +56,7 @@ impl WorkerPool {
                               match result {
                                   Ok(Ok(())) => {},
                                   Ok(Err(e)) => {
-                                      error!("Worker failed: {:?}", e);
+                                      error!("Worker failed: {}", e);
                                   },
                                   Err(_) => {
                                       error!("Worker task timed out after {} seconds", worker_timeout_secs);
@@ -97,7 +97,7 @@ impl WorkerPool {
 
                                 // This is a single item channel so we don't use send_with_checks
                                 if let Err(e) = worker_tx.send(worker_item).await {
-                                    error!("Failed to send to worker: {:?}", e);
+                                    error!("Failed to send to worker: {}", e);
                                     break;
                                 }
                             }
