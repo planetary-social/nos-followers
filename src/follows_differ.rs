@@ -3,7 +3,7 @@ use crate::{
     domain::{follow::Follow, follow_change::FollowChange},
     worker_pool::{WorkerTask, WorkerTaskItem},
 };
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,12 +33,6 @@ where
             repo,
             follow_change_sender,
         }
-    }
-
-    fn convert_timestamp(&self, timestamp: Timestamp) -> Result<DateTime<FixedOffset>> {
-        DateTime::from_timestamp(timestamp.as_u64() as i64, 0)
-            .map(|dt| dt.fixed_offset())
-            .ok_or_else(|| "Failed to convert timestamp to datetime".into())
     }
 
     /// Initializes a structure that holds the differences between the stored
@@ -84,12 +78,11 @@ where
             }
         }
     }
-
     async fn process_follows_diff(
         &self,
         follows_diff: HashMap<PublicKey, FollowsDiff>,
         follower: &PublicKey,
-        event_created_at: DateTime<FixedOffset>,
+        event_created_at: DateTime<Utc>,
     ) -> Result<(usize, usize, usize)> {
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
@@ -179,7 +172,7 @@ where
         let WorkerTaskItem { item: event } = worker_task_item;
         let follower = event.pubkey;
 
-        let event_created_at = self.convert_timestamp(event.created_at)?;
+        let event_created_at = convert_timestamp(event.created_at.as_u64())?;
 
         // Get the stored follows and the latest update time from the database
         let (mut follows_diff, maybe_latest_stored_updated_at) =
@@ -216,6 +209,10 @@ where
 
         Ok(())
     }
+}
+
+fn convert_timestamp(timestamp: u64) -> Result<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp(timestamp as i64, 0).ok_or("Invalid timestamp".into())
 }
 
 #[cfg(test)]

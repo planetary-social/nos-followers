@@ -1,7 +1,7 @@
 use core::panic;
 
 use crate::domain::follow::Follow;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, Utc};
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
 use thiserror::Error;
@@ -107,7 +107,7 @@ impl RepoTrait for Repo {
             "#;
 
         let query = query(statement)
-            .param("updated_at", follow.updated_at)
+            .param("updated_at", follow.updated_at.naive_utc())
             .param("followee_val", follow.followee.to_hex())
             .param("follower_val", follow.follower.to_hex());
 
@@ -163,10 +163,10 @@ impl RepoTrait for Repo {
                 .get::<String>("follower")
                 .map_err(RepoError::Deserialization)?;
             let updated_at = row
-                .get::<DateTime<FixedOffset>>("updated_at")
+                .get::<DateTime<Utc>>("updated_at")
                 .map_err(RepoError::Deserialization)?;
             let created_at = row
-                .get::<DateTime<FixedOffset>>("created_at")
+                .get::<DateTime<Utc>>("created_at")
                 .map_err(RepoError::Deserialization)?;
 
             follows.push(Follow {
