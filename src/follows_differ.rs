@@ -134,34 +134,6 @@ where
         self.follow_change_sender.send(follow_change)?;
         Ok(())
     }
-
-    fn log_results(
-        &self,
-        follower: PublicKey,
-        event_created_at: Timestamp,
-        followed_counter: usize,
-        unfollowed_counter: usize,
-        unchanged: usize,
-        first_seen: bool,
-    ) {
-        if first_seen && followed_counter > 0 {
-            info!(
-                "Pubkey {}: date {}, {} followed, new follows list",
-                follower,
-                event_created_at.to_human_datetime(),
-                followed_counter,
-            );
-        } else if followed_counter > 0 || unfollowed_counter > 0 {
-            info!(
-                "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
-                follower,
-                event_created_at.to_human_datetime(),
-                followed_counter,
-                unfollowed_counter,
-                unchanged
-            );
-        }
-    }
 }
 
 impl<T> WorkerTask<Box<Event>> for FollowsDiffer<T>
@@ -198,17 +170,53 @@ where
             .process_follows_diff(follows_diff, &follower, event_created_at)
             .await?;
 
-        self.log_results(
+        if let Some(log_line) = log_line(
             follower,
             event.created_at,
             followed_counter,
             unfollowed_counter,
             unchanged,
             first_seen,
-        );
+            maybe_latest_stored_updated_at,
+        ) {
+            info!("{}", log_line);
+        }
 
         Ok(())
     }
+}
+
+fn log_line(
+    follower: PublicKey,
+    event_created_at: Timestamp,
+    followed_counter: usize,
+    unfollowed_counter: usize,
+    unchanged: usize,
+    first_seen: bool,
+    maybe_latest_stored_updated_at: Option<Timestamp>,
+) -> Option<String> {
+    let timestamp_diff = if let Some(latest_stored_updated_at) = maybe_latest_stored_updated_at {
+        format!(
+            "[{}->{}]",
+            latest_stored_updated_at.to_human_datetime(),
+            event_created_at.to_human_datetime()
+        )
+    } else {
+        format!("[new->{}]", event_created_at.to_human_datetime())
+    };
+
+    if first_seen && followed_counter > 0 {
+        return Some(format!(
+            "Pubkey {}: date {}, {} followed, new follows list",
+            follower, timestamp_diff, followed_counter,
+        ));
+    } else if followed_counter > 0 || unfollowed_counter > 0 {
+        return Some(format!(
+            "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
+            follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged,
+        ));
+    }
+    None
 }
 
 fn convert_timestamp(timestamp: u64) -> Result<DateTime<Utc>> {
