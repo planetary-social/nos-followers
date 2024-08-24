@@ -525,6 +525,46 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn test_final_state_with_older_list_ignored() {
+        let followee1_pubkey = Keys::generate().public_key();
+        let followee2_pubkey = Keys::generate().public_key();
+        let followee3_pubkey = Keys::generate().public_key();
+        let follower_keys = Keys::generate();
+        let follower_pubkey = follower_keys.public_key();
+
+        // Monday's list: follower follows followee1
+        let monday_list = create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000000);
+
+        // Wednesday's update: follower follows followee1 and followee3
+        let wednesday_update = create_contact_event(
+            &follower_keys,
+            vec![followee1_pubkey, followee3_pubkey],
+            1000000020,
+        );
+
+        // Tuesday's list arrives late: follower follows followee1 and followee2
+        let tuesday_list = create_contact_event(
+            &follower_keys,
+            vec![followee1_pubkey, followee2_pubkey],
+            1000000010,
+        );
+
+        // Apply Monday's list, then Wednesday's update, and finally the late Tuesday list
+        assert_follow_changes(
+            vec![monday_list, wednesday_update, tuesday_list],
+            vec![
+                // Monday: followee1 is followed
+                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
+                // Wednesday: followee3 is followed (with followee1 still followed)
+                FollowChange::new_followed(1000000020.into(), follower_pubkey, followee3_pubkey),
+                // Tuesday's late update should now add followee2 without overwriting newer data
+                FollowChange::new_followed(1000000010.into(), follower_pubkey, followee2_pubkey),
+            ],
+        )
+        .await;
+    }
+
     async fn assert_follow_changes(contact_events: Vec<Event>, mut expected: Vec<FollowChange>) {
         let follow_changes = get_follow_changes_from_contact_events(contact_events)
             .await
