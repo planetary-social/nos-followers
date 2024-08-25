@@ -222,8 +222,8 @@ fn log_line(
         ));
     }
 
-    // Investigate states in which there are no followers
-    if followed_counter == 0 {
+    // Investigate states in which there are no followees but there are unfollowed followees
+    if followed_counter == 0 && unfollowed_counter > 0 {
         return Some(format!(
             "ALL UNFOLLOWED: Pubkey {}: date {}, {} unfollowed, {} unchanged, {}",
             follower,
