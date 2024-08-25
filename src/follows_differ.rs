@@ -223,7 +223,7 @@ fn log_line(
     }
 
     // Investigate states in which there are no followees but there are unfollowed followees
-    if followed_counter == 0 && unfollowed_counter > 0 {
+    if followed_counter == 0 && unfollowed_counter > 0 && unchanged == 0 {
         return Some(format!(
             "ALL UNFOLLOWED: Pubkey {}: date {}, {} unfollowed, {} unchanged, {}",
             follower,
