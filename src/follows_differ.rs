@@ -179,6 +179,7 @@ where
             unchanged,
             first_seen,
             maybe_latest_stored_updated_at,
+            &event,
         ) {
             info!("{}", log_line);
         }
@@ -195,6 +196,7 @@ fn log_line(
     unchanged: usize,
     first_seen: bool,
     maybe_latest_stored_updated_at: Option<Timestamp>,
+    event: &Event,
 ) -> Option<String> {
     let timestamp_diff = if let Some(latest_stored_updated_at) = maybe_latest_stored_updated_at {
         format!(
@@ -211,10 +213,24 @@ fn log_line(
             "Pubkey {}: date {}, {} followed, new follows list",
             follower, timestamp_diff, followed_counter,
         ));
-    } else if followed_counter > 0 || unfollowed_counter > 0 {
+    }
+
+    if followed_counter > 0 {
         return Some(format!(
             "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
             follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged,
+        ));
+    }
+
+    // Investigate states in which there are no followers
+    if followed_counter == 0 {
+        return Some(format!(
+            "ALL UNFOLLOWED: Pubkey {}: date {}, {} unfollowed, {} unchanged, {}",
+            follower,
+            timestamp_diff,
+            unfollowed_counter,
+            unchanged,
+            event.as_json()
         ));
     }
 
@@ -530,36 +546,44 @@ mod tests {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
         let followee3_pubkey = Keys::generate().public_key();
+        let followee4_pubkey = Keys::generate().public_key();
         let follower_keys = Keys::generate();
         let follower_pubkey = follower_keys.public_key();
 
         // Monday's list: follower follows followee1
-        let monday_list = create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000000);
-
-        // Wednesday's update: follower follows followee1 and followee3
-        let wednesday_update = create_contact_event(
-            &follower_keys,
-            vec![followee1_pubkey, followee3_pubkey],
-            1000000020,
-        );
-
-        // Tuesday's list arrives late: follower follows followee1 and followee2
-        let tuesday_list = create_contact_event(
+        let monday_list = create_contact_event(
             &follower_keys,
             vec![followee1_pubkey, followee2_pubkey],
+            1000000000,
+        );
+
+        // Tuesday's update: follower stops following followee1, starts following followee3
+        let tuesday_list = create_contact_event(
+            &follower_keys,
+            vec![followee2_pubkey, followee3_pubkey],
             1000000010,
+        );
+
+        // Wednesday's update: follower stops following followee2, starts following followee4
+        let wednesday_update = create_contact_event(
+            &follower_keys,
+            vec![followee3_pubkey, followee4_pubkey],
+            1000000020,
         );
 
         // Apply Monday's list, then Wednesday's update, and finally the late Tuesday list
         assert_follow_changes(
             vec![monday_list, wednesday_update, tuesday_list],
             vec![
-                // Monday: followee1 is followed
+                // Monday: 1 and 2 is followed
                 FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                // Wednesday: followee3 is followed (with followee1 still followed)
+                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee2_pubkey),
+                // Wednesday: 3 and 4 are followed, 1 and 2 are unfollowed
+                FollowChange::new_unfollowed(1000000020.into(), follower_pubkey, followee1_pubkey),
+                FollowChange::new_unfollowed(1000000020.into(), follower_pubkey, followee2_pubkey),
                 FollowChange::new_followed(1000000020.into(), follower_pubkey, followee3_pubkey),
-                // Tuesday's late update should now add followee2 without overwriting newer data
-                FollowChange::new_followed(1000000010.into(), follower_pubkey, followee2_pubkey),
+                FollowChange::new_followed(1000000020.into(), follower_pubkey, followee4_pubkey),
+                // Tuesday's late update should do nothing
             ],
         )
         .await;
