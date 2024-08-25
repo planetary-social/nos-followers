@@ -143,6 +143,11 @@ where
 {
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
         let WorkerTaskItem { item: event } = worker_task_item;
+
+        if event.kind != Kind::ContactList {
+            return Ok(());
+        }
+
         let follower = event.pubkey;
 
         let event_created_at = convert_timestamp(event.created_at.as_u64())?;
@@ -150,6 +155,8 @@ where
         // Get the stored follows and the latest update time from the database
         let (mut follows_diff, maybe_latest_stored_updated_at) =
             self.initialize_follows_diff(&follower).await?;
+
+        let first_seen = follows_diff.is_empty();
 
         // Populate the new follows from the event tags
         self.populate_new_follows(&mut follows_diff, &event);
@@ -165,7 +172,6 @@ where
             }
         }
 
-        let first_seen = follows_diff.is_empty();
         // Process the follows_diff and apply changes
         let (followed_counter, unfollowed_counter, unchanged) = self
             .process_follows_diff(follows_diff, &follower, event_created_at)
