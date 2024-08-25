@@ -198,6 +198,11 @@ fn log_line(
     maybe_latest_stored_updated_at: Option<Timestamp>,
     event: &Event,
 ) -> Option<String> {
+    if unchanged > 0 && followed_counter == 0 && unfollowed_counter == 0 {
+        // This one is not interesting
+        return None;
+    }
+
     let timestamp_diff = if let Some(latest_stored_updated_at) = maybe_latest_stored_updated_at {
         format!(
             "[{}->{}]",
@@ -215,13 +220,6 @@ fn log_line(
         ));
     }
 
-    if followed_counter > 0 {
-        return Some(format!(
-            "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
-            follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged,
-        ));
-    }
-
     // Investigate states in which there are no followees but there are unfollowed followees
     if followed_counter == 0 && unfollowed_counter > 0 && unchanged == 0 {
         return Some(format!(
@@ -234,12 +232,10 @@ fn log_line(
         ));
     }
 
-    debug!(
+    Some(format!(
         "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged, first seen: {}",
         follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged, first_seen
-    );
-
-    None
+    ))
 }
 
 fn convert_timestamp(timestamp: u64) -> Result<DateTime<Utc>> {
