@@ -179,7 +179,6 @@ where
 
         if let Some(log_line) = log_line(
             follower,
-            event.created_at,
             followed_counter,
             unfollowed_counter,
             unchanged,
@@ -196,7 +195,6 @@ where
 
 fn log_line(
     follower: PublicKey,
-    event_created_at: Timestamp,
     followed_counter: usize,
     unfollowed_counter: usize,
     unchanged: usize,
@@ -209,14 +207,15 @@ fn log_line(
         return None;
     }
 
+    let human_event_created_at = event.created_at.to_human_datetime();
     let timestamp_diff = if let Some(latest_stored_updated_at) = maybe_latest_stored_updated_at {
         format!(
             "[{}->{}]",
             latest_stored_updated_at.to_human_datetime(),
-            event_created_at.to_human_datetime()
+            human_event_created_at
         )
     } else {
-        format!("[new->{}]", event_created_at.to_human_datetime())
+        format!("[new->{}]", human_event_created_at)
     };
 
     if first_seen && followed_counter > 0 {

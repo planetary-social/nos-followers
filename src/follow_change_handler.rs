@@ -1,3 +1,4 @@
+use crate::config::Settings;
 use crate::domain::follow_change::FollowChange;
 use crate::google_publisher::GooglePublisher;
 use crate::google_pubsub_client::GooglePubSubClient;
@@ -10,7 +11,6 @@ use std::sync::Arc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-
 /// Fetches friendly ids and then sends follow change to google pubsub
 pub struct FollowChangeHandler {
     repo: Arc<Repo>,
@@ -24,20 +24,23 @@ impl FollowChangeHandler {
         repo: Arc<Repo>,
         nostr_client: Client,
         cancellation_token: CancellationToken,
-        timeout_secs: u64,
-        google_project_id: &str,
-        google_topic: &str,
+        settings: &Settings,
     ) -> Result<Self> {
         let google_publisher_client =
-            GooglePubSubClient::new(google_project_id, google_topic).await?;
-        let google_publisher =
-            GooglePublisher::create(cancellation_token.clone(), google_publisher_client).await?;
+            GooglePubSubClient::new(&settings.google_project_id, &settings.google_topic).await?;
+        let google_publisher = GooglePublisher::create(
+            cancellation_token.clone(),
+            google_publisher_client,
+            settings.seconds_threshold,
+            settings.size_threshold,
+        )
+        .await?;
 
         Ok(Self {
             repo,
             nostr_client,
             google_publisher,
-            timeout_secs,
+            timeout_secs: settings.worker_timeout_secs,
         })
     }
 }

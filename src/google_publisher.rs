@@ -6,21 +6,6 @@ use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-const ALLOWED_PUBKEYS: &[&str] = &[
-    "07ecf9838136fe430fac43fa0860dbc62a0aac0729c5a33df1192ce75e330c9f", // Bryan
-    "89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5", // Daniel
-    "e8ad7c13ba55ba0a04c23fc09edce74ad7a8dddc059dc2e274ff63bc2e047782", // Daphne
-    "31d53c6dc32d0935a04b88d592156d350d355e2d817361ac082f775c2fe4df02", // Gergely
-    "27cf2c68535ae1fc06510e827670053f5dcd39e6bd7e05f1ffb487ef2ac13549", // Josh
-    "81f14ddb4704df919866a3ba0178c6b44a6a18ca8ebc7f1720c315e7ac10aad9", // Lexie
-    "969e6a28ee5214cb0296ee69cbdce4f43229124a78b1043d85df31e5636d0f1f", // Linda
-    "b29bb98ebecca7ae3a86a02ab6cf260baecf098dcd452ef8e5f9c549dfc0e0ef", // Martin
-    "d0a1ffb8761b974cec4a3be8cbcb2e96a7090dcf465ffeac839aa4ca20c9a59e", // Matt
-    "76c71aae3a491f1d9eec47cba17e229cda4113a0bbb6e6ae1776d7643e29cafa", // Rabble
-    "e77b246867ba5172e22c08b6add1c7de1049de997ad2fe6ea0a352131f9a0e9a", // Sebastian
-    "806d236c19d4771153406e150b1baf6257725cda781bf57442aeef53ed6cb727", // Shaina
-];
-
 /// Google publisher for follow changes. It batches follow changes and publishes
 /// them to Google PubSub after certain time is elapsed or a size threshold is
 /// hit.
@@ -32,15 +17,15 @@ impl GooglePublisher {
     pub async fn create(
         cancellation_token: CancellationToken,
         mut client: impl PublishEvents + Send + Sync + 'static,
+        seconds_threshold: u64,
+        size_threshold: usize,
     ) -> Result<Self, GooglePublisherError> {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
         tokio::spawn(async move {
             let mut buffer = Vec::new();
-            let size_threshold = 500;
-            let seconds = 5;
 
-            let mut interval = time::interval(Duration::from_secs(seconds));
+            let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
             loop {
                 select! {
@@ -102,13 +87,141 @@ impl GooglePublisher {
         &self,
         follow_change: FollowChange,
     ) -> Result<(), SendError<FollowChange>> {
-        // TODO: Temporary filter while developing this service
-        if !ALLOWED_PUBKEYS.contains(&follow_change.followee.to_hex().as_str())
-            && !ALLOWED_PUBKEYS.contains(&follow_change.follower.to_hex().as_str())
-        {
-            return Ok(());
-        }
-
         self.sender.send(follow_change).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::follow_change::FollowChange;
+    use crate::google_pubsub_client::GooglePublisherError;
+    use futures::Future;
+    use gcloud_sdk::tonic::Status;
+    use nostr_sdk::prelude::Keys;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    struct MockPublishEvents {
+        published_events: Arc<Mutex<Vec<FollowChange>>>,
+        fail_publish: bool,
+    }
+
+    impl PublishEvents for MockPublishEvents {
+        fn publish_events(
+            &mut self,
+            follow_changes: Vec<FollowChange>,
+        ) -> impl Future<Output = Result<(), GooglePublisherError>> + std::marker::Send {
+            let published_events = self.published_events.clone();
+            let fail_publish = self.fail_publish;
+
+            async move {
+                if fail_publish {
+                    Err(GooglePublisherError::PublishError(Status::cancelled(
+                        "Mock error",
+                    )))
+                } else {
+                    let mut published_events = published_events.lock().await;
+                    published_events.extend(follow_changes);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_google_publisher() {
+        let published_events = Arc::new(Mutex::new(Vec::new()));
+        let mock_client = MockPublishEvents {
+            published_events: published_events.clone(),
+            fail_publish: false,
+        };
+
+        let cancellation_token = CancellationToken::new();
+        let seconds_threshold = 1;
+        let size_threshold = 5;
+
+        let publisher = GooglePublisher::create(
+            cancellation_token.clone(),
+            mock_client,
+            seconds_threshold,
+            size_threshold,
+        )
+        .await
+        .unwrap();
+
+        let follower_pubkey = Keys::generate().public_key();
+        let followee_pubkey = Keys::generate().public_key();
+
+        // Queue up follow changes
+        publisher
+            .queue_publication(FollowChange::new_followed(
+                1.into(),
+                follower_pubkey,
+                followee_pubkey,
+            ))
+            .await
+            .unwrap();
+
+        publisher
+            .queue_publication(FollowChange::new_unfollowed(
+                2.into(),
+                follower_pubkey,
+                followee_pubkey,
+            ))
+            .await
+            .unwrap();
+
+        // Wait enough time for the interval to trigger
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Check that events were published
+        let events = published_events.lock().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].at, 1.into());
+        assert_eq!(events[1].at, 2.into());
+    }
+
+    #[tokio::test]
+    async fn test_google_publisher_error() {
+        let published_events = Arc::new(Mutex::new(Vec::new()));
+        let mock_client = MockPublishEvents {
+            published_events: published_events.clone(),
+            fail_publish: true, // Simulate a failure in publishing
+        };
+
+        let cancellation_token = CancellationToken::new();
+        let seconds_threshold = 1;
+        let size_threshold = 5;
+
+        let publisher = GooglePublisher::create(
+            cancellation_token.clone(),
+            mock_client,
+            seconds_threshold,
+            size_threshold,
+        )
+        .await
+        .unwrap();
+
+        let follower_pubkey = Keys::generate().public_key();
+        let followee_pubkey = Keys::generate().public_key();
+
+        // Queue up follow changes
+        publisher
+            .queue_publication(FollowChange::new_followed(
+                1.into(),
+                follower_pubkey,
+                followee_pubkey,
+            ))
+            .await
+            .unwrap();
+
+        // Wait enough time for the interval to trigger
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Check that no events were published due to the error
+        let events = published_events.lock().await;
+        assert_eq!(events.len(), 0);
     }
 }
