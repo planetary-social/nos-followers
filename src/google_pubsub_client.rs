@@ -77,8 +77,8 @@ impl PublishEvents for GooglePubSubClient {
             .iter()
             .filter(|follow_change| {
                 // TODO: Temporary filter while developing this service
-                !ALLOWED_PUBKEYS.contains(&follow_change.followee.to_hex().as_str())
-                    && !ALLOWED_PUBKEYS.contains(&follow_change.follower.to_hex().as_str())
+                ALLOWED_PUBKEYS.contains(&follow_change.followee.to_hex().as_str())
+                    || ALLOWED_PUBKEYS.contains(&follow_change.follower.to_hex().as_str())
             })
             .map(|follow_change| {
                 let data = serde_json::to_vec(follow_change)
