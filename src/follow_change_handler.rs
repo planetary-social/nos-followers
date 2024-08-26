@@ -1,5 +1,6 @@
 use crate::domain::follow_change::FollowChange;
 use crate::google_publisher::GooglePublisher;
+use crate::google_pubsub_client::GooglePubSubClient;
 use crate::refresh_friendly_id::refresh_friendly_id;
 use crate::repo::{Repo, RepoTrait};
 use crate::worker_pool::{WorkerTask, WorkerTaskItem};
@@ -24,8 +25,13 @@ impl FollowChangeHandler {
         nostr_client: Client,
         cancellation_token: CancellationToken,
         timeout_secs: u64,
+        google_project_id: &str,
+        google_topic: &str,
     ) -> Result<Self> {
-        let google_publisher = GooglePublisher::create(cancellation_token.clone()).await?;
+        let google_publisher_client =
+            GooglePubSubClient::new(google_project_id, google_topic).await?;
+        let google_publisher =
+            GooglePublisher::create(cancellation_token.clone(), google_publisher_client).await?;
 
         Ok(Self {
             repo,

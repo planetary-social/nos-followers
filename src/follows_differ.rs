@@ -591,6 +591,21 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn test_it_does_not_process_non_contact_events() {
+        let follower_keys = Keys::generate();
+        let followee_pubkey = Keys::generate().public_key();
+
+        let wrong_event = create_event(
+            &follower_keys,
+            vec![followee_pubkey],
+            1000000000,
+            Kind::TextNote,
+        );
+
+        assert_follow_changes(vec![wrong_event], vec![]).await;
+    }
+
     async fn assert_follow_changes(contact_events: Vec<Event>, mut expected: Vec<FollowChange>) {
         let follow_changes = get_follow_changes_from_contact_events(contact_events)
             .await
@@ -601,6 +616,15 @@ mod tests {
     }
 
     fn create_contact_event(follower: &Keys, followees: Vec<PublicKey>, created_at: u64) -> Event {
+        create_event(follower, followees, created_at, Kind::ContactList)
+    }
+
+    fn create_event(
+        follower: &Keys,
+        followees: Vec<PublicKey>,
+        created_at: u64,
+        kind: Kind,
+    ) -> Event {
         let contacts = followees
             .into_iter()
             .map(|followee| Contact::new::<String>(followee, None, None))
@@ -615,7 +639,7 @@ mod tests {
             })
         });
 
-        EventBuilder::new(Kind::ContactList, "", tags)
+        EventBuilder::new(kind, "", tags)
             .custom_created_at(created_at.into())
             .to_event(&follower)
             .unwrap()

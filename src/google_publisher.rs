@@ -1,9 +1,5 @@
 use crate::domain::follow_change::FollowChange;
-use gcloud_sdk::{
-    google::pubsub::v1::{publisher_client::PublisherClient, PublishRequest, PubsubMessage},
-    *,
-};
-use thiserror::Error;
+use crate::google_pubsub_client::{GooglePublisherError, PublishEvents};
 use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
@@ -25,46 +21,6 @@ const ALLOWED_PUBKEYS: &[&str] = &[
     "806d236c19d4771153406e150b1baf6257725cda781bf57442aeef53ed6cb727", // Shaina
 ];
 
-struct GooglePublisherClient {
-    pubsub_client: GoogleApi<PublisherClient<GoogleAuthMiddleware>>,
-    google_full_topic: String,
-}
-
-impl GooglePublisherClient {
-    async fn publish_events(
-        &mut self,
-        follow_changes: Vec<FollowChange>,
-    ) -> Result<(), GooglePublisherError> {
-        let pubsub_messages: Result<Vec<PubsubMessage>, GooglePublisherError> = follow_changes
-            .iter()
-            .map(|follow_change| {
-                let data = serde_json::to_vec(follow_change)
-                    .map_err(GooglePublisherError::SerializationError)?;
-
-                Ok(PubsubMessage {
-                    data,
-                    ..Default::default()
-                })
-            })
-            .collect();
-
-        let pubsub_messages = pubsub_messages?;
-
-        let request = PublishRequest {
-            topic: self.google_full_topic.clone(),
-            messages: pubsub_messages,
-        };
-
-        self.pubsub_client
-            .get()
-            .publish(request)
-            .await
-            .map_err(GooglePublisherError::PublishError)?;
-
-        Ok(())
-    }
-}
-
 /// Google publisher for follow changes. It batches follow changes and publishes
 /// them to Google PubSub after certain time is elapsed or a size threshold is
 /// hit.
@@ -75,31 +31,14 @@ pub struct GooglePublisher {
 impl GooglePublisher {
     pub async fn create(
         cancellation_token: CancellationToken,
+        mut client: impl PublishEvents + Send + Sync + 'static,
     ) -> Result<Self, GooglePublisherError> {
-        let google_project_id = "pub-verse-app";
-        let google_topic = "follow-changes";
-        let google_full_topic = format!("projects/{}/topics/{}", google_project_id, google_topic);
-
-        let pubsub_client: GoogleApi<PublisherClient<GoogleAuthMiddleware>> =
-            GoogleApi::from_function(
-                PublisherClient::new,
-                "https://pubsub.googleapis.com",
-                Some(google_full_topic.clone()),
-            )
-            .await
-            .map_err(GooglePublisherError::Init)?;
-
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
         tokio::spawn(async move {
             let mut buffer = Vec::new();
             let size_threshold = 500;
             let seconds = 5;
-
-            let mut client = GooglePublisherClient {
-                pubsub_client,
-                google_full_topic,
-            };
 
             let mut interval = time::interval(Duration::from_secs(seconds));
 
@@ -172,16 +111,4 @@ impl GooglePublisher {
 
         self.sender.send(follow_change).await
     }
-}
-
-#[derive(Error, Debug)]
-pub enum GooglePublisherError {
-    #[error("Failed to publish events: {0}")]
-    PublishError(#[from] tonic::Status),
-
-    #[error("Failed to serialize event to JSON: {0}")]
-    SerializationError(#[from] serde_json::Error),
-
-    #[error("Failed to initialize Google publisher: {0}")]
-    Init(#[from] gcloud_sdk::error::Error),
 }

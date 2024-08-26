@@ -3,6 +3,7 @@ mod domain;
 mod follow_change_handler;
 mod follows_differ;
 mod google_publisher;
+mod google_pubsub_client;
 mod http_server;
 mod migrations;
 mod refresh_friendly_id;
@@ -48,6 +49,8 @@ async fn main() -> Result<()> {
     let follow_change_channel_size = config.get_by_key::<usize>("follow_change_channel_size")?;
     let follow_change_workers = config.get_by_key::<usize>("follow_change_workers")?;
     let worker_timeout_secs = config.get_by_key::<u64>("worker_timeout_secs")?;
+    let google_project_id = config.get_by_key::<String>("google_project_id")?;
+    let google_topic = config.get_by_key::<String>("google_topic")?;
 
     info!("Initializing repository at {}", uri);
     let graph = Graph::new(uri, user, password).await?;
@@ -74,6 +77,8 @@ async fn main() -> Result<()> {
         shared_nostr_client.clone(),
         cancellation_token.clone(),
         worker_timeout_secs,
+        &google_project_id,
+        &google_topic,
     )
     .await?;
 
