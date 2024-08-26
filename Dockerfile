@@ -71,6 +71,7 @@ USER appuser
 # Copy the executable from the "build" stage.
 COPY --from=build /bin/server /bin/
 COPY ./migrations /app/migrations
+COPY ./config/settings.yml /app/config/settings.yml
 
 # Expose the port that the application listens on.
 EXPOSE 3000
