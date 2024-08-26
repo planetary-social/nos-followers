@@ -5,6 +5,7 @@ use gcloud_sdk::{
     *,
 };
 use thiserror::Error;
+use tracing::info;
 
 const ALLOWED_PUBKEYS: &[&str] = &[
     "07ecf9838136fe430fac43fa0860dbc62a0aac0729c5a33df1192ce75e330c9f", // Bryan
@@ -92,6 +93,15 @@ impl PublishEvents for GooglePubSubClient {
             .collect();
 
         let pubsub_messages = pubsub_messages?;
+
+        info!(
+            "{} Google PubSub messages after filtering",
+            pubsub_messages.len()
+        );
+
+        if pubsub_messages.is_empty() {
+            return Ok(());
+        }
 
         let request = PublishRequest {
             topic: self.google_full_topic.clone(),
