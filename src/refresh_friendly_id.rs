@@ -91,7 +91,7 @@ pub async fn refresh_friendly_id(
     let metadata_result = match nostr_client.metadata(*public_key).await {
         Ok(metadata) => Some(metadata),
         Err(e) => {
-            error!(
+            debug!(
                 "Failed to fetch metadata for public key {}: {}",
                 public_key.to_hex(),
                 e
@@ -99,11 +99,13 @@ pub async fn refresh_friendly_id(
             None
         }
     };
+
     debug!(
         "Fetched metadata for public key {}: {:?}",
         public_key.to_hex(),
         metadata_result
     );
+
     let friendly_id = fetch_friendly_id(metadata_result, public_key, Nip05Verifier).await;
 
     match friendly_id {

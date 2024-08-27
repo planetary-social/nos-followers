@@ -5,7 +5,7 @@ use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// Google publisher for follow changes. It batches follow changes and publishes
 /// them to Google PubSub after certain time is elapsed or a size threshold is
@@ -25,9 +25,11 @@ impl GooglePublisher {
 
         tokio::spawn(async move {
             let mut buffer = UniqueFollowChanges::new(size_threshold);
-            let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
             loop {
+                // Start a new sleep timer at the beginning of each loop iteration
+                let sleep_duration = time::sleep(Duration::from_secs(seconds_threshold));
+
                 select! {
                     _ = cancellation_token.cancelled() => {
                         debug!("Cancellation token is cancelled, stopping Google publisher");
@@ -37,9 +39,9 @@ impl GooglePublisher {
                     // The first condition to send the current buffer is the
                     // time interval. We wait a max of `seconds_threshold`
                     // seconds, after that the buffer is cleared and sent
-                    _ = interval.tick() => {
+                    _ = sleep_duration => {
                         if !buffer.is_empty() {
-                            info!("Publishing batch of {} follow changes", buffer.len());
+                            debug!("Time based threshold of {} seconds reached, publishing buffer", seconds_threshold);
 
 
                             if let Err(e) = client.publish_events(buffer.drain()).await {
@@ -71,9 +73,9 @@ impl GooglePublisher {
                 }
 
                 if buffer.len() >= size_threshold {
-                    info!(
-                        "Publishing batch of {} follow changes after reaching threshold of {} items",
-                        buffer.len(), size_threshold
+                    debug!(
+                        "Reached threshold of {} items, publishing buffer",
+                        size_threshold
                     );
                     if let Err(e) = client.publish_events(buffer.drain()).await {
                         error!("Failed to publish events: {}", e);
