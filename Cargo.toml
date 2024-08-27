@@ -14,7 +14,7 @@ futures = "0.3.30"
 gcloud-sdk = { version = "0.25.5", features = ["google-pubsub-v1"] }
 indexmap = "2.4.0"
 neo4rs = "0.8.0"
-nostr-sdk = "0.33.0"
+nostr-sdk = "0.34.0"
 rand = { version = "0.8.5", features = ["std"] }
 regex = "1.10.6"
 serde = { version = "1.0.204", features = ["derive"] }
