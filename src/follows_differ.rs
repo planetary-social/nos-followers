@@ -144,7 +144,8 @@ where
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
         let WorkerTaskItem { item: event } = worker_task_item;
 
-        if event.kind != Kind::ContactList {
+        let one_day_ago = Timestamp::now() - 60 * 60 * 24;
+        if event.kind != Kind::ContactList || event.created_at < one_day_ago {
             return Ok(());
         }
 
@@ -299,13 +300,13 @@ mod tests {
         let contact_events = vec![create_contact_event(
             &follower_keys,
             vec![followee_pubkey],
-            1000000000,
+            seconds_ago(1000),
         )];
 
         assert_follow_changes(
             contact_events,
             vec![FollowChange::new_followed(
-                1000000000.into(),
+                seconds_ago(1000).into(),
                 follower_pubkey,
                 followee_pubkey,
             )],
@@ -321,19 +322,27 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000000),
+            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000010,
+                seconds_ago(990),
             ),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000010.into(), follower_pubkey, followee2_pubkey),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
             ],
         )
         .await;
@@ -347,21 +356,33 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000000),
+            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000010,
+                seconds_ago(990),
             ),
-            create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000020),
+            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(980)),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000010.into(), follower_pubkey, followee2_pubkey),
-                FollowChange::new_unfollowed(1000000020.into(), follower_pubkey, followee2_pubkey),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
+                FollowChange::new_unfollowed(
+                    seconds_ago(980).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
             ],
         )
         .await;
@@ -375,26 +396,38 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000000),
+            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000010,
+                seconds_ago(990),
             ),
-            create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000020),
+            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(980)),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000015,
+                seconds_ago(985),
             ),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000010.into(), follower_pubkey, followee2_pubkey),
-                FollowChange::new_unfollowed(1000000020.into(), follower_pubkey, followee2_pubkey),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
+                FollowChange::new_unfollowed(
+                    seconds_ago(980).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
             ],
         )
         .await;
@@ -408,20 +441,28 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000000),
+            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000010,
+                seconds_ago(990),
             ),
-            create_contact_event(&follower_keys, vec![followee1_pubkey], 1000000005),
+            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(995)),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000010.into(), follower_pubkey, followee2_pubkey),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
             ],
         )
         .await;
@@ -432,7 +473,11 @@ mod tests {
         let follower_keys = Keys::generate();
 
         // An empty contact list
-        let contact_events = vec![create_contact_event(&follower_keys, vec![], 1000000000)];
+        let contact_events = vec![create_contact_event(
+            &follower_keys,
+            vec![],
+            seconds_ago(1000),
+        )];
 
         assert_follow_changes(contact_events, vec![]).await;
     }
@@ -448,18 +493,34 @@ mod tests {
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000000,
+                seconds_ago(1000),
             ),
-            create_contact_event(&follower_keys, vec![], 1000000010),
+            create_contact_event(&follower_keys, vec![], seconds_ago(990)),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee2_pubkey),
-                FollowChange::new_unfollowed(1000000010.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_unfollowed(1000000010.into(), follower_pubkey, followee2_pubkey),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
+                FollowChange::new_unfollowed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_unfollowed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
             ],
         )
         .await;
@@ -476,20 +537,28 @@ mod tests {
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000000,
+                seconds_ago(1000),
             ),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000010,
+                seconds_ago(990),
             ),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee2_pubkey),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
             ],
         )
         .await;
@@ -503,7 +572,7 @@ mod tests {
         let contact_events = vec![create_contact_event(
             &follower_keys,
             vec![follower_pubkey],
-            1000000000,
+            seconds_ago(1000),
         )];
 
         assert_follow_changes(contact_events, vec![]).await;
@@ -521,22 +590,38 @@ mod tests {
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                1000000000,
+                seconds_ago(1000),
             ),
             create_contact_event(
                 &follower_keys,
                 vec![followee2_pubkey, followee3_pubkey],
-                1000000010,
+                seconds_ago(990),
             ),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee2_pubkey),
-                FollowChange::new_unfollowed(1000000010.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000010.into(), follower_pubkey, followee3_pubkey),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
+                FollowChange::new_unfollowed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(990).into(),
+                    follower_pubkey,
+                    followee3_pubkey,
+                ),
             ],
         )
         .await;
@@ -555,35 +640,59 @@ mod tests {
         let monday_list = create_contact_event(
             &follower_keys,
             vec![followee1_pubkey, followee2_pubkey],
-            1000000000,
+            seconds_ago(1000),
         );
 
         // Tuesday's update: follower stops following followee1, starts following followee3
         let tuesday_list = create_contact_event(
             &follower_keys,
             vec![followee2_pubkey, followee3_pubkey],
-            1000000010,
+            seconds_ago(990),
         );
 
         // Wednesday's update: follower stops following followee2, starts following followee4
         let wednesday_update = create_contact_event(
             &follower_keys,
             vec![followee3_pubkey, followee4_pubkey],
-            1000000020,
+            seconds_ago(980),
         );
 
         // Apply Monday's list, then Wednesday's update, and finally the late Tuesday list
         assert_follow_changes(
             vec![monday_list, wednesday_update, tuesday_list],
             vec![
-                // Monday: 1 and 2 is followed
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_followed(1000000000.into(), follower_pubkey, followee2_pubkey),
+                // Monday: 1 and 2 are followed
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(1000).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
                 // Wednesday: 3 and 4 are followed, 1 and 2 are unfollowed
-                FollowChange::new_unfollowed(1000000020.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_unfollowed(1000000020.into(), follower_pubkey, followee2_pubkey),
-                FollowChange::new_followed(1000000020.into(), follower_pubkey, followee3_pubkey),
-                FollowChange::new_followed(1000000020.into(), follower_pubkey, followee4_pubkey),
+                FollowChange::new_unfollowed(
+                    seconds_ago(980).into(),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
+                FollowChange::new_unfollowed(
+                    seconds_ago(980).into(),
+                    follower_pubkey,
+                    followee2_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(980).into(),
+                    follower_pubkey,
+                    followee3_pubkey,
+                ),
+                FollowChange::new_followed(
+                    seconds_ago(980).into(),
+                    follower_pubkey,
+                    followee4_pubkey,
+                ),
                 // Tuesday's late update should do nothing
             ],
         )
@@ -598,7 +707,7 @@ mod tests {
         let wrong_event = create_event(
             &follower_keys,
             vec![followee_pubkey],
-            1000000000,
+            seconds_ago(1000),
             Kind::TextNote,
         );
 
@@ -675,5 +784,9 @@ mod tests {
         follow_changes_vec.sort();
 
         Ok(follow_changes_vec)
+    }
+
+    fn seconds_ago(seconds: i64) -> u64 {
+        (Utc::now().timestamp() - seconds).max(0) as u64
     }
 }
