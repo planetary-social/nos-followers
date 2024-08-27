@@ -1,5 +1,6 @@
 use crate::domain::follow_change::FollowChange;
 use crate::google_pubsub_client::{GooglePublisherError, PublishEvents};
+use crate::unique_follow_changes::UniqueFollowChanges;
 use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
@@ -23,8 +24,7 @@ impl GooglePublisher {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
         tokio::spawn(async move {
-            let mut buffer = Vec::new();
-
+            let mut buffer = UniqueFollowChanges::new(size_threshold);
             let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
             loop {
@@ -34,10 +34,15 @@ impl GooglePublisher {
                         break;
                     }
 
+                    // The first condition to send the current buffer is the
+                    // time interval. We wait a max of `seconds_threshold`
+                    // seconds, after that the buffer is cleared and sent
                     _ = interval.tick() => {
                         if !buffer.is_empty() {
                             info!("Publishing batch of {} follow changes", buffer.len());
-                            if let Err(e) = client.publish_events(buffer.split_off(0)).await {
+
+
+                            if let Err(e) = client.publish_events(buffer.drain()).await {
                                 match &e {
                                     // We've seen this happen sporadically, we don't neet to kill the look in this situation
                                     GooglePublisherError::PublishError(_) => {
@@ -55,7 +60,7 @@ impl GooglePublisher {
                     recv_result = publication_receiver.recv() => {
                         match recv_result {
                             Some(follow_change) => {
-                                buffer.push(follow_change);
+                                buffer.insert(follow_change);
                             }
                             None => {
                                 debug!("Publication receiver closed, stopping Google publisher");
@@ -70,7 +75,7 @@ impl GooglePublisher {
                         "Publishing batch of {} follow changes after reaching threshold of {} items",
                         buffer.len(), size_threshold
                     );
-                    if let Err(e) = client.publish_events(buffer.split_off(0)).await {
+                    if let Err(e) = client.publish_events(buffer.drain()).await {
                         error!("Failed to publish events: {}", e);
                         break;
                     }
@@ -131,6 +136,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_google_publisher_collapses_messages() {
+        let published_events = Arc::new(Mutex::new(Vec::new()));
+        let mock_client = MockPublishEvents {
+            published_events: published_events.clone(),
+            fail_publish: false,
+        };
+
+        let cancellation_token = CancellationToken::new();
+        let seconds_threshold = 1;
+        let size_threshold = 5;
+
+        let publisher = GooglePublisher::create(
+            cancellation_token.clone(),
+            mock_client,
+            seconds_threshold,
+            size_threshold,
+        )
+        .await
+        .unwrap();
+
+        let follower_pubkey = Keys::generate().public_key();
+        let followee1_pubkey = Keys::generate().public_key();
+        let followee2_pubkey = Keys::generate().public_key();
+
+        publisher
+            .queue_publication(FollowChange::new_followed(
+                1.into(),
+                follower_pubkey,
+                followee1_pubkey,
+            ))
+            .await
+            .unwrap();
+
+        publisher
+            .queue_publication(FollowChange::new_unfollowed(
+                1.into(),
+                follower_pubkey,
+                followee2_pubkey,
+            ))
+            .await
+            .unwrap();
+
+        publisher
+            .queue_publication(FollowChange::new_followed(
+                2.into(),
+                follower_pubkey,
+                followee2_pubkey,
+            ))
+            .await
+            .unwrap();
+
+        publisher
+            .queue_publication(FollowChange::new_unfollowed(
+                2.into(),
+                follower_pubkey,
+                followee2_pubkey,
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let events = published_events.lock().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            FollowChange::new_followed(1.into(), follower_pubkey, followee1_pubkey)
+        );
+
+        // The second follow change for the same followee should have collapsed
+        // to a single change. We only keep the last one
+        assert_eq!(
+            events[1],
+            FollowChange::new_unfollowed(2.into(), follower_pubkey, followee2_pubkey)
+        );
+    }
+
+    #[tokio::test]
     async fn test_google_publisher() {
         let published_events = Arc::new(Mutex::new(Vec::new()));
         let mock_client = MockPublishEvents {
@@ -152,14 +235,14 @@ mod tests {
         .unwrap();
 
         let follower_pubkey = Keys::generate().public_key();
-        let followee_pubkey = Keys::generate().public_key();
+        let followee1_pubkey = Keys::generate().public_key();
+        let followee2_pubkey = Keys::generate().public_key();
 
-        // Queue up follow changes
         publisher
             .queue_publication(FollowChange::new_followed(
                 1.into(),
                 follower_pubkey,
-                followee_pubkey,
+                followee1_pubkey,
             ))
             .await
             .unwrap();
@@ -168,19 +251,21 @@ mod tests {
             .queue_publication(FollowChange::new_unfollowed(
                 2.into(),
                 follower_pubkey,
-                followee_pubkey,
+                followee2_pubkey,
             ))
             .await
             .unwrap();
 
-        // Wait enough time for the interval to trigger
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Check that events were published
         let events = published_events.lock().await;
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].at, 1.into());
-        assert_eq!(events[1].at, 2.into());
+        assert_eq!(
+            events.clone(),
+            [
+                FollowChange::new_followed(1.into(), follower_pubkey, followee1_pubkey),
+                FollowChange::new_unfollowed(2.into(), follower_pubkey, followee2_pubkey)
+            ]
+        );
     }
 
     #[tokio::test]
@@ -217,10 +302,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait enough time for the interval to trigger
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Check that no events were published due to the error
         let events = published_events.lock().await;
         assert_eq!(events.len(), 0);
     }

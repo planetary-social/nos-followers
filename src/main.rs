@@ -9,6 +9,7 @@ mod migrations;
 mod refresh_friendly_id;
 mod relay_subscriber;
 mod repo;
+mod unique_follow_changes;
 mod worker_pool;
 
 use config::{Config, Settings};
