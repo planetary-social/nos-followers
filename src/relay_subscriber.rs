@@ -8,14 +8,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 pub fn create_client() -> Client {
-    let opts = Options::new()
+    let opts = Options::default()
         .skip_disconnected_relays(true)
         .wait_for_send(false)
         .connection_timeout(Some(Duration::from_secs(5)))
         .send_timeout(Some(Duration::from_secs(5)))
         .wait_for_subscription(true);
 
-    ClientBuilder::new().opts(opts).build()
+    ClientBuilder::default().opts(opts).build()
 }
 
 pub async fn start_nostr_subscription(

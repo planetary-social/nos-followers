@@ -3,7 +3,7 @@ use cached::proc_macro::cached;
 use cached::TimedSizedCache;
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{debug, error};
 
 #[derive(Debug, PartialEq)]
 pub enum FriendlyId {
@@ -88,7 +88,22 @@ pub async fn refresh_friendly_id(
     nostr_client: &Client,
     public_key: &PublicKey,
 ) -> String {
-    let metadata_result = nostr_client.metadata(*public_key).await.ok();
+    let metadata_result = match nostr_client.metadata(*public_key).await {
+        Ok(metadata) => Some(metadata),
+        Err(e) => {
+            error!(
+                "Failed to fetch metadata for public key {}: {}",
+                public_key.to_hex(),
+                e
+            );
+            None
+        }
+    };
+    debug!(
+        "Fetched metadata for public key {}: {:?}",
+        public_key.to_hex(),
+        metadata_result
+    );
     let friendly_id = fetch_friendly_id(metadata_result, public_key, Nip05Verifier).await;
 
     match friendly_id {
