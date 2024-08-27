@@ -640,7 +640,7 @@ mod tests {
 
         EventBuilder::new(kind, "", tags)
             .custom_created_at(created_at.into())
-            .to_event(&follower)
+            .to_event(follower)
             .unwrap()
     }
 

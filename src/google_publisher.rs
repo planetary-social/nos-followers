@@ -199,17 +199,14 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let events = published_events.lock().await;
-        assert_eq!(events.len(), 2);
         assert_eq!(
-            events[0],
-            FollowChange::new_followed(1.into(), follower_pubkey, followee1_pubkey)
-        );
-
-        // The second follow change for the same followee should have collapsed
-        // to a single change. We only keep the last one
-        assert_eq!(
-            events[1],
-            FollowChange::new_unfollowed(2.into(), follower_pubkey, followee2_pubkey)
+            events.clone(),
+            [
+                FollowChange::new_followed(1.into(), follower_pubkey, followee1_pubkey),
+                // The second follow change for the same followee should have collapsed
+                // to a single change. We only keep the last one
+                FollowChange::new_unfollowed(2.into(), follower_pubkey, followee2_pubkey)
+            ]
         );
     }
 
