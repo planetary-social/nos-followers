@@ -14,14 +14,14 @@ futures = "0.3.30"
 gcloud-sdk = { version = "0.25.5", features = ["google-pubsub-v1"] }
 indexmap = "2.4.0"
 neo4rs = "0.8.0"
-nostr-sdk = "0.33.0"
+nostr-sdk = "0.34.0"
 rand = { version = "0.8.5", features = ["std"] }
 regex = "1.10.6"
-serde = { version = "1.0.204", features = ["derive"] }
-serde_json = "1.0.121"
+serde = { version = "1.0.209", features = ["derive"] }
+serde_json = "1.0.127"
 thiserror = "1.0.63"
 time = "0.3.36"
-tokio = { version = "1.39.2", features = ["full"] }
+tokio = { version = "1.39.3", features = ["full"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 tower-http = { version = "0.5.2", features = ["timeout", "trace"] }
 tracing = "0.1.40"
