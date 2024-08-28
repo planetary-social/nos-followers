@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -9,22 +10,34 @@ pub enum ChangeType {
     Unfollowed,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
+#[derive(Clone, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct FollowChange {
     pub change_type: ChangeType,
-    pub at: Timestamp,
+    pub at: DateTime<Utc>,
+    pub previous_at: Option<DateTime<Utc>>,
     pub follower: PublicKey,
     pub friendly_follower: Option<String>,
     pub followee: PublicKey,
     pub friendly_followee: Option<String>,
 }
+impl PartialEq for FollowChange {
+    fn eq(&self, other: &Self) -> bool {
+        self.change_type == other.change_type
+            && self.at == other.at
+            && self.follower == other.follower
+            && self.followee == other.followee
+    }
+}
+
+impl Eq for FollowChange {}
 
 impl FollowChange {
-    pub fn new_followed(at: Timestamp, follower: PublicKey, followee: PublicKey) -> Self {
+    pub fn new_followed(at: DateTime<Utc>, follower: PublicKey, followee: PublicKey) -> Self {
         Self {
             change_type: ChangeType::Followed,
             at,
+            previous_at: None,
             follower,
             friendly_follower: None,
             followee,
@@ -32,15 +45,21 @@ impl FollowChange {
         }
     }
 
-    pub fn new_unfollowed(at: Timestamp, follower: PublicKey, followee: PublicKey) -> Self {
+    pub fn new_unfollowed(at: DateTime<Utc>, follower: PublicKey, followee: PublicKey) -> Self {
         Self {
             change_type: ChangeType::Unfollowed,
             at,
+            previous_at: None,
             follower,
             friendly_follower: None,
             followee,
             friendly_followee: None,
         }
+    }
+
+    pub fn with_last_seen_contact_list_at(mut self, maybe_at: Option<DateTime<Utc>>) -> Self {
+        self.previous_at = maybe_at;
+        self
     }
 
     pub fn with_friendly_follower(mut self, name: String) -> Self {
@@ -71,7 +90,7 @@ impl fmt::Display for FollowChange {
             self.friendly_followee
                 .clone()
                 .unwrap_or_else(|| "N/A".to_string()),
-            self.at.to_human_datetime()
+            self.at.to_rfc3339(),
         )
     }
 }
@@ -87,7 +106,7 @@ impl fmt::Debug for FollowChange {
                 ChangeType::Unfollowed => "-x->",
             },
             &self.followee.to_hex()[..3],
-            self.at
+            self.at,
         )
     }
 }

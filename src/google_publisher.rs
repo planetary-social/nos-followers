@@ -103,10 +103,12 @@ mod tests {
     use super::*;
     use crate::domain::follow_change::FollowChange;
     use crate::google_pubsub_client::GooglePublisherError;
+    use chrono::{DateTime, Duration, Utc};
     use futures::Future;
     use gcloud_sdk::tonic::Status;
     use nostr_sdk::prelude::Keys;
     use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
@@ -137,7 +139,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_google_publisher_collapses_messages() {
         let published_events = Arc::new(Mutex::new(Vec::new()));
         let mock_client = MockPublishEvents {
@@ -164,7 +166,7 @@ mod tests {
 
         publisher
             .queue_publication(FollowChange::new_followed(
-                1.into(),
+                seconds_to_datetime(1),
                 follower_pubkey,
                 followee1_pubkey,
             ))
@@ -173,7 +175,7 @@ mod tests {
 
         publisher
             .queue_publication(FollowChange::new_unfollowed(
-                1.into(),
+                seconds_to_datetime(1),
                 follower_pubkey,
                 followee2_pubkey,
             ))
@@ -182,7 +184,7 @@ mod tests {
 
         publisher
             .queue_publication(FollowChange::new_followed(
-                2.into(),
+                seconds_to_datetime(2),
                 follower_pubkey,
                 followee2_pubkey,
             ))
@@ -191,28 +193,36 @@ mod tests {
 
         publisher
             .queue_publication(FollowChange::new_unfollowed(
-                2.into(),
+                seconds_to_datetime(2),
                 follower_pubkey,
                 followee2_pubkey,
             ))
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::seconds(2).to_std().unwrap()).await;
 
         let events = published_events.lock().await;
         assert_eq!(
             events.clone(),
             [
-                FollowChange::new_followed(1.into(), follower_pubkey, followee1_pubkey),
+                FollowChange::new_followed(
+                    seconds_to_datetime(1),
+                    follower_pubkey,
+                    followee1_pubkey
+                ),
                 // The second follow change for the same followee should have collapsed
                 // to a single change. We only keep the last one
-                FollowChange::new_unfollowed(2.into(), follower_pubkey, followee2_pubkey)
+                FollowChange::new_unfollowed(
+                    seconds_to_datetime(2),
+                    follower_pubkey,
+                    followee2_pubkey
+                )
             ]
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_google_publisher() {
         let published_events = Arc::new(Mutex::new(Vec::new()));
         let mock_client = MockPublishEvents {
@@ -239,7 +249,7 @@ mod tests {
 
         publisher
             .queue_publication(FollowChange::new_followed(
-                1.into(),
+                seconds_to_datetime(2),
                 follower_pubkey,
                 followee1_pubkey,
             ))
@@ -248,26 +258,34 @@ mod tests {
 
         publisher
             .queue_publication(FollowChange::new_unfollowed(
-                2.into(),
+                seconds_to_datetime(1),
                 follower_pubkey,
                 followee2_pubkey,
             ))
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::seconds(2).to_std().unwrap()).await;
 
         let events = published_events.lock().await;
         assert_eq!(
             events.clone(),
             [
-                FollowChange::new_followed(1.into(), follower_pubkey, followee1_pubkey),
-                FollowChange::new_unfollowed(2.into(), follower_pubkey, followee2_pubkey)
+                FollowChange::new_followed(
+                    seconds_to_datetime(2),
+                    follower_pubkey,
+                    followee1_pubkey
+                ),
+                FollowChange::new_unfollowed(
+                    seconds_to_datetime(1),
+                    follower_pubkey,
+                    followee2_pubkey
+                )
             ]
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_google_publisher_error() {
         let published_events = Arc::new(Mutex::new(Vec::new()));
         let mock_client = MockPublishEvents {
@@ -294,16 +312,20 @@ mod tests {
         // Queue up follow changes
         publisher
             .queue_publication(FollowChange::new_followed(
-                1.into(),
+                seconds_to_datetime(1),
                 follower_pubkey,
                 followee_pubkey,
             ))
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::seconds(2).to_std().unwrap()).await;
 
         let events = published_events.lock().await;
         assert_eq!(events.len(), 0);
+    }
+
+    fn seconds_to_datetime(seconds: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from(UNIX_EPOCH + Duration::seconds(seconds).to_std().unwrap())
     }
 }

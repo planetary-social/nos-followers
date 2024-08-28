@@ -16,17 +16,37 @@ impl Repo {
     }
 }
 
+// Default trait raises not implemented just to ease testing
 pub trait RepoTrait {
-    async fn get_friendly_id(&self, _public_key: &PublicKey) -> Result<Option<String>, RepoError> {
-        panic!("Not implemented")
+    /// Set the last contact list date seen for a user if it's newer than the stored value. Returns the previous value
+    fn maybe_update_last_contact_list_at(
+        &self,
+        _public_key: &PublicKey,
+        _at: &DateTime<Utc>,
+    ) -> impl std::future::Future<Output = Result<Option<DateTime<Utc>>, RepoError>> + std::marker::Send
+    {
+        async { panic!("Not implemented") }
     }
-    async fn add_friendly_id(
+
+    /// Get the friendly_id for a user
+    fn get_friendly_id(
+        &self,
+        _public_key: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<Option<String>, RepoError>> + std::marker::Send
+    {
+        async { panic!("Not implemented") }
+    }
+
+    /// Set the friendly_id for a user
+    fn set_friendly_id(
         &self,
         _public_key: &PublicKey,
         _friendly_id: &str,
-    ) -> Result<(), RepoError> {
-        panic!("Not implemented")
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
     }
+
+    /// Upsert a follow relationship
     fn upsert_follow(
         &self,
         _follow: &Follow,
@@ -34,6 +54,7 @@ pub trait RepoTrait {
         async { panic!("Not implemented") }
     }
 
+    /// Delete a follow relationship
     fn delete_follow(
         &self,
         _followee: &PublicKey,
@@ -41,6 +62,8 @@ pub trait RepoTrait {
     ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
         async { panic!("Not implemented") }
     }
+
+    /// Get all follows for a user
     fn get_follows(
         &self,
         _follower: &PublicKey,
@@ -50,6 +73,47 @@ pub trait RepoTrait {
 }
 
 impl RepoTrait for Repo {
+    /// Set the last contact list date seen for a user if it's newer than the stored value.
+    /// Returns `Some(previous_value)` if there was a previous value, or `None` if there was no previous value.
+    async fn maybe_update_last_contact_list_at(
+        &self,
+        public_key: &PublicKey,
+        at: &DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, RepoError> {
+        let statement = r#"
+            MERGE (user:User {pubkey: $pubkey_val})
+            WITH user, user.last_contact_list_at AS previous_value
+            ON CREATE SET user.last_contact_list_at = $last_contact_list_at
+            SET user.last_contact_list_at = CASE
+                WHEN previous_value IS NULL OR previous_value < $last_contact_list_at
+                THEN $last_contact_list_at
+                ELSE previous_value
+            END
+            RETURN previous_value
+        "#;
+
+        let query = query(statement)
+            .param("pubkey_val", public_key.to_hex())
+            .param("last_contact_list_at", (at.naive_utc(), "Etc/UTC"));
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::MaybeSetLastContactListAt)?;
+
+        if let Some(row) = records
+            .next()
+            .await
+            .map_err(RepoError::MaybeSetLastContactListAt)?
+        {
+            let previous_value = parse_datetime(&row, "previous_value")?;
+            Ok(Some(previous_value))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn get_friendly_id(&self, public_key: &PublicKey) -> Result<Option<String>, RepoError> {
         let statement = r#"
             MATCH (user:User {pubkey: $pubkey_val})
@@ -74,7 +138,7 @@ impl RepoTrait for Repo {
         }
     }
 
-    async fn add_friendly_id(
+    async fn set_friendly_id(
         &self,
         public_key: &PublicKey,
         friendly_id: &str,
@@ -92,7 +156,7 @@ impl RepoTrait for Repo {
         self.graph
             .run(query)
             .await
-            .map_err(RepoError::AddFriendlyId)?;
+            .map_err(RepoError::SetFriendlyId)?;
 
         Ok(())
     }
@@ -188,8 +252,10 @@ fn parse_datetime(row: &neo4rs::Row, field: &str) -> Result<DateTime<Utc>, RepoE
 
 #[derive(Error, Debug)]
 pub enum RepoError {
+    #[error("Failed to set first contact list date: {0}")]
+    MaybeSetLastContactListAt(neo4rs::Error),
     #[error("Failed to add friendly_id: {0}")]
-    AddFriendlyId(neo4rs::Error),
+    SetFriendlyId(neo4rs::Error),
     #[error("Failed to upsert follow: {0}")]
     UpsertFollow(neo4rs::Error),
     #[error("Failed to delete follow: {0}")]

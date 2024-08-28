@@ -113,7 +113,7 @@ pub async fn refresh_friendly_id(
         | FriendlyId::Name(display_name)
         | FriendlyId::Nip05(display_name)
         | FriendlyId::Npub(display_name) => {
-            if let Err(e) = repo.add_friendly_id(public_key, &display_name).await {
+            if let Err(e) = repo.set_friendly_id(public_key, &display_name).await {
                 error!(
                     "Failed to add friendly ID for public key {}: {}",
                     public_key.to_hex(),

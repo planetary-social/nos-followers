@@ -8,6 +8,7 @@ use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
+use tokio::time::{Duration, Instant};
 use tracing::{debug, info};
 
 #[derive(Default, Debug)]
@@ -40,28 +41,18 @@ where
     async fn initialize_follows_diff(
         &self,
         follower: &PublicKey,
-    ) -> Result<(HashMap<PublicKey, FollowsDiff>, Option<Timestamp>)> {
+    ) -> Result<HashMap<PublicKey, FollowsDiff>> {
         let stored_follows = self.repo.get_follows(follower).await?;
         let mut follows_diff: HashMap<PublicKey, FollowsDiff> = HashMap::new();
-        let mut maybe_latest_stored_updated_at: Option<Timestamp> = None;
 
         for stored_follow in stored_follows {
-            let updated_at = Timestamp::from(stored_follow.updated_at.timestamp() as u64);
-            if let Some(ref mut latest_stored_updated_at) = maybe_latest_stored_updated_at {
-                if updated_at > *latest_stored_updated_at {
-                    *latest_stored_updated_at = updated_at;
-                }
-            } else {
-                maybe_latest_stored_updated_at = Some(updated_at);
-            }
-
             follows_diff
                 .entry(stored_follow.followee)
                 .or_default()
                 .stored_follow = Some(stored_follow.clone());
         }
 
-        Ok((follows_diff, maybe_latest_stored_updated_at))
+        Ok(follows_diff)
     }
 
     fn populate_new_follows(
@@ -84,6 +75,7 @@ where
         follows_diff: HashMap<PublicKey, FollowsDiff>,
         follower: &PublicKey,
         event_created_at: DateTime<Utc>,
+        maybe_last_seen_contact_list_at: Option<DateTime<Utc>>,
     ) -> Result<(usize, usize, usize)> {
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
@@ -98,11 +90,10 @@ where
                         unchanged += 1;
                     } else {
                         self.repo.delete_follow(&followee, follower).await?;
-                        self.send_follow_change(FollowChange::new_unfollowed(
-                            Timestamp::from(event_created_at.timestamp() as u64),
-                            *follower,
-                            followee,
-                        ))?;
+                        let follow_change =
+                            FollowChange::new_unfollowed(event_created_at, *follower, followee)
+                                .with_last_seen_contact_list_at(maybe_last_seen_contact_list_at);
+                        self.send_follow_change(follow_change)?;
                         unfollowed_counter += 1;
                     }
                 }
@@ -115,11 +106,10 @@ where
                             created_at: event_created_at,
                         };
                         self.repo.upsert_follow(&follow).await?;
-                        self.send_follow_change(FollowChange::new_followed(
-                            Timestamp::from(event_created_at.timestamp() as u64),
-                            *follower,
-                            followee,
-                        ))?;
+                        let follow_change =
+                            FollowChange::new_followed(event_created_at, *follower, followee)
+                                .with_last_seen_contact_list_at(maybe_last_seen_contact_list_at);
+                        self.send_follow_change(follow_change)?;
                         followed_counter += 1;
                     } else {
                         debug!("Skipping self-follow for {}", followee);
@@ -137,6 +127,8 @@ where
     }
 }
 
+const ONE_DAY_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
+
 impl<T> WorkerTask<Box<Event>> for FollowsDiffer<T>
 where
     T: RepoTrait + Sync + Send,
@@ -144,7 +136,8 @@ where
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
         let WorkerTaskItem { item: event } = worker_task_item;
 
-        let one_day_ago = Timestamp::now() - 60 * 60 * 24;
+        let one_day_ago = Timestamp::from((Instant::now() - ONE_DAY_DURATION).elapsed().as_secs());
+
         if event.kind != Kind::ContactList || event.created_at < one_day_ago {
             return Ok(());
         }
@@ -152,19 +145,14 @@ where
         let follower = event.pubkey;
 
         let event_created_at = convert_timestamp(event.created_at.as_u64())?;
-
-        // Get the stored follows and the latest update time from the database
-        let (mut follows_diff, maybe_latest_stored_updated_at) =
-            self.initialize_follows_diff(&follower).await?;
-
-        let first_seen = follows_diff.is_empty();
-
-        // Populate the new follows from the event tags
-        self.populate_new_follows(&mut follows_diff, &event);
+        let maybe_last_seen_contact_list = self
+            .repo
+            .maybe_update_last_contact_list_at(&follower, &event_created_at)
+            .await?;
 
         // Check if the event is older than the latest stored update and skip if so
-        if let Some(latest_stored_updated_at) = maybe_latest_stored_updated_at {
-            if event.created_at <= latest_stored_updated_at {
+        if let Some(last_seen_contact_list) = maybe_last_seen_contact_list {
+            if event.created_at <= (last_seen_contact_list.timestamp() as u64).into() {
                 debug!(
                     "Skipping follow list for {} as it's older than the last update",
                     follower
@@ -173,9 +161,20 @@ where
             }
         }
 
+        // Get the stored follows and the latest update time from the database
+        let mut follows_diff = self.initialize_follows_diff(&follower).await?;
+
+        // Populate the new follows from the event tags
+        self.populate_new_follows(&mut follows_diff, &event);
+
         // Process the follows_diff and apply changes
         let (followed_counter, unfollowed_counter, unchanged) = self
-            .process_follows_diff(follows_diff, &follower, event_created_at)
+            .process_follows_diff(
+                follows_diff,
+                &follower,
+                event_created_at,
+                maybe_last_seen_contact_list,
+            )
             .await?;
 
         if let Some(log_line) = log_line(
@@ -183,8 +182,7 @@ where
             followed_counter,
             unfollowed_counter,
             unchanged,
-            first_seen,
-            maybe_latest_stored_updated_at,
+            maybe_last_seen_contact_list,
             &event,
         ) {
             info!("{}", log_line);
@@ -199,8 +197,7 @@ fn log_line(
     followed_counter: usize,
     unfollowed_counter: usize,
     unchanged: usize,
-    first_seen: bool,
-    maybe_latest_stored_updated_at: Option<Timestamp>,
+    maybe_last_seen_contact_list: Option<DateTime<Utc>>,
     event: &Event,
 ) -> Option<String> {
     if unchanged > 0 && followed_counter == 0 && unfollowed_counter == 0 {
@@ -209,17 +206,17 @@ fn log_line(
     }
 
     let human_event_created_at = event.created_at.to_human_datetime();
-    let timestamp_diff = if let Some(latest_stored_updated_at) = maybe_latest_stored_updated_at {
-        format!(
-            "[{}->{}]",
-            latest_stored_updated_at.to_human_datetime(),
-            human_event_created_at
-        )
+
+    let last_seen_contact_list = if let Some(last_seen_contact_list) = maybe_last_seen_contact_list
+    {
+        last_seen_contact_list.to_rfc3339()
     } else {
-        format!("[new->{}]", human_event_created_at)
+        "new".to_string()
     };
 
-    if first_seen && followed_counter > 0 {
+    let timestamp_diff = format!("[{}->{}]", last_seen_contact_list, human_event_created_at);
+
+    if maybe_last_seen_contact_list.is_none() {
         return Some(format!(
             "Pubkey {}: date {}, {} followed, new follows list",
             follower, timestamp_diff, followed_counter,
@@ -239,8 +236,8 @@ fn log_line(
     }
 
     Some(format!(
-        "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged, first seen: {}",
-        follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged, first_seen
+        "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
+        follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged,
     ))
 }
 
@@ -253,24 +250,42 @@ mod tests {
     use super::*;
     use crate::domain::follow::Follow;
     use crate::repo::RepoError;
+    use chrono::{Duration, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
     use tokio::sync::broadcast::channel;
     use tokio::sync::Mutex;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::sleep;
 
     #[derive(Default)]
     struct MockRepo {
-        follows: Arc<Mutex<HashMap<PublicKey, Vec<Follow>>>>,
+        follows: Arc<Mutex<HashMap<PublicKey, (Vec<Follow>, Option<DateTime<Utc>>)>>>,
     }
 
     impl RepoTrait for MockRepo {
+        async fn maybe_update_last_contact_list_at(
+            &self,
+            public_key: &PublicKey,
+            at: &DateTime<Utc>,
+        ) -> Result<Option<DateTime<Utc>>, RepoError> {
+            let mut follows = self.follows.lock().await;
+            let entry = follows.entry(*public_key).or_default();
+            let previous_value = entry.1;
+
+            if previous_value.is_none() || at > previous_value.as_ref().unwrap() {
+                entry.1 = Some(*at);
+            }
+
+            Ok(previous_value)
+        }
+
         async fn upsert_follow(&self, follow: &Follow) -> Result<(), RepoError> {
             let mut follows = self.follows.lock().await;
             let entry = follows.entry(follow.follower).or_default();
             let follow = follow.clone();
-            entry.retain(|f| f.followee != follow.followee);
-            entry.push(follow);
+            entry.0.retain(|f| f.followee != follow.followee);
+            entry.0.push(follow);
             Ok(())
         }
 
@@ -281,17 +296,17 @@ mod tests {
         ) -> Result<(), RepoError> {
             let mut follows = self.follows.lock().await;
             let entry = follows.entry(*follower).or_default();
-            entry.retain(|f| f.followee != *followee);
+            entry.0.retain(|f| f.followee != *followee);
             Ok(())
         }
 
         async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<Follow>, RepoError> {
             let follows = self.follows.lock().await;
-            Ok(follows.get(follower).cloned().unwrap_or_default())
+            Ok(follows.get(follower).cloned().unwrap_or_default().0)
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_follows_differ_for_new_contact_list() {
         let followee_pubkey = Keys::generate().public_key();
         let follower_keys = Keys::generate();
@@ -300,13 +315,13 @@ mod tests {
         let contact_events = vec![create_contact_event(
             &follower_keys,
             vec![followee_pubkey],
-            seconds_ago(1000),
+            seconds_to_datetime(1000),
         )];
 
         assert_follow_changes(
             contact_events,
             vec![FollowChange::new_followed(
-                seconds_ago(1000).into(),
+                seconds_to_datetime(1000),
                 follower_pubkey,
                 followee_pubkey,
             )],
@@ -314,7 +329,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_follows_differ_for_new_added_contact() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -322,11 +337,15 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
+            create_contact_event(
+                &follower_keys,
+                vec![followee1_pubkey],
+                seconds_to_datetime(1),
+            ),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(990),
+                seconds_to_datetime(2),
             ),
         ];
 
@@ -334,12 +353,12 @@ mod tests {
             contact_events,
             vec![
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
@@ -348,7 +367,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_follows_differ_for_removed_contact() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -356,30 +375,38 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
+            create_contact_event(
+                &follower_keys,
+                vec![followee1_pubkey],
+                seconds_to_datetime(1),
+            ),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(990),
+                seconds_to_datetime(2),
             ),
-            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(980)),
+            create_contact_event(
+                &follower_keys,
+                vec![followee1_pubkey],
+                seconds_to_datetime(3),
+            ),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
                 FollowChange::new_unfollowed(
-                    seconds_ago(980).into(),
+                    seconds_to_datetime(3),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
@@ -388,7 +415,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_follows_differ_ignores_adds_from_older_contact_list() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -396,17 +423,25 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
             create_contact_event(
                 &follower_keys,
-                vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(990),
+                vec![followee1_pubkey],
+                seconds_to_datetime(1),
             ),
-            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(980)),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(985),
+                seconds_to_datetime(2),
+            ),
+            create_contact_event(
+                &follower_keys,
+                vec![followee1_pubkey],
+                seconds_to_datetime(4),
+            ),
+            create_contact_event(
+                &follower_keys,
+                vec![followee1_pubkey, followee2_pubkey],
+                seconds_to_datetime(3),
             ),
         ];
 
@@ -414,17 +449,17 @@ mod tests {
             contact_events,
             vec![
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
                 FollowChange::new_unfollowed(
-                    seconds_ago(980).into(),
+                    seconds_to_datetime(4),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
@@ -433,7 +468,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_follows_differ_ignores_removes_from_older_contact_list() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -441,25 +476,33 @@ mod tests {
         let follower_pubkey = follower_keys.public_key();
 
         let contact_events = vec![
-            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(1000)),
+            create_contact_event(
+                &follower_keys,
+                vec![followee1_pubkey],
+                seconds_to_datetime(1),
+            ),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(990),
+                seconds_to_datetime(3),
             ),
-            create_contact_event(&follower_keys, vec![followee1_pubkey], seconds_ago(995)),
+            create_contact_event(
+                &follower_keys,
+                vec![followee1_pubkey],
+                seconds_to_datetime(2),
+            ),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(3),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
@@ -468,7 +511,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_no_follows_in_initial_contact_list() {
         let follower_keys = Keys::generate();
 
@@ -476,13 +519,13 @@ mod tests {
         let contact_events = vec![create_contact_event(
             &follower_keys,
             vec![],
-            seconds_ago(1000),
+            seconds_to_datetime(1000),
         )];
 
         assert_follow_changes(contact_events, vec![]).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_unfollow_all_contacts() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -493,31 +536,31 @@ mod tests {
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(1000),
+                seconds_to_datetime(1),
             ),
-            create_contact_event(&follower_keys, vec![], seconds_ago(990)),
+            create_contact_event(&follower_keys, vec![], seconds_to_datetime(2)),
         ];
 
         assert_follow_changes(
             contact_events,
             vec![
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
                 FollowChange::new_unfollowed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_unfollowed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
@@ -526,7 +569,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_no_changes_for_unchanged_contact_list() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -537,12 +580,12 @@ mod tests {
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(1000),
+                seconds_to_datetime(1000),
             ),
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(990),
+                seconds_to_datetime(990),
             ),
         ];
 
@@ -550,12 +593,12 @@ mod tests {
             contact_events,
             vec![
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1000),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1000),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
@@ -564,7 +607,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_follow_self_ignored() {
         let follower_keys = Keys::generate();
         let follower_pubkey = follower_keys.public_key();
@@ -572,13 +615,13 @@ mod tests {
         let contact_events = vec![create_contact_event(
             &follower_keys,
             vec![follower_pubkey],
-            seconds_ago(1000),
+            seconds_to_datetime(1000),
         )];
 
         assert_follow_changes(contact_events, vec![]).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_mixed_follow_and_unfollow_in_single_update() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -590,12 +633,12 @@ mod tests {
             create_contact_event(
                 &follower_keys,
                 vec![followee1_pubkey, followee2_pubkey],
-                seconds_ago(1000),
+                seconds_to_datetime(1),
             ),
             create_contact_event(
                 &follower_keys,
                 vec![followee2_pubkey, followee3_pubkey],
-                seconds_ago(990),
+                seconds_to_datetime(2),
             ),
         ];
 
@@ -603,22 +646,22 @@ mod tests {
             contact_events,
             vec![
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
                 FollowChange::new_unfollowed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(990).into(),
+                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee3_pubkey,
                 ),
@@ -627,7 +670,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_final_state_with_older_list_ignored() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -640,21 +683,21 @@ mod tests {
         let monday_list = create_contact_event(
             &follower_keys,
             vec![followee1_pubkey, followee2_pubkey],
-            seconds_ago(1000),
+            seconds_to_datetime(1),
         );
 
         // Tuesday's update: follower stops following followee1, starts following followee3
         let tuesday_list = create_contact_event(
             &follower_keys,
             vec![followee2_pubkey, followee3_pubkey],
-            seconds_ago(990),
+            seconds_to_datetime(2),
         );
 
         // Wednesday's update: follower stops following followee2, starts following followee4
         let wednesday_update = create_contact_event(
             &follower_keys,
             vec![followee3_pubkey, followee4_pubkey],
-            seconds_ago(980),
+            seconds_to_datetime(3),
         );
 
         // Apply Monday's list, then Wednesday's update, and finally the late Tuesday list
@@ -663,33 +706,33 @@ mod tests {
             vec![
                 // Monday: 1 and 2 are followed
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(1000).into(),
+                    seconds_to_datetime(1),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
                 // Wednesday: 3 and 4 are followed, 1 and 2 are unfollowed
                 FollowChange::new_unfollowed(
-                    seconds_ago(980).into(),
+                    seconds_to_datetime(3),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
                 FollowChange::new_unfollowed(
-                    seconds_ago(980).into(),
+                    seconds_to_datetime(3),
                     follower_pubkey,
                     followee2_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(980).into(),
+                    seconds_to_datetime(3),
                     follower_pubkey,
                     followee3_pubkey,
                 ),
                 FollowChange::new_followed(
-                    seconds_ago(980).into(),
+                    seconds_to_datetime(3),
                     follower_pubkey,
                     followee4_pubkey,
                 ),
@@ -699,7 +742,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_it_does_not_process_non_contact_events() {
         let follower_keys = Keys::generate();
         let followee_pubkey = Keys::generate().public_key();
@@ -707,7 +750,7 @@ mod tests {
         let wrong_event = create_event(
             &follower_keys,
             vec![followee_pubkey],
-            seconds_ago(1000),
+            seconds_to_datetime(1000),
             Kind::TextNote,
         );
 
@@ -723,14 +766,18 @@ mod tests {
         assert_eq!(follow_changes, expected);
     }
 
-    fn create_contact_event(follower: &Keys, followees: Vec<PublicKey>, created_at: u64) -> Event {
+    fn create_contact_event(
+        follower: &Keys,
+        followees: Vec<PublicKey>,
+        created_at: DateTime<Utc>,
+    ) -> Event {
         create_event(follower, followees, created_at, Kind::ContactList)
     }
 
     fn create_event(
         follower: &Keys,
         followees: Vec<PublicKey>,
-        created_at: u64,
+        created_at: DateTime<Utc>,
         kind: Kind,
     ) -> Event {
         let contacts = followees
@@ -748,7 +795,7 @@ mod tests {
         });
 
         EventBuilder::new(kind, "", tags)
-            .custom_created_at(created_at.into())
+            .custom_created_at((created_at.timestamp() as u64).into())
             .to_event(follower)
             .unwrap()
     }
@@ -773,11 +820,10 @@ mod tests {
         for event in contact_events {
             follows_differ
                 .call(WorkerTaskItem::new(Box::new(event)))
-                .await
-                .unwrap();
+                .await?
         }
 
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::milliseconds(100).to_std()?).await;
         follow_change_task.abort();
 
         let mut follow_changes_vec = follow_changes.lock().await.clone();
@@ -786,7 +832,11 @@ mod tests {
         Ok(follow_changes_vec)
     }
 
-    fn seconds_ago(seconds: i64) -> u64 {
-        (Utc::now().timestamp() - seconds).max(0) as u64
+    fn seconds_to_datetime(seconds: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from(
+            UNIX_EPOCH
+                + Duration::days(100).to_std().unwrap()
+                + Duration::seconds(seconds).to_std().unwrap(),
+        )
     }
 }

@@ -48,15 +48,24 @@ impl UniqueFollowChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Duration, Utc};
     use nostr_sdk::prelude::Keys;
-    use nostr_sdk::prelude::Timestamp;
+    use std::time::UNIX_EPOCH;
 
-    fn create_follow_change(follower: PublicKey, followee: PublicKey, at: u64) -> FollowChange {
-        FollowChange::new_followed(Timestamp::from(at), follower, followee)
+    fn create_follow_change(
+        follower: PublicKey,
+        followee: PublicKey,
+        at: DateTime<Utc>,
+    ) -> FollowChange {
+        FollowChange::new_followed(at, follower, followee)
     }
 
-    fn create_unfollow_change(follower: PublicKey, followee: PublicKey, at: u64) -> FollowChange {
-        FollowChange::new_unfollowed(Timestamp::from(at), follower, followee)
+    fn create_unfollow_change(
+        follower: PublicKey,
+        followee: PublicKey,
+        at: DateTime<Utc>,
+    ) -> FollowChange {
+        FollowChange::new_unfollowed(at, follower, followee)
     }
 
     #[test]
@@ -66,10 +75,10 @@ mod tests {
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
-        let change1 = create_follow_change(follower, followee, 1);
+        let change1 = create_follow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(change1);
 
-        let change2 = create_unfollow_change(follower, followee, 1);
+        let change2 = create_unfollow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(change2.clone());
 
         // When they share the same time, the last change added should be kept
@@ -83,10 +92,10 @@ mod tests {
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
-        let newer_change = create_follow_change(follower, followee, 2);
+        let newer_change = create_follow_change(follower, followee, seconds_to_datetime(2));
         unique_changes.insert(newer_change.clone());
 
-        let older_change = create_unfollow_change(follower, followee, 1);
+        let older_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(older_change);
 
         // The older change should not replace the newer one, insertion order doesn't matter
@@ -101,8 +110,8 @@ mod tests {
         let followee1 = Keys::generate().public_key();
         let followee2 = Keys::generate().public_key();
 
-        let change1 = create_follow_change(follower, followee1, 1);
-        let change2 = create_follow_change(follower, followee2, 2);
+        let change1 = create_follow_change(follower, followee1, seconds_to_datetime(2));
+        let change2 = create_follow_change(follower, followee2, seconds_to_datetime(1));
 
         unique_changes.insert(change1.clone());
         unique_changes.insert(change2.clone());
@@ -121,7 +130,7 @@ mod tests {
         assert!(unique_changes.is_empty());
         assert_eq!(unique_changes.len(), 0);
 
-        let change = create_follow_change(follower, followee, 1);
+        let change = create_follow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(change);
 
         assert!(!unique_changes.is_empty());
@@ -135,14 +144,18 @@ mod tests {
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
-        let change1 = create_follow_change(follower, followee, 1);
+        let change1 = create_follow_change(follower, followee, seconds_to_datetime(2));
         unique_changes.insert(change1);
 
-        let change2 = create_follow_change(follower, followee, 2);
+        let change2 = create_follow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(change2);
 
         let changes = unique_changes.drain();
         assert_eq!(changes.len(), 1);
         assert!(unique_changes.is_empty());
+    }
+
+    fn seconds_to_datetime(seconds: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from(UNIX_EPOCH + Duration::seconds(seconds).to_std().unwrap())
     }
 }
