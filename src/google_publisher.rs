@@ -25,11 +25,9 @@ impl GooglePublisher {
 
         tokio::spawn(async move {
             let mut buffer = UniqueFollowChanges::new(size_threshold);
+            let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
             loop {
-                // Start a new sleep timer at the beginning of each loop iteration
-                let sleep_duration = time::sleep(Duration::from_secs(seconds_threshold));
-
                 select! {
                     _ = cancellation_token.cancelled() => {
                         debug!("Cancellation token is cancelled, stopping Google publisher");
@@ -39,10 +37,9 @@ impl GooglePublisher {
                     // The first condition to send the current buffer is the
                     // time interval. We wait a max of `seconds_threshold`
                     // seconds, after that the buffer is cleared and sent
-                    _ = sleep_duration => {
+                    _ = interval.tick() => {
                         if !buffer.is_empty() {
                             debug!("Time based threshold of {} seconds reached, publishing buffer", seconds_threshold);
-
 
                             if let Err(e) = client.publish_events(buffer.drain()).await {
                                 match &e {
@@ -72,6 +69,9 @@ impl GooglePublisher {
                     }
                 }
 
+                // The second condition to send the current buffer is it's size.
+                // If the buffer reaches the size threshold, we publish it and
+                // reset the time based interval.
                 if buffer.len() >= size_threshold {
                     debug!(
                         "Reached threshold of {} items, publishing buffer",
@@ -81,6 +81,7 @@ impl GooglePublisher {
                         error!("Failed to publish events: {}", e);
                         break;
                     }
+                    interval.reset();
                 }
             }
         });
