@@ -1,3 +1,5 @@
+use crate::refresh_friendly_id::{fetch_account_info, AccountInfo};
+use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use crate::{
     domain::{follow::Follow, follow_change::FollowChange},
@@ -17,21 +19,29 @@ struct FollowsDiff {
     exists_in_latest_contact_list: bool,
 }
 
-pub struct FollowsDiffer<T>
+pub struct FollowsDiffer<T, U>
 where
     T: RepoTrait + Sync + Send,
+    U: GetEventsOf + Sync + Send,
 {
     repo: Arc<T>,
+    nostr_client: Arc<U>,
     follow_change_sender: Sender<FollowChange>,
 }
 
-impl<T> FollowsDiffer<T>
+impl<T, U> FollowsDiffer<T, U>
 where
     T: RepoTrait + Sync + Send,
+    U: GetEventsOf + Sync + Send,
 {
-    pub fn new(repo: Arc<T>, follow_change_sender: Sender<FollowChange>) -> Self {
+    pub fn new(
+        repo: Arc<T>,
+        nostr_client: Arc<U>,
+        follow_change_sender: Sender<FollowChange>,
+    ) -> Self {
         Self {
             repo,
+            nostr_client,
             follow_change_sender,
         }
     }
@@ -81,6 +91,14 @@ where
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
 
+        let send_notifications = should_send_notifications(
+            &self.nostr_client,
+            maybe_last_seen_contact_list_at,
+            follower,
+            event_created_at,
+        )
+        .await?;
+
         for (followee, diff) in follows_diff {
             match diff.stored_follow {
                 Some(mut stored_follow) => {
@@ -90,10 +108,12 @@ where
                         unchanged += 1;
                     } else {
                         self.repo.delete_follow(&followee, follower).await?;
-                        let follow_change =
-                            FollowChange::new_unfollowed(event_created_at, *follower, followee)
-                                .with_last_seen_contact_list_at(maybe_last_seen_contact_list_at);
-                        self.send_follow_change(follow_change)?;
+
+                        if send_notifications {
+                            let follow_change =
+                                FollowChange::new_unfollowed(event_created_at, *follower, followee);
+                            self.send_follow_change(follow_change)?;
+                        }
                         unfollowed_counter += 1;
                     }
                 }
@@ -106,10 +126,12 @@ where
                             created_at: event_created_at,
                         };
                         self.repo.upsert_follow(&follow).await?;
-                        let follow_change =
-                            FollowChange::new_followed(event_created_at, *follower, followee)
-                                .with_last_seen_contact_list_at(maybe_last_seen_contact_list_at);
-                        self.send_follow_change(follow_change)?;
+
+                        if send_notifications {
+                            let follow_change =
+                                FollowChange::new_followed(event_created_at, *follower, followee);
+                            self.send_follow_change(follow_change)?;
+                        }
                         followed_counter += 1;
                     } else {
                         debug!("Skipping self-follow for {}", followee);
@@ -128,10 +150,12 @@ where
 }
 
 const ONE_DAY_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
+const ONE_WEEK_DURATION: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
-impl<T> WorkerTask<Box<Event>> for FollowsDiffer<T>
+impl<T, U> WorkerTask<Box<Event>> for FollowsDiffer<T, U>
 where
     T: RepoTrait + Sync + Send,
+    U: GetEventsOf + Sync + Send,
 {
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
         let WorkerTaskItem { item: event } = worker_task_item;
@@ -190,6 +214,39 @@ where
 
         Ok(())
     }
+}
+
+/// An heuristic to decide if we should send notifications for a contact list
+async fn should_send_notifications<T: GetEventsOf>(
+    nostr_client: &Arc<T>,
+    maybe_last_seen_contact_list: Option<DateTime<Utc>>,
+    follower: &PublicKey,
+    event_created_at: DateTime<Utc>,
+) -> Result<bool> {
+    if maybe_last_seen_contact_list.is_none() {
+        // This is the first time we see a contact list from this follower.
+        let AccountInfo { created_at, .. } = fetch_account_info(nostr_client, follower).await;
+        let Some(follower_created_at) = created_at else {
+            return Ok(true);
+        };
+
+        if (event_created_at - follower_created_at).to_std()? > ONE_WEEK_DURATION {
+            // If there's a big gap from the time of creation of the follower to
+            // the current contact list, then we assume that most of the follows
+            // are from long ago and we skip creating follow changes for this
+            // one to avoid noise, only used to update the DB and have the
+            // initial contact list for upcoming diffs.
+
+            info!(
+                "Skipping notifications for first seen list of an old account: {}",
+                follower
+            );
+
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn log_line(
@@ -251,6 +308,7 @@ mod tests {
     use crate::domain::follow::Follow;
     use crate::repo::RepoError;
     use chrono::{Duration, Utc};
+    use nostr_sdk::PublicKey;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
@@ -259,8 +317,27 @@ mod tests {
     use tokio::time::sleep;
 
     #[derive(Default)]
+
+    struct MockNostrClient;
+    impl GetEventsOf for MockNostrClient {
+        async fn get_events_of(
+            &self,
+            _filter: Vec<Filter>,
+            _timeout: Option<core::time::Duration>,
+        ) -> Result<Vec<Event>, nostr_sdk::client::Error> {
+            Ok(vec![])
+        }
+    }
     struct MockRepo {
         follows: Arc<Mutex<HashMap<PublicKey, (Vec<Follow>, Option<DateTime<Utc>>)>>>,
+    }
+
+    impl Default for MockRepo {
+        fn default() -> Self {
+            Self {
+                follows: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
     }
 
     impl RepoTrait for MockRepo {
@@ -805,7 +882,11 @@ mod tests {
     ) -> Result<Vec<FollowChange>> {
         let (follow_change_sender, _) = channel(100);
         let repo = Arc::new(MockRepo::default());
-        let follows_differ = FollowsDiffer::new(repo.clone(), follow_change_sender.clone());
+        let follows_differ = FollowsDiffer::new(
+            repo.clone(),
+            Arc::new(MockNostrClient),
+            follow_change_sender.clone(),
+        );
 
         let mut follow_change_receiver = follow_change_sender.subscribe();
         let follow_changes: Arc<Mutex<Vec<FollowChange>>> = Arc::new(Mutex::new(Vec::new()));

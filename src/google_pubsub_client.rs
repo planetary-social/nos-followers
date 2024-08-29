@@ -93,15 +93,11 @@ impl PublishEvents for GooglePubSubClient {
 
         let pubsub_messages = pubsub_messages?;
 
-        info!(
-            "{} Google PubSub messages after filtering",
-            pubsub_messages.len()
-        );
-
         if pubsub_messages.is_empty() {
             return Ok(());
         }
 
+        let len = pubsub_messages.len();
         let request = PublishRequest {
             topic: self.google_full_topic.clone(),
             messages: pubsub_messages,
@@ -112,6 +108,11 @@ impl PublishEvents for GooglePubSubClient {
             .publish(request)
             .await
             .map_err(GooglePublisherError::PublishError)?;
+
+        info!(
+            "Published {} messages to Google PubSub {}",
+            len, self.google_full_topic
+        );
 
         Ok(())
     }

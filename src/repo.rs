@@ -83,7 +83,6 @@ impl RepoTrait for Repo {
         let statement = r#"
             MERGE (user:User {pubkey: $pubkey_val})
             WITH user, user.last_contact_list_at AS previous_value
-            ON CREATE SET user.last_contact_list_at = $last_contact_list_at
             SET user.last_contact_list_at = CASE
                 WHEN previous_value IS NULL OR previous_value < $last_contact_list_at
                 THEN $last_contact_list_at
@@ -107,8 +106,9 @@ impl RepoTrait for Repo {
             .await
             .map_err(RepoError::MaybeSetLastContactListAt)?
         {
+            println!("row: {:?}", row);
             let previous_value = parse_datetime(&row, "previous_value")?;
-            Ok(Some(previous_value))
+            Ok(previous_value)
         } else {
             Ok(None)
         }
@@ -226,8 +226,16 @@ impl RepoTrait for Repo {
             let follower = row.get::<String>("follower").map_err(|e| {
                 RepoError::deserialization_with_context(e, "deserializing 'follower' field")
             })?;
-            let updated_at = parse_datetime(&row, "updated_at")?;
-            let created_at = parse_datetime(&row, "created_at")?;
+            let Some(updated_at) = parse_datetime(&row, "updated_at")? else {
+                return Err(RepoError::GetFollows(neo4rs::Error::DeserializationError(
+                    neo4rs::DeError::PropertyMissingButRequired,
+                )));
+            };
+            let Some(created_at) = parse_datetime(&row, "created_at")? else {
+                return Err(RepoError::GetFollows(neo4rs::Error::DeserializationError(
+                    neo4rs::DeError::PropertyMissingButRequired,
+                )));
+            };
 
             follows.push(Follow {
                 followee: PublicKey::from_hex(&followee).map_err(RepoError::GetFollowsPubkey)?,
@@ -242,9 +250,12 @@ impl RepoTrait for Repo {
 }
 
 /// A function to read as DateTime<Utc> a value stored either as LocalDatetime or DateTime<Utc>
-fn parse_datetime(row: &neo4rs::Row, field: &str) -> Result<DateTime<Utc>, RepoError> {
-    row.get::<DateTime<Utc>>(field)
-        .or_else(|_| row.get::<NaiveDateTime>(field).map(|naive| naive.and_utc()))
+fn parse_datetime(row: &neo4rs::Row, field: &str) -> Result<Option<DateTime<Utc>>, RepoError> {
+    row.get::<Option<DateTime<Utc>>>(field)
+        .or_else(|_| {
+            row.get::<Option<NaiveDateTime>>(field)
+                .map(|naive| naive.map(|n| n.and_utc()))
+        })
         .map_err(|e| {
             RepoError::deserialization_with_context(e, format!("deserializing '{}' field", field))
         })

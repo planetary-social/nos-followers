@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
@@ -14,8 +14,8 @@ pub enum ChangeType {
 #[serde(rename_all = "camelCase")]
 pub struct FollowChange {
     pub change_type: ChangeType,
+    #[serde(serialize_with = "serialize_at_as_i64")]
     pub at: DateTime<Utc>,
-    pub previous_at: Option<DateTime<Utc>>,
     pub follower: PublicKey,
     pub friendly_follower: Option<String>,
     pub followee: PublicKey,
@@ -37,7 +37,6 @@ impl FollowChange {
         Self {
             change_type: ChangeType::Followed,
             at,
-            previous_at: None,
             follower,
             friendly_follower: None,
             followee,
@@ -49,17 +48,11 @@ impl FollowChange {
         Self {
             change_type: ChangeType::Unfollowed,
             at,
-            previous_at: None,
             follower,
             friendly_follower: None,
             followee,
             friendly_followee: None,
         }
-    }
-
-    pub fn with_last_seen_contact_list_at(mut self, maybe_at: Option<DateTime<Utc>>) -> Self {
-        self.previous_at = maybe_at;
-        self
     }
 
     pub fn with_friendly_follower(mut self, name: String) -> Self {
@@ -71,6 +64,13 @@ impl FollowChange {
         self.friendly_followee = Some(name);
         self
     }
+}
+
+fn serialize_at_as_i64<S>(at: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_i64(at.timestamp())
 }
 
 impl fmt::Display for FollowChange {

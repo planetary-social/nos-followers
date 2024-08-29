@@ -55,9 +55,14 @@ async fn main() -> Result<()> {
     let repo = Arc::new(Repo::new(graph));
 
     info!("Initializing workers for follower list diff calculation");
+    let shared_nostr_client = Arc::new(create_client());
     let (follow_change_sender, _) =
         broadcast::channel::<FollowChange>(settings.follow_change_channel_size);
-    let follows_differ_worker = FollowsDiffer::new(repo.clone(), follow_change_sender.clone());
+    let follows_differ_worker = FollowsDiffer::new(
+        repo.clone(),
+        shared_nostr_client.clone(),
+        follow_change_sender.clone(),
+    );
     let cancellation_token = CancellationToken::new();
     let (event_sender, event_receiver) =
         broadcast::channel::<Box<Event>>(settings.event_channel_size);
@@ -70,7 +75,6 @@ async fn main() -> Result<()> {
     )?;
 
     info!("Starting follower change processing task");
-    let shared_nostr_client = create_client();
     let follow_change_handler = FollowChangeHandler::new(
         repo.clone(),
         shared_nostr_client.clone(),
@@ -94,7 +98,7 @@ async fn main() -> Result<()> {
         .kind(Kind::ContactList)];
 
     let nostr_sub = start_nostr_subscription(
-        shared_nostr_client,
+        shared_nostr_client.clone(),
         [settings.relay].into(),
         filters,
         event_sender,

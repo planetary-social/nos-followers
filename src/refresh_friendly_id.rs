@@ -1,11 +1,15 @@
-use crate::repo::{Repo, RepoTrait};
+use crate::{
+    relay_subscriber::GetEventsOf,
+    repo::{Repo, RepoTrait},
+};
 use cached::proc_macro::cached;
 use cached::TimedSizedCache;
+use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum FriendlyId {
     DisplayName(String),
     Name(String),
@@ -25,6 +29,105 @@ impl FriendlyId {
         }
     }
 }
+#[derive(Debug, Clone)]
+pub struct AccountInfo {
+    pub friendly_id: FriendlyId,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Get useful info about an account
+// We cache 1_000_000 entries and each entry expires after 50 minutes
+#[cached(
+    ty = "TimedSizedCache<[u8; 32], AccountInfo>",
+    create = "{ TimedSizedCache::with_size_and_lifespan(1_000_000, 60 * 50) }",
+    convert = r#"{ public_key.to_bytes() }"#
+)]
+pub async fn fetch_account_info<T: GetEventsOf>(
+    nostr_client: &Arc<T>,
+    public_key: &PublicKey,
+) -> AccountInfo {
+    let filter: Filter = Filter::new()
+        .author(*public_key)
+        .kind(Kind::Metadata)
+        .limit(1);
+
+    let Ok(events) = nostr_client.get_events_of(vec![filter], None).await else {
+        let friendly_id = verified_friendly_id(None, public_key, Nip05Verifier).await;
+
+        return AccountInfo {
+            friendly_id,
+            created_at: None,
+        };
+    };
+
+    let (maybe_metadata, maybe_event) = match events.first() {
+        Some(event) => match Metadata::from_json(event.content()) {
+            Ok(metadata) => (Some(metadata), Some(event)),
+            Err(e) => {
+                debug!(
+                    "Failed to fetch metadata for public key {}: {}",
+                    public_key.to_hex(),
+                    e
+                );
+                (None, Some(event))
+            }
+        },
+        None => {
+            debug!(
+                "No metadata event found for public key {}",
+                public_key.to_hex(),
+            );
+            (None, None)
+        }
+    };
+
+    debug!(
+        "Fetched metadata for public key {}: {:?}",
+        public_key.to_hex(),
+        maybe_metadata
+    );
+
+    let friendly_id = verified_friendly_id(maybe_metadata, public_key, Nip05Verifier).await;
+
+    AccountInfo {
+        friendly_id,
+        created_at: maybe_event
+            .map(|m| DateTime::from_timestamp(m.created_at.as_u64() as i64, 0))
+            .unwrap_or(None),
+    }
+}
+
+// Try to return an identifier that is not the public key. Save it in DB
+// We cache 1_000_000 entries and each entry expires after 50 minutes
+#[cached(
+    ty = "TimedSizedCache<[u8; 32], String>",
+    create = "{ TimedSizedCache::with_size_and_lifespan(1_000_000, 60 * 50) }",
+    convert = r#"{ public_key.to_bytes() }"#
+)]
+pub async fn refresh_friendly_id<T: GetEventsOf>(
+    repo: &Arc<Repo>,
+    nostr_client: &Arc<T>,
+    public_key: &PublicKey,
+) -> String {
+    let AccountInfo { friendly_id, .. } = fetch_account_info(nostr_client, public_key).await;
+
+    match friendly_id {
+        FriendlyId::DisplayName(display_name)
+        | FriendlyId::Name(display_name)
+        | FriendlyId::Nip05(display_name)
+        | FriendlyId::Npub(display_name) => {
+            if let Err(e) = repo.set_friendly_id(public_key, &display_name).await {
+                error!(
+                    "Failed to add friendly ID for public key {}: {}",
+                    public_key.to_hex(),
+                    e
+                );
+            }
+            display_name
+        }
+        FriendlyId::PublicKey(pk) => pk,
+    }
+}
 
 trait VerifyNip05 {
     async fn verify_nip05(&self, public_key: &PublicKey, nip05_value: &str) -> bool;
@@ -40,7 +143,7 @@ impl VerifyNip05 for Nip05Verifier {
     }
 }
 
-async fn fetch_friendly_id(
+async fn verified_friendly_id(
     maybe_metadata: Option<Metadata>,
     public_key: &PublicKey,
     nip05_verifier: impl VerifyNip05,
@@ -74,56 +177,6 @@ async fn fetch_friendly_id(
     }
 
     name_or_npub_or_pubkey
-}
-
-// Try to return an identifier that is not the public key. Save it in DB
-// We cache 1_000_000 entries and each entry expires after 50 minutes
-#[cached(
-    ty = "TimedSizedCache<[u8; 32], String>",
-    create = "{ TimedSizedCache::with_size_and_lifespan(1_000_000, 60 * 50) }",
-    convert = r#"{ public_key.to_bytes() }"#
-)]
-pub async fn refresh_friendly_id(
-    repo: &Arc<Repo>,
-    nostr_client: &Client,
-    public_key: &PublicKey,
-) -> String {
-    let metadata_result = match nostr_client.metadata(*public_key).await {
-        Ok(metadata) => Some(metadata),
-        Err(e) => {
-            debug!(
-                "Failed to fetch metadata for public key {}: {}",
-                public_key.to_hex(),
-                e
-            );
-            None
-        }
-    };
-
-    debug!(
-        "Fetched metadata for public key {}: {:?}",
-        public_key.to_hex(),
-        metadata_result
-    );
-
-    let friendly_id = fetch_friendly_id(metadata_result, public_key, Nip05Verifier).await;
-
-    match friendly_id {
-        FriendlyId::DisplayName(display_name)
-        | FriendlyId::Name(display_name)
-        | FriendlyId::Nip05(display_name)
-        | FriendlyId::Npub(display_name) => {
-            if let Err(e) = repo.set_friendly_id(public_key, &display_name).await {
-                error!(
-                    "Failed to add friendly ID for public key {}: {}",
-                    public_key.to_hex(),
-                    e
-                );
-            }
-            display_name
-        }
-        FriendlyId::PublicKey(pk) => pk,
-    }
 }
 
 #[cfg(test)]
@@ -163,7 +216,8 @@ mod tests {
                 .unwrap();
         let metadata = Metadata::default();
 
-        let friendly_id = fetch_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
+        let friendly_id =
+            verified_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
 
         assert_eq!(
             friendly_id,
@@ -181,7 +235,8 @@ mod tests {
         let mut metadata = Metadata::default();
         metadata.display_name = Some("Alice".to_string());
 
-        let friendly_id = fetch_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
+        let friendly_id =
+            verified_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
 
         assert_eq!(friendly_id, FriendlyId::DisplayName("Alice".to_string()));
     }
@@ -194,7 +249,8 @@ mod tests {
         let mut metadata = Metadata::default();
         metadata.name = Some("Alice".to_string());
 
-        let friendly_id = fetch_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
+        let friendly_id =
+            verified_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
 
         assert_eq!(friendly_id, FriendlyId::Name("Alice".to_string()));
     }
@@ -209,7 +265,8 @@ mod tests {
         metadata.name = Some("Alice".to_string());
         metadata.nip05 = Some("alice@nos.social".to_string());
 
-        let friendly_id = fetch_friendly_id(Some(metadata), &public_key, TrueNip05Verifier).await;
+        let friendly_id =
+            verified_friendly_id(Some(metadata), &public_key, TrueNip05Verifier).await;
 
         assert_eq!(
             friendly_id,
@@ -227,7 +284,8 @@ mod tests {
         metadata.name = Some("AliceName".to_string());
         metadata.nip05 = Some("alice@nos.social".to_string());
 
-        let friendly_id = fetch_friendly_id(Some(metadata), &public_key, FalseNip05Verifier).await;
+        let friendly_id =
+            verified_friendly_id(Some(metadata), &public_key, FalseNip05Verifier).await;
 
         assert_eq!(
             friendly_id,

@@ -1,11 +1,32 @@
 use anyhow::{bail, Result};
+use futures::Future;
 use nostr_sdk::prelude::*;
 use signal::unix::{signal, SignalKind};
+use std::marker::Send;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+
+pub trait GetEventsOf: Send + Sync {
+    fn get_events_of(
+        &self,
+        filters: Vec<Filter>,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = Result<Vec<Event>, Error>> + Send;
+}
+
+impl GetEventsOf for Client {
+    fn get_events_of(
+        &self,
+        filters: Vec<Filter>,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = Result<Vec<Event>, Error>> + Send {
+        self.get_events_of(filters, timeout)
+    }
+}
 
 pub fn create_client() -> Client {
     let opts = Options::default()
@@ -19,7 +40,7 @@ pub fn create_client() -> Client {
 }
 
 pub async fn start_nostr_subscription(
-    nostr_client: Client,
+    nostr_client: Arc<Client>,
     relays: Vec<String>,
     filters: Vec<Filter>,
     event_tx: Sender<Box<Event>>,
