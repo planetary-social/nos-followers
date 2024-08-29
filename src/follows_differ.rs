@@ -134,7 +134,10 @@ where
                         }
                         followed_counter += 1;
                     } else {
-                        debug!("Skipping self-follow for {}", followee);
+                        debug!(
+                            "Skipping self-follow for {}",
+                            followee.to_bech32().unwrap_or_default()
+                        );
                     }
                 }
             }
@@ -179,7 +182,7 @@ where
             if event.created_at <= (last_seen_contact_list.timestamp() as u64).into() {
                 debug!(
                     "Skipping follow list for {} as it's older than the last update",
-                    follower
+                    follower.to_bech32().unwrap_or_default()
                 );
                 return Ok(());
             }
@@ -239,7 +242,7 @@ async fn should_send_notifications<T: GetEventsOf>(
 
             info!(
                 "Skipping notifications for first seen list of an old account: {}",
-                follower
+                follower.to_bech32().unwrap_or_default()
             );
 
             return Ok(false);
@@ -275,16 +278,18 @@ fn log_line(
 
     if maybe_last_seen_contact_list.is_none() {
         return Some(format!(
-            "Pubkey {}: date {}, {} followed, new follows list",
-            follower, timestamp_diff, followed_counter,
+            "Npub {}: date {}, {} followed, new follows list",
+            follower.to_bech32().unwrap_or_default(),
+            timestamp_diff,
+            followed_counter,
         ));
     }
 
     // Investigate states in which there are no followees but there are unfollowed followees
     if followed_counter == 0 && unfollowed_counter > 0 && unchanged == 0 {
         return Some(format!(
-            "ALL UNFOLLOWED: Pubkey {}: date {}, {} unfollowed, {} unchanged, {}",
-            follower,
+            "ALL UNFOLLOWED: Npub {}: date {}, {} unfollowed, {} unchanged, {}",
+            follower.to_bech32().unwrap_or_default(),
             timestamp_diff,
             unfollowed_counter,
             unchanged,
@@ -293,8 +298,12 @@ fn log_line(
     }
 
     Some(format!(
-        "Pubkey {}: date {}, {} followed, {} unfollowed, {} unchanged",
-        follower, timestamp_diff, followed_counter, unfollowed_counter, unchanged,
+        "Npub {}: date {}, {} followed, {} unfollowed, {} unchanged",
+        follower.to_bech32().unwrap_or_default(),
+        timestamp_diff,
+        followed_counter,
+        unfollowed_counter,
+        unchanged,
     ))
 }
 

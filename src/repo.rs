@@ -89,7 +89,7 @@ impl RepoTrait for Repo {
                 ELSE previous_value
             END
             RETURN previous_value
-        "#;
+            "#;
 
         let query = query(statement)
             .param("pubkey_val", public_key.to_hex())
@@ -106,7 +106,6 @@ impl RepoTrait for Repo {
             .await
             .map_err(RepoError::MaybeSetLastContactListAt)?
         {
-            println!("row: {:?}", row);
             let previous_value = parse_datetime(&row, "previous_value")?;
             Ok(previous_value)
         } else {
