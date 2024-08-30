@@ -1,5 +1,5 @@
 use crate::config::Settings;
-use crate::domain::follow_change::FollowChange;
+use crate::domain::FollowChange;
 use crate::google_publisher::GooglePublisher;
 use crate::google_pubsub_client::GooglePubSubClient;
 use crate::refresh_friendly_id::refresh_friendly_id;

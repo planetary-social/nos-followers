@@ -1,16 +1,16 @@
-use crate::domain::follow_change::FollowChange;
+use crate::domain::FollowChange;
 use indexmap::IndexMap;
 use nostr_sdk::PublicKey;
 
 /// A struct that reduces noise by collapsing multiple follow/unfollow actions
 /// for the same follower-followee pair into a single `FollowChange`. Only the
 /// most recent change is kept, preventing unnecessary toggles.
-pub struct UniqueFollowChanges {
+pub struct FollowChangeAggregator {
     // IndexMap is used to preserve insertion order
     unique_follow_changes: IndexMap<(PublicKey, PublicKey), FollowChange>,
 }
 
-impl UniqueFollowChanges {
+impl FollowChangeAggregator {
     pub fn new(size_threshold: usize) -> Self {
         Self {
             unique_follow_changes: IndexMap::with_capacity(size_threshold),
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_insert_unique_follow_change() {
-        let mut unique_changes = UniqueFollowChanges::new(10);
+        let mut unique_changes = FollowChangeAggregator::new(10);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn test_does_not_replace_with_older_change() {
-        let mut unique_changes = UniqueFollowChanges::new(10);
+        let mut unique_changes = FollowChangeAggregator::new(10);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_insert_different_followee() {
-        let mut unique_changes = UniqueFollowChanges::new(10);
+        let mut unique_changes = FollowChangeAggregator::new(10);
 
         let follower = Keys::generate().public_key();
         let followee1 = Keys::generate().public_key();
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_is_empty_and_len() {
-        let mut unique_changes = UniqueFollowChanges::new(10);
+        let mut unique_changes = FollowChangeAggregator::new(10);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_drain_clears_map() {
-        let mut unique_changes = UniqueFollowChanges::new(10);
+        let mut unique_changes = FollowChangeAggregator::new(10);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();

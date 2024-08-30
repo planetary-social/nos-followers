@@ -1,7 +1,6 @@
 mod config;
 mod domain;
 mod follow_change_handler;
-mod follows_differ;
 mod google_publisher;
 mod google_pubsub_client;
 mod http_server;
@@ -9,13 +8,11 @@ mod migrations;
 mod refresh_friendly_id;
 mod relay_subscriber;
 mod repo;
-mod unique_follow_changes;
 mod worker_pool;
 
 use config::{Config, Settings};
-use domain::follow_change::FollowChange;
+use domain::{FollowChange, FollowsDiffer};
 use follow_change_handler::FollowChangeHandler;
-use follows_differ::FollowsDiffer;
 use http_server::HttpServer;
 use migrations::apply_migrations;
 use neo4rs::Graph;

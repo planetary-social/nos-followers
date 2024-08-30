@@ -1,6 +1,6 @@
 use core::panic;
 
-use crate::domain::follow::Follow;
+use crate::domain::Follow;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;

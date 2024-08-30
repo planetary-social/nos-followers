@@ -1,6 +1,6 @@
-use crate::domain::follow_change::FollowChange;
+use crate::domain::FollowChange;
+use crate::domain::FollowChangeAggregator;
 use crate::google_pubsub_client::{GooglePublisherError, PublishEvents};
-use crate::unique_follow_changes::UniqueFollowChanges;
 use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
@@ -24,7 +24,7 @@ impl GooglePublisher {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
         tokio::spawn(async move {
-            let mut buffer = UniqueFollowChanges::new(size_threshold);
+            let mut buffer = FollowChangeAggregator::new(size_threshold);
             let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
             loop {
@@ -102,7 +102,7 @@ impl GooglePublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::follow_change::FollowChange;
+    use crate::domain::FollowChange;
     use crate::google_pubsub_client::GooglePublisherError;
     use chrono::{DateTime, Duration, Utc};
     use futures::Future;
