@@ -5,13 +5,13 @@ use crate::{
     domain::{follow::Follow, follow_change::FollowChange},
     worker_pool::{WorkerTask, WorkerTaskItem},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use metrics::counter;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
 use tracing::{debug, info};
 
 #[derive(Default, Debug)]
@@ -153,8 +153,8 @@ where
     }
 }
 
-const ONE_DAY_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
-const ONE_WEEK_DURATION: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+const ONE_DAY_DURATION: Duration = Duration::seconds(60 * 60 * 24);
+const ONE_WEEK_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7);
 
 impl<T, U> WorkerTask<Box<Event>> for FollowsDiffer<T, U>
 where
@@ -164,7 +164,11 @@ where
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
         let WorkerTaskItem { item: event } = worker_task_item;
 
-        let one_day_ago = Timestamp::from((Instant::now() - ONE_DAY_DURATION).elapsed().as_secs());
+        let one_day_ago = Timestamp::from(
+            (Instant::now() - ONE_DAY_DURATION.to_std()?)
+                .elapsed()
+                .as_secs(),
+        );
 
         if event.kind != Kind::ContactList || event.created_at < one_day_ago {
             return Ok(());
@@ -235,7 +239,7 @@ async fn should_send_notifications<T: GetEventsOf>(
             return Ok(true);
         };
 
-        if (event_created_at - follower_created_at).to_std()? > ONE_WEEK_DURATION {
+        if (event_created_at - follower_created_at) > ONE_WEEK_DURATION {
             // If there's a big gap from the time of creation of the follower to
             // the current contact list, then we assume that most of the follows
             // are from long ago and we skip creating follow changes for this
