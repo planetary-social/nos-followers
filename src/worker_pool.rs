@@ -1,4 +1,5 @@
 use futures::Future;
+use metrics::counter;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::{
@@ -56,9 +57,11 @@ impl WorkerPool {
                               match result {
                                   Ok(Ok(())) => {},
                                   Ok(Err(e)) => {
+                                      counter!("worker_failures").increment(1);
                                       error!("Worker failed: {}", e);
                                   },
                                   Err(_) => {
+                                      counter!("worker_timeouts").increment(1);
                                       error!("Worker task timed out after {} seconds", worker_timeout_secs);
                                   }
                               }
@@ -95,16 +98,17 @@ impl WorkerPool {
 
                                 let worker_item = WorkerTaskItem { item };
 
-                                // This is a single item channel so we don't use send_with_checks
                                 if let Err(e) = worker_tx.send(worker_item).await {
                                     error!("Failed to send to worker: {}", e);
                                     break;
                                 }
                             }
                             Err(RecvError::Lagged(n)) => {
+                                counter!("worker_lagged").increment(1);
                                 warn!("Receiver lagged and missed {} messages", n);
                             }
                             Err(RecvError::Closed) => {
+                                counter!("worker_closed").increment(1);
                                 error!("Item receiver channel closed");
                                 break;
                             }

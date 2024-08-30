@@ -5,6 +5,7 @@ use crate::{
 use cached::proc_macro::cached;
 use cached::TimedSizedCache;
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use nostr_sdk::prelude::*;
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -171,6 +172,7 @@ async fn verified_friendly_id(
 
     if let Some(nip05_value) = metadata.nip05 {
         if nip05_verifier.verify_nip05(public_key, &nip05_value).await {
+            counter!("verified_nip05").increment(1);
             return FriendlyId::Nip05(nip05_value);
         }
         return name_or_npub_or_pubkey;

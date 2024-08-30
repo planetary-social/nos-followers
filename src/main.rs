@@ -11,6 +11,7 @@ mod repo;
 mod worker_pool;
 
 use config::{Config, Settings};
+use core::panic;
 use domain::{FollowChange, FollowsDiffer};
 use follow_change_handler::FollowChangeHandler;
 use http_server::HttpServer;
@@ -19,8 +20,7 @@ use neo4rs::Graph;
 use nostr_sdk::prelude::*;
 use relay_subscriber::{create_client, start_nostr_subscription};
 use repo::Repo;
-
-use core::panic;
+use rustls::crypto::ring;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,10 @@ async fn main() -> Result<()> {
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
+
+    ring::default_provider()
+        .install_default()
+        .expect("Failed to install ring crypto provider");
 
     // Load the configuration
     let config = Config::new("config")?;

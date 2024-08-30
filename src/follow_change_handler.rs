@@ -57,8 +57,9 @@ impl<T: GetEventsOf> WorkerTask<FollowChange> for FollowChangeHandler<T> {
         let WorkerTaskItem {
             item: mut follow_change,
         } = worker_task_item;
-        // Fetch friendly IDs for the pubkeys or get it from DB if it takes more
-        // than timeout_secs. Whatever if found through the network is cached.
+        // Fetch friendly IDs for the pubkeys or fallback to the DB if it takes
+        // more than timeout_secs. Whatever is found through the network is
+        // cached.
         let (friendly_follower, friendly_followee) = tokio::select!(
             result = fetch_friendly_ids(
                 &self.repo,

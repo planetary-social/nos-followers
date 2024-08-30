@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
@@ -34,6 +35,8 @@ impl Eq for FollowChange {}
 
 impl FollowChange {
     pub fn new_followed(at: DateTime<Utc>, follower: PublicKey, followee: PublicKey) -> Self {
+        counter!("follows").increment(1);
+
         Self {
             change_type: ChangeType::Followed,
             at,
@@ -45,6 +48,8 @@ impl FollowChange {
     }
 
     pub fn new_unfollowed(at: DateTime<Utc>, follower: PublicKey, followee: PublicKey) -> Self {
+        counter!("unfollows").increment(1);
+
         Self {
             change_type: ChangeType::Unfollowed,
             at,

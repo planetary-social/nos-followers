@@ -6,6 +6,7 @@ use crate::{
     worker_pool::{WorkerTask, WorkerTaskItem},
 };
 use chrono::{DateTime, Utc};
+use metrics::counter;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -215,6 +216,7 @@ where
             info!("{}", log_line);
         }
 
+        counter!("contact_lists_processed").increment(1);
         Ok(())
     }
 }

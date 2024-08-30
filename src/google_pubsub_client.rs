@@ -4,6 +4,7 @@ use gcloud_sdk::{
     google::pubsub::v1::{publisher_client::PublisherClient, PublishRequest, PubsubMessage},
     *,
 };
+use metrics::counter;
 use thiserror::Error;
 use tracing::info;
 
@@ -113,6 +114,8 @@ impl PublishEvents for GooglePubSubClient {
             "Published {} messages to Google PubSub {}",
             len, self.google_full_topic
         );
+
+        counter!("pubsub_messages").increment(len as u64);
 
         Ok(())
     }
