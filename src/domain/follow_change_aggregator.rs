@@ -7,7 +7,7 @@ use nostr_sdk::PublicKey;
 /// most recent change is kept, preventing unnecessary toggles.
 pub struct FollowChangeAggregator {
     // IndexMap is used to preserve insertion order
-    unique_follow_changes: IndexMap<(PublicKey, PublicKey), FollowChange>,
+    unique_follow_changes: IndexMap<PublicKey, FollowChange>,
 }
 
 impl FollowChangeAggregator {
@@ -17,12 +17,20 @@ impl FollowChangeAggregator {
         }
     }
     pub fn insert(&mut self, follow_change: FollowChange) {
-        let key = (follow_change.follower, follow_change.followee);
+        let key = follow_change.followee;
 
         if let Some(existing_change) = self.unique_follow_changes.get(&key) {
             // Replace only if the new follow_change is more recent
             if follow_change.at >= existing_change.at {
-                self.unique_follow_changes.insert(key, follow_change);
+                // ...and the same type
+                if existing_change.change_type == follow_change.change_type {
+                    self.unique_follow_changes.insert(key, follow_change);
+                } else {
+                    // A follow followed by and unfollow is a no-op
+                    // An unfollow followed by a follow is a no-op
+                    // So remove it
+                    self.unique_follow_changes.shift_remove(&key);
+                }
             }
         } else {
             self.unique_follow_changes.insert(key, follow_change);
@@ -78,7 +86,7 @@ mod tests {
         let change1 = create_follow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(change1);
 
-        let change2 = create_unfollow_change(follower, followee, seconds_to_datetime(1));
+        let change2 = create_follow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(change2.clone());
 
         // When they share the same time, the last change added should be kept
@@ -118,6 +126,40 @@ mod tests {
 
         // Both changes should be kept since they have different followees
         assert_eq!(unique_changes.drain(), [change1, change2]);
+    }
+
+    #[test]
+    fn test_an_unfollow_cancels_a_follow() {
+        let mut unique_changes = FollowChangeAggregator::new(10);
+
+        let follower = Keys::generate().public_key();
+        let followee = Keys::generate().public_key();
+
+        let follow_change = create_follow_change(follower, followee, seconds_to_datetime(1));
+        let unfollow_change = create_unfollow_change(follower, followee, seconds_to_datetime(2));
+
+        unique_changes.insert(follow_change.clone());
+        unique_changes.insert(unfollow_change.clone());
+
+        // The unfollow should cancel the follow
+        assert_eq!(unique_changes.drain(), []);
+    }
+
+    #[test]
+    fn test_a_follow_cancels_an_unfollow() {
+        let mut unique_changes = FollowChangeAggregator::new(10);
+
+        let follower = Keys::generate().public_key();
+        let followee = Keys::generate().public_key();
+
+        let unfollow_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
+        let follow_change = create_follow_change(follower, followee, seconds_to_datetime(2));
+
+        unique_changes.insert(unfollow_change.clone());
+        unique_changes.insert(follow_change.clone());
+
+        // The follow should cancel the unfollow
+        assert_eq!(unique_changes.drain(), []);
     }
 
     #[test]
