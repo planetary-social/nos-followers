@@ -10,5 +10,5 @@ followers:
   worker_timeout_secs: 10
   google_project_id: "pub-verse-app"
   google_topic: "follow-changes"
-  seconds_threshold: 5
-  size_threshold: 500
+  seconds_threshold: 60
+  size_threshold: 5000
