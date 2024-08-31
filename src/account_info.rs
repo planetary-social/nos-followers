@@ -7,16 +7,20 @@ use cached::TimedSizedCache;
 use chrono::{DateTime, Utc};
 use metrics::counter;
 use nostr_sdk::prelude::*;
+use serde::Serialize;
+use serde::Serializer;
+use std::fmt::Display;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, PartialOrd, Ord, Eq)]
 pub enum FriendlyId {
     DisplayName(String),
     Name(String),
     Npub(String),
     Nip05(String),
     PublicKey(String),
+    DB(String),
 }
 
 impl FriendlyId {
@@ -26,10 +30,41 @@ impl FriendlyId {
             | FriendlyId::Name(s)
             | FriendlyId::Npub(s)
             | FriendlyId::Nip05(s)
+            | FriendlyId::DB(s)
             | FriendlyId::PublicKey(s) => !s.trim().is_empty(),
         }
     }
 }
+
+impl Display for FriendlyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FriendlyId::DisplayName(s)
+            | FriendlyId::Name(s)
+            | FriendlyId::Npub(s)
+            | FriendlyId::Nip05(s)
+            | FriendlyId::PublicKey(s)
+            | FriendlyId::DB(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl Serialize for FriendlyId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            FriendlyId::DisplayName(s)
+            | FriendlyId::Name(s)
+            | FriendlyId::Npub(s)
+            | FriendlyId::Nip05(s)
+            | FriendlyId::PublicKey(s)
+            | FriendlyId::DB(s) => serializer.serialize_str(s),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountInfo {
     pub friendly_id: FriendlyId,
@@ -38,6 +73,7 @@ pub struct AccountInfo {
 
 /// Get useful info about an account
 // We cache 1_000_000 entries and each entry expires after 50 minutes
+// TODO: The number is arbitrary, adjust based on metrics
 #[cached(
     ty = "TimedSizedCache<[u8; 32], AccountInfo>",
     create = "{ TimedSizedCache::with_size_and_lifespan(1_000_000, 60 * 50) }",
@@ -100,8 +136,9 @@ pub async fn fetch_account_info<T: GetEventsOf>(
 
 // Try to return an identifier that is not the public key. Save it in DB
 // We cache 1_000_000 entries and each entry expires after 50 minutes
+// TODO: The number is arbitrary, adjust based on metrics
 #[cached(
-    ty = "TimedSizedCache<[u8; 32], String>",
+    ty = "TimedSizedCache<[u8; 32], FriendlyId>",
     create = "{ TimedSizedCache::with_size_and_lifespan(1_000_000, 60 * 50) }",
     convert = r#"{ public_key.to_bytes() }"#
 )]
@@ -109,25 +146,26 @@ pub async fn refresh_friendly_id<T: GetEventsOf>(
     repo: &Arc<Repo>,
     nostr_client: &Arc<T>,
     public_key: &PublicKey,
-) -> String {
+) -> FriendlyId {
     let AccountInfo { friendly_id, .. } = fetch_account_info(nostr_client, public_key).await;
 
-    match friendly_id {
+    match &friendly_id {
         FriendlyId::DisplayName(display_name)
         | FriendlyId::Name(display_name)
         | FriendlyId::Nip05(display_name)
         | FriendlyId::Npub(display_name) => {
-            if let Err(e) = repo.set_friendly_id(public_key, &display_name).await {
+            if let Err(e) = repo.set_friendly_id(public_key, display_name).await {
                 error!(
                     "Failed to add friendly ID for public key {}: {}",
                     public_key.to_hex(),
                     e
                 );
             }
-            display_name
         }
-        FriendlyId::PublicKey(pk) => pk,
+        FriendlyId::PublicKey(_display_name) | FriendlyId::DB(_display_name) => {}
     }
+
+    friendly_id
 }
 
 trait VerifyNip05 {

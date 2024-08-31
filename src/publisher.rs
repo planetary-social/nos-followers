@@ -1,30 +1,37 @@
 use crate::domain::FollowChange;
 use crate::domain::FollowChangeAggregator;
-use crate::google_pubsub_client::{GooglePublisherError, PublishEvents};
+use crate::google_pubsub_client::{PublishEvents, PublisherError};
 use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-/// Google publisher for follow changes. It batches follow changes and publishes
+/// Publisher for follow changes. It batches follow changes and publishes
 /// them to Google PubSub after certain time is elapsed or a size threshold is
 /// hit.
-pub struct GooglePublisher {
+pub struct Publisher {
     sender: mpsc::Sender<FollowChange>,
 }
 
-impl GooglePublisher {
+impl Publisher {
     pub async fn create(
         cancellation_token: CancellationToken,
         mut client: impl PublishEvents + Send + Sync + 'static,
         seconds_threshold: u64,
         size_threshold: usize,
-    ) -> Result<Self, GooglePublisherError> {
+        max_follows_per_hour: u32,
+        max_retention_minutes: i64,
+    ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
+        let mut buffer = FollowChangeAggregator::new(
+            size_threshold,
+            max_follows_per_hour,
+            max_retention_minutes,
+        )
+        .map_err(|_| PublisherError::BufferInit)?;
         tokio::spawn(async move {
-            let mut buffer = FollowChangeAggregator::new(size_threshold);
             let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
             loop {
@@ -41,10 +48,10 @@ impl GooglePublisher {
                         if !buffer.is_empty() {
                             debug!("Time based threshold of {} seconds reached, publishing buffer", seconds_threshold);
 
-                            if let Err(e) = client.publish_events(buffer.drain()).await {
+                            if let Err(e) = client.publish_events(buffer.drain_into_batches()).await {
                                 match &e {
                                     // We've seen this happen sporadically, we don't neet to kill the look in this situation
-                                    GooglePublisherError::PublishError(_) => {
+                                    PublisherError::PublishError(_) => {
                                         error!("{}", e);
                                     }
                                     _ => {
@@ -72,12 +79,12 @@ impl GooglePublisher {
                 // The second condition to send the current buffer is it's size.
                 // If the buffer reaches the size threshold, we publish it and
                 // reset the time based interval.
-                if buffer.len() >= size_threshold {
+                if buffer.follow_changes_len() >= size_threshold {
                     debug!(
                         "Reached threshold of {} items, publishing buffer",
                         size_threshold
                     );
-                    if let Err(e) = client.publish_events(buffer.drain()).await {
+                    if let Err(e) = client.publish_events(buffer.drain_into_batches()).await {
                         error!("Failed to publish events: {}", e);
                         break;
                     }
@@ -102,38 +109,40 @@ impl GooglePublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::FollowChange;
-    use crate::google_pubsub_client::GooglePublisherError;
+    use crate::domain::{FollowChange, FollowChangeBatch};
+    use crate::google_pubsub_client::PublisherError;
+    use assertables::*;
     use chrono::{DateTime, Duration, Utc};
     use futures::Future;
     use gcloud_sdk::tonic::Status;
     use nostr_sdk::prelude::Keys;
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
     struct MockPublishEvents {
-        published_events: Arc<Mutex<Vec<FollowChange>>>,
+        published_events: Arc<Mutex<Vec<FollowChangeBatch>>>,
         fail_publish: bool,
     }
 
     impl PublishEvents for MockPublishEvents {
         fn publish_events(
             &mut self,
-            follow_changes: Vec<FollowChange>,
-        ) -> impl Future<Output = Result<(), GooglePublisherError>> + std::marker::Send {
+            messages: Vec<FollowChangeBatch>,
+        ) -> impl Future<Output = Result<(), PublisherError>> + std::marker::Send {
             let published_events = self.published_events.clone();
             let fail_publish = self.fail_publish;
 
             async move {
                 if fail_publish {
-                    Err(GooglePublisherError::PublishError(Status::cancelled(
+                    Err(PublisherError::PublishError(Status::cancelled(
                         "Mock error",
                     )))
                 } else {
                     let mut published_events = published_events.lock().await;
-                    published_events.extend(follow_changes);
+                    published_events.extend(messages);
                     Ok(())
                 }
             }
@@ -141,7 +150,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_google_publisher_collapses_messages() {
+    async fn test_publisher_collapses_messages() {
         let published_events = Arc::new(Mutex::new(Vec::new()));
         let mock_client = MockPublishEvents {
             published_events: published_events.clone(),
@@ -151,12 +160,16 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
         let size_threshold = 5;
+        let max_follows_per_hour = 10;
+        let max_retention_minutes = 1;
 
-        let publisher = GooglePublisher::create(
+        let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
             size_threshold,
+            max_follows_per_hour,
+            max_retention_minutes,
         )
         .await
         .unwrap();
@@ -194,7 +207,7 @@ mod tests {
 
         publisher
             .queue_publication(FollowChange::new_unfollowed(
-                seconds_to_datetime(2),
+                seconds_to_datetime(3),
                 follower_pubkey,
                 followee2_pubkey,
             ))
@@ -204,27 +217,27 @@ mod tests {
         tokio::time::sleep(Duration::seconds(2).to_std().unwrap()).await;
 
         let events = published_events.lock().await;
-        assert_eq!(
+        assert_bag_eq!(
             events.clone(),
             [
-                FollowChange::new_followed(
+                FollowChangeBatch::from(FollowChange::new_followed(
                     seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey
-                ),
+                )),
                 // The second follow change for the same followee should have collapsed
                 // to a single change. We only keep the last one
-                FollowChange::new_unfollowed(
+                FollowChangeBatch::from(FollowChange::new_unfollowed(
                     seconds_to_datetime(2),
                     follower_pubkey,
                     followee2_pubkey
-                )
+                ))
             ]
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_google_publisher() {
+    async fn test_publisher() {
         let published_events = Arc::new(Mutex::new(Vec::new()));
         let mock_client = MockPublishEvents {
             published_events: published_events.clone(),
@@ -234,12 +247,16 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
         let size_threshold = 5;
+        let max_follows_per_hour = 10;
+        let max_retention_minutes = 1;
 
-        let publisher = GooglePublisher::create(
+        let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
             size_threshold,
+            max_follows_per_hour,
+            max_retention_minutes,
         )
         .await
         .unwrap();
@@ -269,25 +286,25 @@ mod tests {
         tokio::time::sleep(Duration::seconds(2).to_std().unwrap()).await;
 
         let events = published_events.lock().await;
-        assert_eq!(
+        assert_bag_eq!(
             events.clone(),
             [
-                FollowChange::new_followed(
+                FollowChangeBatch::from(FollowChange::new_followed(
                     seconds_to_datetime(2),
                     follower_pubkey,
-                    followee1_pubkey
-                ),
-                FollowChange::new_unfollowed(
+                    followee1_pubkey,
+                )),
+                FollowChangeBatch::from(FollowChange::new_unfollowed(
                     seconds_to_datetime(1),
                     follower_pubkey,
-                    followee2_pubkey
-                )
-            ]
+                    followee2_pubkey,
+                ))
+            ],
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_google_publisher_error() {
+    async fn test_publisher_error() {
         let published_events = Arc::new(Mutex::new(Vec::new()));
         let mock_client = MockPublishEvents {
             published_events: published_events.clone(),
@@ -297,12 +314,16 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
         let size_threshold = 5;
+        let max_follows_per_hour = 10;
+        let max_retention_minutes = 1;
 
-        let publisher = GooglePublisher::create(
+        let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
             size_threshold,
+            max_follows_per_hour,
+            max_retention_minutes,
         )
         .await
         .unwrap();

@@ -1,5 +1,6 @@
 use core::panic;
 
+use crate::account_info::FriendlyId;
 use crate::domain::Follow;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use neo4rs::{query, Graph};
@@ -32,7 +33,7 @@ pub trait RepoTrait {
     fn get_friendly_id(
         &self,
         _public_key: &PublicKey,
-    ) -> impl std::future::Future<Output = Result<Option<String>, RepoError>> + std::marker::Send
+    ) -> impl std::future::Future<Output = Result<Option<FriendlyId>, RepoError>> + std::marker::Send
     {
         async { panic!("Not implemented") }
     }
@@ -113,7 +114,10 @@ impl RepoTrait for Repo {
         }
     }
 
-    async fn get_friendly_id(&self, public_key: &PublicKey) -> Result<Option<String>, RepoError> {
+    async fn get_friendly_id(
+        &self,
+        public_key: &PublicKey,
+    ) -> Result<Option<FriendlyId>, RepoError> {
         let statement = r#"
             MATCH (user:User {pubkey: $pubkey_val})
             RETURN user.friendly_id AS friendly_id
@@ -131,7 +135,7 @@ impl RepoTrait for Repo {
             let friendly_id = row.get::<String>("friendly_id").map_err(|e| {
                 RepoError::deserialization_with_context(e, "deserializing 'friendly_id' field")
             })?;
-            Ok(Some(friendly_id))
+            Ok(Some(FriendlyId::DB(friendly_id)))
         } else {
             Ok(None)
         }

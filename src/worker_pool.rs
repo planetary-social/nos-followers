@@ -1,6 +1,7 @@
 use futures::Future;
 use metrics::counter;
 use std::error::Error;
+use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::{
     broadcast::{self, error::RecvError},
@@ -9,7 +10,7 @@ use tokio::sync::{
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 pub struct WorkerPool {}
 
 // A channel based worker pool that distributes work to a pool of workers.
@@ -24,7 +25,7 @@ impl WorkerPool {
         worker: Worker,
     ) -> Result<TaskTracker, Box<dyn Error>>
     where
-        Item: Send + Clone + 'static,
+        Item: Debug + Send + Clone + 'static,
         Worker: WorkerTask<Item> + Send + Sync + 'static,
     {
         let tracker = TaskTracker::new();
@@ -39,8 +40,6 @@ impl WorkerPool {
             let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerTaskItem<Item>>(1);
             worker_txs.push(worker_tx);
 
-            //let tracker = tracker.clone();
-
             let worker = worker_clone.clone();
             let token_clone = token_clone.clone();
             tracker.spawn(async move {
@@ -52,10 +51,13 @@ impl WorkerPool {
                         }
 
                         Some(item) = worker_rx.recv() => {
+                              trace!("Worker task processing item {:?}", item);
                               let result = timeout(Duration::from_secs(worker_timeout_secs), worker.call(item)).await;
 
                               match result {
-                                  Ok(Ok(())) => {},
+                                  Ok(Ok(())) => {
+                                        trace!("Worker task finished successfully processing item");
+                                  },
                                   Ok(Err(e)) => {
                                       counter!("worker_failures").increment(1);
                                       error!("Worker failed: {}", e);
@@ -91,6 +93,7 @@ impl WorkerPool {
                     result = item_receiver.recv() => {
                         match result {
                             Ok(item) => {
+                                trace!("Worker pool dispatching item {:?}", item);
                                 let Some(worker_tx) = worker_txs_cycle.next() else {
                                     error!("Failed to get worker");
                                     break;
@@ -132,6 +135,7 @@ pub trait WorkerTask<T> {
     ) -> impl Future<Output = Result<(), Box<dyn Error>>> + std::marker::Send;
 }
 
+#[derive(Debug)]
 pub struct WorkerTaskItem<T> {
     pub item: T,
 }

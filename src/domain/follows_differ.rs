@@ -1,4 +1,4 @@
-use crate::refresh_friendly_id::{fetch_account_info, AccountInfo};
+use crate::account_info::{fetch_account_info, AccountInfo};
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use crate::{
@@ -162,6 +162,7 @@ where
     U: GetEventsOf + Sync + Send,
 {
     async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
+        debug!("Processing event here");
         let WorkerTaskItem { item: event } = worker_task_item;
 
         let one_day_ago = Timestamp::from(
@@ -170,7 +171,21 @@ where
                 .as_secs(),
         );
 
-        if event.kind != Kind::ContactList || event.created_at < one_day_ago {
+        if event.kind != Kind::ContactList {
+            debug!(
+                "Skipping event of kind {:?} for {}",
+                event.kind,
+                event.pubkey.to_bech32().unwrap_or_default()
+            );
+            return Ok(());
+        }
+
+        if event.created_at < one_day_ago {
+            debug!(
+                "Skipping event older than a day for {}. Created on {}",
+                event.pubkey.to_bech32().unwrap_or_default(),
+                event.created_at.to_human_datetime()
+            );
             return Ok(());
         }
 
@@ -268,6 +283,11 @@ fn log_line(
 ) -> Option<String> {
     if unchanged > 0 && followed_counter == 0 && unfollowed_counter == 0 {
         // This one is not interesting
+        debug!(
+            "No changes for {}. Last seen contact list: {:?}",
+            follower.to_bech32().unwrap_or_default(),
+            maybe_last_seen_contact_list
+        );
         return None;
     }
 

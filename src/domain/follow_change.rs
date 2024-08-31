@@ -1,26 +1,24 @@
+use crate::account_info::FriendlyId;
 use chrono::{DateTime, Utc};
 use metrics::counter;
 use nostr_sdk::prelude::*;
-use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChangeType {
     Followed,
     Unfollowed,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialOrd, Ord)]
-#[serde(rename_all = "camelCase")]
+/// A change in the follow relationship between two users.
+#[derive(Clone, PartialOrd, Ord)]
 pub struct FollowChange {
     pub change_type: ChangeType,
-    #[serde(serialize_with = "serialize_at_as_i64")]
     pub at: DateTime<Utc>,
     pub follower: PublicKey,
-    pub friendly_follower: Option<String>,
+    pub friendly_follower: FriendlyId,
     pub followee: PublicKey,
-    pub friendly_followee: Option<String>,
+    pub friendly_followee: FriendlyId,
 }
 impl PartialEq for FollowChange {
     fn eq(&self, other: &Self) -> bool {
@@ -41,9 +39,9 @@ impl FollowChange {
             change_type: ChangeType::Followed,
             at,
             follower,
-            friendly_follower: None,
+            friendly_follower: FriendlyId::PublicKey(follower.to_hex()),
             followee,
-            friendly_followee: None,
+            friendly_followee: FriendlyId::PublicKey(followee.to_hex()),
         }
     }
 
@@ -54,28 +52,21 @@ impl FollowChange {
             change_type: ChangeType::Unfollowed,
             at,
             follower,
-            friendly_follower: None,
+            friendly_follower: FriendlyId::PublicKey(follower.to_hex()),
             followee,
-            friendly_followee: None,
+            friendly_followee: FriendlyId::PublicKey(followee.to_hex()),
         }
     }
 
-    pub fn with_friendly_follower(mut self, name: String) -> Self {
-        self.friendly_follower = Some(name);
+    pub fn with_friendly_follower(mut self, name: FriendlyId) -> Self {
+        self.friendly_follower = name;
         self
     }
 
-    pub fn with_friendly_followee(mut self, name: String) -> Self {
-        self.friendly_followee = Some(name);
+    pub fn with_friendly_followee(mut self, name: FriendlyId) -> Self {
+        self.friendly_followee = name;
         self
     }
-}
-
-fn serialize_at_as_i64<S>(at: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_i64(at.timestamp())
 }
 
 impl fmt::Display for FollowChange {
@@ -88,13 +79,9 @@ impl fmt::Display for FollowChange {
                 ChangeType::Unfollowed => "Unfollowed",
             },
             self.follower,
-            self.friendly_follower
-                .clone()
-                .unwrap_or_else(|| "N/A".to_string()),
+            self.friendly_follower,
             self.followee,
-            self.friendly_followee
-                .clone()
-                .unwrap_or_else(|| "N/A".to_string()),
+            self.friendly_followee,
             self.at.to_rfc3339(),
         )
     }

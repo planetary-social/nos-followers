@@ -9,16 +9,14 @@ axum = "0.7.5"
 cached = { version = "0.53.1", features = ["async"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 config_rs = { version = "0.14", package = "config", features = ["yaml"] }
-env_logger = "0.11.5"
 futures = "0.3.30"
 gcloud-sdk = { version = "0.25.5", features = ["google-pubsub-v1"] }
-indexmap = "2.4.0"
+governor = "0.6.3"
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
 neo4rs = "0.8.0"
 nostr-sdk = "0.33.0"
-rand = { version = "0.8.5", features = ["std"] }
-regex = "1.10.6"
+ordermap = "0.5.3"
 rustls = { version = "0.23.12", features = ["ring"] }
 serde = { version = "1.0.209", features = ["derive"] }
 serde_json = "1.0.127"
@@ -29,3 +27,7 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 tower-http = { version = "0.5.2", features = ["timeout", "trace"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[dev-dependencies]
+assertables = "7.0.1"
+pretty_assertions = "1.2"

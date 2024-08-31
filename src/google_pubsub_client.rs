@@ -1,4 +1,4 @@
-use crate::FollowChange;
+use crate::domain::FollowChangeBatch;
 use futures::Future;
 use gcloud_sdk::{
     google::pubsub::v1::{publisher_client::PublisherClient, PublishRequest, PubsubMessage},
@@ -6,7 +6,7 @@ use gcloud_sdk::{
 };
 use metrics::counter;
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info};
 
 const ALLOWED_PUBKEYS: &[&str] = &[
     "07ecf9838136fe430fac43fa0860dbc62a0aac0729c5a33df1192ce75e330c9f", // Bryan
@@ -24,7 +24,7 @@ const ALLOWED_PUBKEYS: &[&str] = &[
 ];
 
 #[derive(Error, Debug)]
-pub enum GooglePublisherError {
+pub enum PublisherError {
     #[error("Failed to publish events: {0}")]
     PublishError(#[from] tonic::Status),
 
@@ -33,13 +33,16 @@ pub enum GooglePublisherError {
 
     #[error("Failed to initialize Google publisher: {0}")]
     Init(#[from] gcloud_sdk::error::Error),
+
+    #[error("Failed to initialize buffer")]
+    BufferInit,
 }
 
 pub trait PublishEvents {
     fn publish_events(
         &mut self,
-        follow_changes: Vec<FollowChange>,
-    ) -> impl Future<Output = Result<(), GooglePublisherError>> + std::marker::Send;
+        follow_changes: Vec<FollowChangeBatch>,
+    ) -> impl Future<Output = Result<(), PublisherError>> + std::marker::Send;
 }
 
 pub struct GooglePubSubClient {
@@ -48,10 +51,7 @@ pub struct GooglePubSubClient {
 }
 
 impl GooglePubSubClient {
-    pub async fn new(
-        google_project_id: &str,
-        google_topic: &str,
-    ) -> Result<Self, GooglePublisherError> {
+    pub async fn new(google_project_id: &str, google_topic: &str) -> Result<Self, PublisherError> {
         let google_full_topic = format!("projects/{}/topics/{}", google_project_id, google_topic);
 
         let pubsub_client: GoogleApi<PublisherClient<GoogleAuthMiddleware>> =
@@ -61,7 +61,7 @@ impl GooglePubSubClient {
                 Some(google_full_topic.clone()),
             )
             .await
-            .map_err(GooglePublisherError::Init)?;
+            .map_err(PublisherError::Init)?;
 
         Ok(Self {
             pubsub_client,
@@ -73,17 +73,17 @@ impl GooglePubSubClient {
 impl PublishEvents for GooglePubSubClient {
     async fn publish_events(
         &mut self,
-        follow_changes: Vec<FollowChange>,
-    ) -> Result<(), GooglePublisherError> {
-        let pubsub_messages: Result<Vec<PubsubMessage>, GooglePublisherError> = follow_changes
+        follow_changes: Vec<FollowChangeBatch>,
+    ) -> Result<(), PublisherError> {
+        let pubsub_messages: Result<Vec<PubsubMessage>, PublisherError> = follow_changes
             .iter()
-            .filter(|follow_change| {
+            .filter(|message| {
                 // TODO: Temporary filter while developing this service
-                ALLOWED_PUBKEYS.contains(&follow_change.followee.to_hex().as_str())
+                ALLOWED_PUBKEYS.contains(&message.followee().to_hex().as_str())
             })
-            .map(|follow_change| {
-                let data = serde_json::to_vec(follow_change)
-                    .map_err(GooglePublisherError::SerializationError)?;
+            .map(|message| {
+                let data =
+                    serde_json::to_vec(message).map_err(PublisherError::SerializationError)?;
 
                 Ok(PubsubMessage {
                     data,
@@ -95,6 +95,7 @@ impl PublishEvents for GooglePubSubClient {
         let pubsub_messages = pubsub_messages?;
 
         if pubsub_messages.is_empty() {
+            debug!("No messages to publish");
             return Ok(());
         }
 
@@ -108,7 +109,7 @@ impl PublishEvents for GooglePubSubClient {
             .get()
             .publish(request)
             .await
-            .map_err(GooglePublisherError::PublishError)?;
+            .map_err(PublisherError::PublishError)?;
 
         info!(
             "Published {} messages to Google PubSub {}",
