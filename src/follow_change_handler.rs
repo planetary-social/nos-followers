@@ -1,8 +1,8 @@
+use crate::account_info::{refresh_friendly_id, FriendlyId};
 use crate::config::Settings;
 use crate::domain::FollowChange;
-use crate::google_publisher::GooglePublisher;
 use crate::google_pubsub_client::GooglePubSubClient;
-use crate::refresh_friendly_id::refresh_friendly_id;
+use crate::publisher::Publisher;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{Repo, RepoTrait};
 use crate::worker_pool::{WorkerTask, WorkerTaskItem};
@@ -15,7 +15,7 @@ use tracing::debug;
 /// Fetches friendly ids and then sends follow change to google pubsub
 pub struct FollowChangeHandler<T: GetEventsOf> {
     repo: Arc<Repo>,
-    google_publisher: GooglePublisher,
+    google_publisher: Publisher,
     nostr_client: Arc<T>,
     timeout_secs: u64,
 }
@@ -32,11 +32,13 @@ where
     ) -> Result<Self> {
         let google_publisher_client =
             GooglePubSubClient::new(&settings.google_project_id, &settings.google_topic).await?;
-        let google_publisher = GooglePublisher::create(
+        let google_publisher = Publisher::create(
             cancellation_token.clone(),
             google_publisher_client,
             settings.seconds_threshold,
             settings.size_threshold,
+            settings.followers_per_hour_before_rate_limit,
+            settings.max_retention_minutes,
         )
         .await?;
 
@@ -69,11 +71,11 @@ impl<T: GetEventsOf> WorkerTask<FollowChange> for FollowChangeHandler<T> {
             result = get_friendly_ids_from_db(&self.repo, &follow_change, self.timeout_secs) => result
         );
 
-        follow_change.friendly_follower = Some(friendly_follower);
-        follow_change.friendly_followee = Some(friendly_followee);
+        follow_change.friendly_follower = friendly_follower;
+        follow_change.friendly_followee = friendly_followee;
 
         debug!(
-            "Fetched friendly IDs for follow change from {:?} to {:?}, about to send to google pubsub",
+            "Fetched friendly IDs for follow change from {} to {}, queueing for publication",
             follow_change.friendly_follower, follow_change.friendly_followee
         );
 
@@ -89,7 +91,7 @@ async fn fetch_friendly_ids<T: GetEventsOf>(
     repo: &Arc<Repo>,
     nostr_client: Arc<T>,
     follow_change: &FollowChange,
-) -> (String, String) {
+) -> (FriendlyId, FriendlyId) {
     let (friendly_follower, friendly_followee) = tokio::join!(
         refresh_friendly_id(repo, &nostr_client, &follow_change.follower),
         refresh_friendly_id(repo, &nostr_client, &follow_change.followee),
@@ -105,7 +107,7 @@ async fn get_friendly_ids_from_db(
     repo: &Arc<Repo>,
     follow_change: &FollowChange,
     timeout_secs: u64,
-) -> (String, String) {
+) -> (FriendlyId, FriendlyId) {
     sleep(std::time::Duration::from_secs(timeout_secs)).await;
 
     let (friendly_follower, friendly_followee) = tokio::join!(
@@ -118,13 +120,15 @@ async fn get_friendly_ids_from_db(
             follow_change
                 .follower
                 .to_bech32()
-                .unwrap_or(follow_change.follower.to_hex()),
+                .map(FriendlyId::Npub)
+                .unwrap_or(FriendlyId::PublicKey(follow_change.follower.to_hex())),
         ),
         friendly_followee.ok().flatten().unwrap_or(
             follow_change
                 .followee
                 .to_bech32()
-                .unwrap_or(follow_change.followee.to_hex()),
+                .map(FriendlyId::Npub)
+                .unwrap_or(FriendlyId::PublicKey(follow_change.followee.to_hex())),
         ),
     )
 }

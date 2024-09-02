@@ -12,3 +12,5 @@ followers:
   google_topic: "follow-changes"
   seconds_threshold: 60
   size_threshold: 5000
+  followers_per_hour_before_rate_limit: 2
+  max_retention_minutes: 60

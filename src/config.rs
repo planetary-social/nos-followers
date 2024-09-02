@@ -19,6 +19,8 @@ pub struct Settings {
     pub google_topic: String,
     pub seconds_threshold: u64,
     pub size_threshold: usize,
+    pub followers_per_hour_before_rate_limit: u32,
+    pub max_retention_minutes: i64,
 }
 
 impl Configurable for Settings {
@@ -76,12 +78,5 @@ impl Config {
         T: DeserializeOwned,
     {
         self.config.get::<T>(T::key())
-    }
-
-    pub fn get_by_key<T>(&self, key: &str) -> Result<T, ConfigError>
-    where
-        T: DeserializeOwned,
-    {
-        self.config.get::<T>(key)
     }
 }
