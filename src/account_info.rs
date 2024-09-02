@@ -23,18 +23,7 @@ pub enum FriendlyId {
     DB(String),
 }
 
-impl FriendlyId {
-    pub fn is_set(&self) -> bool {
-        match self {
-            FriendlyId::DisplayName(s)
-            | FriendlyId::Name(s)
-            | FriendlyId::Npub(s)
-            | FriendlyId::Nip05(s)
-            | FriendlyId::DB(s)
-            | FriendlyId::PublicKey(s) => !s.trim().is_empty(),
-        }
-    }
-}
+impl FriendlyId {}
 
 impl Display for FriendlyId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

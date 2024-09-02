@@ -58,13 +58,9 @@ impl FollowChange {
         }
     }
 
+    #[cfg(test)]
     pub fn with_friendly_follower(mut self, name: FriendlyId) -> Self {
         self.friendly_follower = name;
-        self
-    }
-
-    pub fn with_friendly_followee(mut self, name: FriendlyId) -> Self {
-        self.friendly_followee = name;
         self
     }
 }

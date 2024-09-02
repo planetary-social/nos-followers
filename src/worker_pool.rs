@@ -99,7 +99,7 @@ impl WorkerPool {
                                     break;
                                 };
 
-                                let worker_item = WorkerTaskItem { item };
+                                let worker_item = WorkerTaskItem::new(item);
 
                                 if let Err(e) = worker_tx.send(worker_item).await {
                                     error!("Failed to send to worker: {}", e);

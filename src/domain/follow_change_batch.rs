@@ -46,10 +46,6 @@ impl FollowChangeBatch {
         &self.followee
     }
 
-    pub fn friendly_follower(&self) -> &Option<FriendlyId> {
-        &self.friendly_follower
-    }
-
     pub fn add(&mut self, follow_change: FollowChange) {
         assert!(self.followee == follow_change.followee, "Followee mismatch");
 

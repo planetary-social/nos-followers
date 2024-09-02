@@ -79,11 +79,4 @@ impl Config {
     {
         self.config.get::<T>(T::key())
     }
-
-    pub fn get_by_key<T>(&self, key: &str) -> Result<T, ConfigError>
-    where
-        T: DeserializeOwned,
-    {
-        self.config.get::<T>(key)
-    }
 }
