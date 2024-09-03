@@ -11,4 +11,7 @@ pub mod follows_differ;
 pub use follows_differ::FollowsDiffer;
 
 pub mod follow_change_batch;
-pub use follow_change_batch::{FollowChangeBatch, MAX_FOLLOWERS_PER_MESSAGE};
+pub use follow_change_batch::{FollowChangeBatch, MAX_FOLLOWERS_PER_BATCH};
+
+pub mod followee_aggregator;
+pub use followee_aggregator::FolloweeAggregator;

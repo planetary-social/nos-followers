@@ -9,7 +9,7 @@ use std::fmt::Debug;
 // This is the maximum total of followers and unfollowers we can have in a single message based on the APNS limit of 4096 bytes.
 // See tests done to discover this number in the notifications server:
 // https://github.com/planetary-social/nos-notification-service-go/blob/4728744c6125909375478ec5ddae5934f1d7e1f7/service/adapters/apns/apns_test.go#L162-L243
-pub const MAX_FOLLOWERS_PER_MESSAGE: usize = 58;
+pub const MAX_FOLLOWERS_PER_BATCH: usize = 58;
 
 /// An serializable message containing follow changes for a single followee.
 #[derive(Clone, Serialize, Eq, PartialEq, Ord, PartialOrd)]

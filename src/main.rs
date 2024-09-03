@@ -6,6 +6,7 @@ mod google_pubsub_client;
 mod http_server;
 mod migrations;
 mod publisher;
+mod rate_counter;
 mod relay_subscriber;
 mod repo;
 mod worker_pool;
