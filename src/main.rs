@@ -68,8 +68,9 @@ async fn main() -> Result<()> {
     let cancellation_token = CancellationToken::new();
     let (event_sender, event_receiver) =
         broadcast::channel::<Box<Event>>(settings.event_channel_size);
-    let event_worker_pool_handle = WorkerPool::start(
-        settings.event_workers,
+    let event_worker_pool_task_tracker = WorkerPool::start(
+        "Differ",
+        settings.diff_workers,
         settings.worker_timeout_secs,
         event_receiver,
         cancellation_token.clone(),
@@ -77,7 +78,7 @@ async fn main() -> Result<()> {
     )?;
 
     info!("Starting follower change processing task");
-    let follow_change_handler = FollowChangeHandler::new(
+    let follow_change_task_tracker = FollowChangeHandler::new(
         repo.clone(),
         shared_nostr_client.clone(),
         cancellation_token.clone(),
@@ -85,12 +86,13 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let follow_change_handler_task = WorkerPool::start(
+    let follow_change_handle = WorkerPool::start(
+        "FollowChangeHandler",
         settings.follow_change_workers,
         settings.worker_timeout_secs * 2,
         follow_change_sender.subscribe(),
         cancellation_token.clone(),
-        follow_change_handler,
+        follow_change_task_tracker,
     )?;
 
     info!("Subscribing to kind 3 events");
@@ -103,7 +105,7 @@ async fn main() -> Result<()> {
         shared_nostr_client.clone(),
         [settings.relay].into(),
         filters,
-        event_sender,
+        event_sender.clone(),
         cancellation_token.clone(),
     );
 
@@ -117,11 +119,11 @@ async fn main() -> Result<()> {
 
     info!("Finished Nostr subscription");
 
-    event_worker_pool_handle.wait().await;
-    info!("Finished Nostr event worker pool");
-
-    follow_change_handler_task.wait().await;
+    follow_change_handle.wait().await;
     info!("Finished follow change worker pool");
+
+    event_worker_pool_task_tracker.wait().await;
+    info!("Finished Nostr event worker pool");
 
     info!("Follower server stopped");
     Ok(())

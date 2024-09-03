@@ -94,7 +94,11 @@ async fn start_subscription(
 
     info!("Subscribing to {:?}", &filters);
 
-    client.subscribe(filters.clone(), None).await?;
+    if let Err(e) = client.subscribe(filters.clone(), None).await {
+        error!("Failed to subscribe: {}", e);
+        cancellation_token.cancel();
+        bail!("Failed to subscribe: {}", e);
+    }
 
     client
         .handle_notifications(|notification| async {

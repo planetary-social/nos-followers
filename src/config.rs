@@ -11,7 +11,7 @@ pub struct Settings {
     pub neo4j_user: String,
     pub neo4j_password: String,
     pub event_channel_size: usize,
-    pub event_workers: usize,
+    pub diff_workers: usize,
     pub follow_change_channel_size: usize,
     pub follow_change_workers: usize,
     pub worker_timeout_secs: u64,

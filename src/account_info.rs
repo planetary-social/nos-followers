@@ -61,11 +61,11 @@ pub struct AccountInfo {
 }
 
 /// Get useful info about an account
-// We cache 1_000_000 entries and each entry expires after 50 minutes
+// We cache 10_000 entries and each entry expires after 50 minutes
 // TODO: The number is arbitrary, adjust based on metrics
 #[cached(
     ty = "TimedSizedCache<[u8; 32], AccountInfo>",
-    create = "{ TimedSizedCache::with_size_and_lifespan(1_000_000, 60 * 50) }",
+    create = "{ TimedSizedCache::with_size_and_lifespan(10_000, 60 * 50) }",
     convert = r#"{ public_key.to_bytes() }"#
 )]
 pub async fn fetch_account_info<T: GetEventsOf>(
@@ -124,11 +124,11 @@ pub async fn fetch_account_info<T: GetEventsOf>(
 }
 
 // Try to return an identifier that is not the public key. Save it in DB
-// We cache 1_000_000 entries and each entry expires after 50 minutes
+// We cache 10_000 entries and each entry expires after 50 minutes
 // TODO: The number is arbitrary, adjust based on metrics
 #[cached(
     ty = "TimedSizedCache<[u8; 32], FriendlyId>",
-    create = "{ TimedSizedCache::with_size_and_lifespan(1_000_000, 60 * 50) }",
+    create = "{ TimedSizedCache::with_size_and_lifespan(10_000, 60 * 50) }",
     convert = r#"{ public_key.to_bytes() }"#
 )]
 pub async fn refresh_friendly_id<T: GetEventsOf>(

@@ -24,7 +24,7 @@ pub struct FollowChangeAggregator<T: Clock = DefaultClock> {
 impl<T: Clock> FollowChangeAggregator<T> {
     pub fn new(max_messages_per_hour: u32, max_retention_minutes: i64, clock: T) -> Result<Self> {
         Ok(Self {
-            followee_maps: OrderMap::with_capacity(100_000),
+            followee_maps: OrderMap::with_capacity(1_000),
             max_retention: Duration::from_secs(max_retention_minutes as u64 * 60),
             max_messages_per_hour,
             clock,
@@ -108,8 +108,6 @@ impl<T: Clock> FollowChangeAggregator<T> {
 fn record_metrics(messages: &[FollowChangeBatch], retained_follow_changes: usize) {
     let mut individual_follow_changes = 0;
     let mut aggregated_follow_changes = 0;
-    let mut total_followers = 0;
-    let mut total_unfollowers = 0;
 
     for message in messages {
         let message_len = message.len();
@@ -118,15 +116,13 @@ fn record_metrics(messages: &[FollowChangeBatch], retained_follow_changes: usize
             individual_follow_changes += 1;
         } else {
             aggregated_follow_changes += 1;
-            total_followers += message.follows().len();
-            total_unfollowers += message.unfollows().len();
         }
+        histogram!("followers_per_message").record(message.follows().len() as f64);
+        histogram!("unfollowers_per_message").record(message.unfollows().len() as f64);
     }
 
     counter!("individual_follow_messages").increment(individual_follow_changes as u64);
     counter!("aggregated_follow_messages").increment(aggregated_follow_changes as u64);
-    histogram!("followers_per_aggregated_message").record(total_followers as f64);
-    histogram!("unfollowers_per_aggregated_message").record(total_unfollowers as f64);
     gauge!("retained_follow_changes").set(retained_follow_changes as f64);
 }
 

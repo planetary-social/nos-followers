@@ -4,7 +4,7 @@ followers:
   neo4j_user: "neo4j"
   neo4j_password: "mydevpassword"
   event_channel_size: 500
-  event_workers: 5
+  diff_workers: 5
   follow_change_channel_size: 50000
   follow_change_workers: 30
   worker_timeout_secs: 10

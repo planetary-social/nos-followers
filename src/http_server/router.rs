@@ -60,11 +60,11 @@ fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
     );
 
     describe_histogram!(
-        "followers_per_aggregated_message",
+        "followers_per_message",
         "Number of followers per aggregated message"
     );
     describe_histogram!(
-        "unfollowers_per_aggregated_message",
+        "unfollowers_per_message",
         "Number of unfollowers per aggregated message"
     );
     describe_gauge!(
