@@ -6,7 +6,7 @@ use gcloud_sdk::{
 };
 use metrics::counter;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::debug;
 
 const ALLOWED_PUBKEYS: &[&str] = &[
     "07ecf9838136fe430fac43fa0860dbc62a0aac0729c5a33df1192ce75e330c9f", // Bryan
@@ -111,7 +111,7 @@ impl PublishEvents for GooglePubSubClient {
             .await
             .map_err(PublisherError::PublishError)?;
 
-        info!(
+        debug!(
             "Published {} messages to Google PubSub {}",
             len, self.google_full_topic
         );

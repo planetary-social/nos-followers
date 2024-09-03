@@ -1,35 +1,50 @@
 use super::{FollowChangeBatch, MAX_FOLLOWERS_PER_MESSAGE};
 use crate::domain::FollowChange;
-use crate::tokio_rate_limiter::{create_tokio_rate_limiter, TokioRateLimiter};
 use anyhow::Result;
+use governor::clock::{DefaultClock, Reference};
+use governor::{
+    clock::Clock, middleware::NoOpMiddleware, nanos::Nanos, state::keyed::DefaultKeyedStateStore,
+    Quota, RateLimiter,
+};
 use metrics::{counter, gauge, histogram};
 use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
-use tokio::time::{Duration, Instant};
-use tracing::debug;
+use std::num::NonZero;
+use std::time::Duration;
+use tracing::{debug, info};
 
 type Follower = PublicKey;
 type Followee = PublicKey;
+type FollowChangeRateLimiter<T> = RateLimiter<
+    PublicKey,
+    DefaultKeyedStateStore<PublicKey>,
+    T,
+    NoOpMiddleware<<T as Clock>::Instant>,
+>;
 
 /// Aggregates `FollowChange` events by merging redundant follow/unfollow actions
 /// for the same follower-followee pair, managing message batching, and compiling
 /// the results into `FollowChangeBatch` instances per followee.
-pub struct FollowChangeAggregator {
-    followee_maps: OrderMap<Followee, OrderMap<Follower, (Instant, FollowChange)>>,
-    rate_limiter: TokioRateLimiter<PublicKey>,
+pub struct FollowChangeAggregator<T: Clock = DefaultClock> {
+    followee_maps: OrderMap<Followee, OrderMap<Follower, (T::Instant, FollowChange)>>,
+    rate_limiter: FollowChangeRateLimiter<T>,
     max_retention: Duration,
+    clock: T,
 }
 
-impl FollowChangeAggregator {
-    pub fn new(
-        size_threshold: usize,
-        max_follows_per_hour: u32,
-        max_retention_minutes: i64,
-    ) -> Result<Self> {
+impl<T: Clock> FollowChangeAggregator<T> {
+    pub fn new(max_follows_per_hour: u32, max_retention_minutes: i64, clock: T) -> Result<Self> {
+        let quota = Quota::per_hour(NonZero::new(max_follows_per_hour).ok_or(anyhow::anyhow!(
+            "max_follows_per_hour must be greater than zero"
+        ))?);
+
+        let rate_limiter = RateLimiter::dashmap_with_clock(quota, &clock);
+
         Ok(Self {
-            followee_maps: OrderMap::with_capacity(size_threshold),
-            rate_limiter: create_tokio_rate_limiter(max_follows_per_hour)?,
-            max_retention: tokio::time::Duration::from_secs(max_retention_minutes as u64 * 60),
+            followee_maps: OrderMap::with_capacity(100_000),
+            rate_limiter,
+            max_retention: Duration::from_secs(max_retention_minutes as u64 * 60),
+            clock,
         })
     }
 
@@ -53,10 +68,7 @@ impl FollowChangeAggregator {
             }
         }
 
-        follow_changes_map.insert(
-            follow_change.follower,
-            (tokio::time::Instant::now(), follow_change),
-        );
+        follow_changes_map.insert(follow_change.follower, (self.clock.now(), follow_change));
     }
 
     /// Collects follow/unfollow changes per followee into FollowChangeBatch objects,
@@ -71,7 +83,7 @@ impl FollowChangeAggregator {
         let mut messages_map: OrderMap<PublicKey, Vec<FollowChangeBatch>> =
             OrderMap::with_capacity(self.followee_maps.len() / MAX_FOLLOWERS_PER_MESSAGE);
 
-        self.followee_maps.retain(|followee, follow_change_map| {
+        self.followee_maps.retain(|_followee, follow_change_map| {
             let mut rate_limited = false;
 
             // TODO: extract_if would have been great here, keep an eye on nightly
@@ -83,9 +95,9 @@ impl FollowChangeAggregator {
                     rate_limiter,
                     inserted_at,
                     &mut messages_map,
-                    followee,
                     rate_limited,
                     follow_change,
+                    &self.clock,
                 );
 
                 rate_limited
@@ -108,7 +120,7 @@ impl FollowChangeAggregator {
         } else {
             record_metrics(&messages, self.follow_changes_len());
 
-            debug!(
+            info!(
                 "Processed {} follow changes for {} followees, retaining {} changes for {} followees. {} messages created, wrapping {} follow changes.",
                 initial_follow_changes_len,
                 initial_followees_len,
@@ -152,18 +164,21 @@ impl FollowChangeAggregator {
 /// - The batching process ensures that no batch contains more than
 ///   MAX_FOLLOWERS_PER_MESSAGE changes. If it didn't we'd hit the APNS max
 ///   payload limit.
-fn collect_follow_change(
-    max_retention: &tokio::time::Duration,
-    rate_limiter: &mut TokioRateLimiter<PublicKey>,
-    inserted_at: &mut tokio::time::Instant,
+fn collect_follow_change<T: Clock>(
+    max_retention: &Duration,
+    rate_limiter: &mut FollowChangeRateLimiter<T>,
+    inserted_at: &mut T::Instant,
     messages_map: &mut OrderMap<PublicKey, Vec<FollowChangeBatch>>,
-    followee: &PublicKey,
     rate_limited: bool,
     follow_change: &mut FollowChange,
+    clock: &T,
 ) -> bool {
-    let retained_for_too_long = inserted_at.elapsed() > *max_retention;
+    let followee = follow_change.followee;
+    //let retained_for_too_long = inserted_at.elapsed() > *max_retention;
+    let retained_for_too_long =
+        clock.now().duration_since(*inserted_at) > Nanos::new(max_retention.as_nanos() as u64);
     let followee_batches = messages_map
-        .entry(*followee)
+        .entry(followee)
         .or_insert_with_key(|followee| vec![FollowChangeBatch::new(*followee)]);
 
     let latest_batch_for_followee = followee_batches
@@ -171,20 +186,28 @@ fn collect_follow_change(
         .expect("Expected a non-empty batch for the followee");
 
     let current_message_has_room = latest_batch_for_followee.len() < MAX_FOLLOWERS_PER_MESSAGE;
-    let rate_limited = rate_limited || rate_limiter.check_key(followee).is_err();
+    let rate_limited = rate_limited || rate_limiter.check_key(&followee).is_err();
 
+    println!(
+        "rate_limited: {}, retained_for_too_long: {}, inserted_at_elapsed: {}, max retention: {}",
+        rate_limited,
+        retained_for_too_long,
+        Duration::from_nanos(clock.now().duration_since(*inserted_at).into()).as_secs(),
+        max_retention.as_secs()
+    );
     if !rate_limited || retained_for_too_long {
         let batch = if latest_batch_for_followee.is_empty()
             || (current_message_has_room && retained_for_too_long)
         {
             latest_batch_for_followee
         } else {
-            followee_batches.push(FollowChangeBatch::new(*followee));
+            followee_batches.push(FollowChangeBatch::new(followee));
             followee_batches
                 .last_mut()
                 .expect("New batch should be available")
         };
 
+        println!("adding {} to batch", follow_change.follower);
         batch.add(follow_change.clone());
         return false;
     }
@@ -221,9 +244,10 @@ fn record_metrics(messages: &[FollowChangeBatch], retained_follow_changes: usize
 mod tests {
     use super::*;
     use assertables::*;
-    use chrono::{DateTime, Duration, Utc};
+    use chrono::{DateTime, Utc};
+    use governor::clock::FakeRelativeClock;
     use nostr_sdk::prelude::Keys;
-    use std::time::UNIX_EPOCH;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn create_follow_change(
         follower: PublicKey,
@@ -243,7 +267,8 @@ mod tests {
 
     #[test]
     fn test_insert_unique_follow_change() {
-        let mut unique_changes = FollowChangeAggregator::new(10, 10, 10).unwrap();
+        let mut unique_changes =
+            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -263,7 +288,8 @@ mod tests {
 
     #[test]
     fn test_does_not_replace_with_older_change() {
-        let mut unique_changes = FollowChangeAggregator::new(10, 10, 10).unwrap();
+        let mut unique_changes =
+            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -281,7 +307,8 @@ mod tests {
 
     #[test]
     fn test_insert_same_follower_different_followee() {
-        let mut unique_changes = FollowChangeAggregator::new(10, 10, 10).unwrap();
+        let mut unique_changes =
+            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee1 = Keys::generate().public_key();
@@ -306,7 +333,8 @@ mod tests {
 
     #[test]
     fn test_an_unfollow_cancels_a_follow() {
-        let mut unique_changes = FollowChangeAggregator::new(10, 10, 10).unwrap();
+        let mut unique_changes =
+            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -323,7 +351,8 @@ mod tests {
 
     #[test]
     fn test_a_follow_cancels_an_unfollow() {
-        let mut unique_changes = FollowChangeAggregator::new(10, 10, 10).unwrap();
+        let mut unique_changes =
+            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -340,14 +369,13 @@ mod tests {
 
     #[test]
     fn test_single_item_batch_before_rate_limit_is_hit() {
-        let size_threshold = 10;
         let max_follows_per_hour = 10;
         let max_retention_minutes = 10;
 
         let mut aggregator = FollowChangeAggregator::new(
-            size_threshold,
             max_follows_per_hour,
             max_retention_minutes,
+            FakeRelativeClock::default(),
         )
         .unwrap();
 
@@ -366,19 +394,16 @@ mod tests {
         assert_batches_eq(&messages, &[(followee, &[change1]), (followee, &[change2])]);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_no_message_after_rate_limit_is_hit_but_retention_not_elapsed() {
-        let size_threshold = 10;
+    #[test]
+    fn test_no_message_after_rate_limit_is_hit_but_retention_not_elapsed() {
         // After one single follow change the rate limit will be hit
         let max_follows_per_hour = 1;
         let max_retention_minutes = 10;
 
-        let mut aggregator = FollowChangeAggregator::new(
-            size_threshold,
-            max_follows_per_hour,
-            max_retention_minutes,
-        )
-        .unwrap();
+        let clock = FakeRelativeClock::default();
+        let mut aggregator =
+            FollowChangeAggregator::new(max_follows_per_hour, max_retention_minutes, clock.clone())
+                .unwrap();
 
         let follower1 = Keys::generate().public_key();
         let follower2 = Keys::generate().public_key();
@@ -406,40 +431,34 @@ mod tests {
 
         // We pass the max retention time, the rest of the messages are packed
         // together as they are less than MAX_FOLLOWERS_PER_MESSAGE
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            (max_retention_minutes as u64 + 1) * 60,
-        ))
-        .await;
+        clock.advance(Duration::from_secs((max_retention_minutes as u64 + 1) * 60));
 
         let messages = aggregator.drain_into_batches();
         assert_batches_eq(&messages, &[(followee, &[change2, change3])]);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_batch_sizes_after_rate_limit_and_retention_period() {
-        let size_threshold = 10;
+    #[test]
+    fn test_batch_sizes_after_rate_limit_and_retention_period() {
         let max_follows_per_hour = 1; // After one single follow change, the rate limit will be hit
         let max_retention_minutes = 10;
-        const MAX_FOLLOWERS_TRIPLED: usize = 3 * MAX_FOLLOWERS_PER_MESSAGE; // The number of messages we will send for testing
+        const MAX_FOLLOWERS_TRIPLED: u64 = 3 * MAX_FOLLOWERS_PER_MESSAGE as u64; // The number of messages we will send for testing
 
-        let mut aggregator = FollowChangeAggregator::new(
-            size_threshold,
-            max_follows_per_hour,
-            max_retention_minutes,
-        )
-        .unwrap();
+        let clock = FakeRelativeClock::default();
+        let mut aggregator =
+            FollowChangeAggregator::new(max_follows_per_hour, max_retention_minutes, clock.clone())
+                .unwrap();
 
         let followee = Keys::generate().public_key();
 
         let mut changes = Vec::new();
         for i in 0..MAX_FOLLOWERS_TRIPLED {
             let follower = Keys::generate().public_key();
-            let change = create_follow_change(follower, followee, seconds_to_datetime(i as i64));
+            let change = create_follow_change(follower, followee, seconds_to_datetime(i));
             aggregator.insert(change.clone());
             changes.push(change);
         }
 
-        // After inserting all changes, we hit the rate limit immediately after the first message.
+        // After inserting MAX_FOLLOWERS_TRIPLED changes, we hit the rate limit immediately after the first message.
         // The first message will be sent immediately, while the rest should be retained.
         let messages = aggregator.drain_into_batches();
         assert_eq!(messages.len(), 1);
@@ -449,11 +468,20 @@ mod tests {
         let messages = aggregator.drain_into_batches();
         assert_eq!(messages.len(), 0);
 
+        // Just before the max_retention time elapses..
+        clock.advance(Duration::from_secs((max_retention_minutes as u64 - 1) * 60));
+
+        // .. we insert another change
+        let follower = Keys::generate().public_key();
+        let change = create_follow_change(
+            follower,
+            followee,
+            seconds_to_datetime(MAX_FOLLOWERS_TRIPLED + 1),
+        );
+        aggregator.insert(change.clone());
+
         // After the max retention time elapses, all retained changes should be sent, in batches.
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            (max_retention_minutes as u64 + 1) * 60,
-        ))
-        .await;
+        clock.advance(Duration::from_secs(2 * 60));
 
         let messages = aggregator.drain_into_batches();
 
@@ -462,8 +490,8 @@ mod tests {
         assert_eq!(messages[0].len(), MAX_FOLLOWERS_PER_MESSAGE);
         assert_eq!(messages[1].len(), MAX_FOLLOWERS_PER_MESSAGE);
         assert_eq!(
-            messages[2].len(),
-            MAX_FOLLOWERS_TRIPLED - 2 * MAX_FOLLOWERS_PER_MESSAGE - 1
+            messages[2].len() as u64,
+            MAX_FOLLOWERS_TRIPLED - 2u64 * MAX_FOLLOWERS_PER_MESSAGE as u64 - 1u64
         ); // Thirds batch should contain the remaining changes
 
         // And another change arrives
@@ -471,7 +499,7 @@ mod tests {
         let change = create_follow_change(
             follower,
             followee,
-            seconds_to_datetime(MAX_FOLLOWERS_TRIPLED as i64),
+            seconds_to_datetime(MAX_FOLLOWERS_TRIPLED),
         );
         aggregator.insert(change.clone());
 
@@ -480,22 +508,20 @@ mod tests {
         // Nothing is sent, the user just receive the messages so this one gets into next batch
         assert_eq!(messages.len(), 0);
 
-        // Another the max retention time elapses, all retained changes should be sent, in batches.
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            (max_retention_minutes as u64 + 1) * 60,
-        ))
-        .await;
+        // The max retention time elapses again, all retained changes should be sent, in batches.
+        clock.advance(Duration::from_secs((max_retention_minutes as u64 + 1) * 60));
 
         let messages = aggregator.drain_into_batches();
 
         // This one has a single item
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].len(), 1);
+        assert_eq!(messages[0].len(), 2);
     }
 
     #[test]
     fn test_is_empty_and_len() {
-        let mut unique_changes = FollowChangeAggregator::new(10, 10, 10).unwrap();
+        let mut unique_changes =
+            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower1 = Keys::generate().public_key();
         let follower2 = Keys::generate().public_key();
@@ -521,7 +547,8 @@ mod tests {
 
     #[test]
     fn test_drain_clears_map() {
-        let mut unique_changes = FollowChangeAggregator::new(10, 10, 10).unwrap();
+        let mut unique_changes =
+            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -552,8 +579,8 @@ mod tests {
         assert_bag_eq!(unfollows_vec, unfollows.as_ref());
     }
 
-    fn seconds_to_datetime(seconds: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::from(UNIX_EPOCH + Duration::seconds(seconds).to_std().unwrap())
+    fn seconds_to_datetime(seconds: u64) -> DateTime<Utc> {
+        DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(seconds))
     }
 
     fn assert_batches_eq(actual: &[FollowChangeBatch], expected: &[(PublicKey, &[FollowChange])]) {

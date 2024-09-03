@@ -6,6 +6,7 @@ use crate::publisher::Publisher;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{Repo, RepoTrait};
 use crate::worker_pool::{WorkerTask, WorkerTaskItem};
+use governor::clock::DefaultClock;
 use nostr_sdk::prelude::*;
 use std::error::Error;
 use std::sync::Arc;
@@ -32,13 +33,14 @@ where
     ) -> Result<Self> {
         let google_publisher_client =
             GooglePubSubClient::new(&settings.google_project_id, &settings.google_topic).await?;
+
         let google_publisher = Publisher::create(
             cancellation_token.clone(),
             google_publisher_client,
             settings.seconds_threshold,
-            settings.size_threshold,
             settings.followers_per_hour_before_rate_limit,
             settings.max_retention_minutes,
+            DefaultClock::default(),
         )
         .await?;
 

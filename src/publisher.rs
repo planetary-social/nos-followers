@@ -1,6 +1,7 @@
 use crate::domain::FollowChange;
 use crate::domain::FollowChangeAggregator;
 use crate::google_pubsub_client::{PublishEvents, PublisherError};
+use governor::clock::Clock;
 use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
@@ -15,22 +16,19 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    pub async fn create(
+    pub async fn create<T: Clock + Send + Sync + 'static>(
         cancellation_token: CancellationToken,
         mut client: impl PublishEvents + Send + Sync + 'static,
         seconds_threshold: u64,
-        size_threshold: usize,
         max_follows_per_hour: u32,
         max_retention_minutes: i64,
+        clock: T,
     ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
-        let mut buffer = FollowChangeAggregator::new(
-            size_threshold,
-            max_follows_per_hour,
-            max_retention_minutes,
-        )
-        .map_err(|_| PublisherError::BufferInit)?;
+        let mut buffer =
+            FollowChangeAggregator::new(max_follows_per_hour, max_retention_minutes, clock)
+                .map_err(|_| PublisherError::BufferInit)?;
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
@@ -75,21 +73,6 @@ impl Publisher {
                         }
                     }
                 }
-
-                // The second condition to send the current buffer is it's size.
-                // If the buffer reaches the size threshold, we publish it and
-                // reset the time based interval.
-                if buffer.follow_changes_len() >= size_threshold {
-                    debug!(
-                        "Reached threshold of {} items, publishing buffer",
-                        size_threshold
-                    );
-                    if let Err(e) = client.publish_events(buffer.drain_into_batches()).await {
-                        error!("Failed to publish events: {}", e);
-                        break;
-                    }
-                    interval.reset();
-                }
             }
         });
 
@@ -115,6 +98,7 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use futures::Future;
     use gcloud_sdk::tonic::Status;
+    use governor::clock::FakeRelativeClock;
     use nostr_sdk::prelude::Keys;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
@@ -159,7 +143,6 @@ mod tests {
 
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
-        let size_threshold = 5;
         let max_follows_per_hour = 10;
         let max_retention_minutes = 1;
 
@@ -167,9 +150,9 @@ mod tests {
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
-            size_threshold,
             max_follows_per_hour,
             max_retention_minutes,
+            FakeRelativeClock::default(),
         )
         .await
         .unwrap();
@@ -246,7 +229,6 @@ mod tests {
 
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
-        let size_threshold = 5;
         let max_follows_per_hour = 10;
         let max_retention_minutes = 1;
 
@@ -254,9 +236,9 @@ mod tests {
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
-            size_threshold,
             max_follows_per_hour,
             max_retention_minutes,
+            FakeRelativeClock::default(),
         )
         .await
         .unwrap();
@@ -313,7 +295,6 @@ mod tests {
 
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
-        let size_threshold = 5;
         let max_follows_per_hour = 10;
         let max_retention_minutes = 1;
 
@@ -321,9 +302,9 @@ mod tests {
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
-            size_threshold,
             max_follows_per_hour,
             max_retention_minutes,
+            FakeRelativeClock::default(),
         )
         .await
         .unwrap();

@@ -8,7 +8,6 @@ mod migrations;
 mod publisher;
 mod relay_subscriber;
 mod repo;
-mod tokio_rate_limiter;
 mod worker_pool;
 
 use config::{Config, Settings};
