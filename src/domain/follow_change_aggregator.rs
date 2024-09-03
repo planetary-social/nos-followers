@@ -188,7 +188,8 @@ fn collect_follow_change<T: Clock>(
         .expect("Expected a non-empty batch for the followee");
 
     let current_message_has_room = latest_batch_for_followee.len() < MAX_FOLLOWERS_PER_MESSAGE;
-    let rate_limited = is_followee_rate_limited || rate_limiter.check_key(&followee).is_err();
+    let rate_limited = is_followee_rate_limited
+        || (!retained_for_too_long && rate_limiter.check_key(&followee).is_err());
 
     if !rate_limited || retained_for_too_long {
         let batch = if latest_batch_for_followee.is_empty()
@@ -231,7 +232,7 @@ fn record_metrics(messages: &[FollowChangeBatch], retained_follow_changes: usize
     counter!("aggregated_follow_messages").increment(aggregated_follow_changes as u64);
     histogram!("followers_per_aggregated_message").record(total_followers as f64);
     histogram!("unfollowers_per_aggregated_message").record(total_unfollowers as f64);
-    gauge!("retained_follow_changes").increment(retained_follow_changes as f64);
+    gauge!("retained_follow_changes").set(retained_follow_changes as f64);
 }
 
 #[cfg(test)]
