@@ -34,10 +34,6 @@ impl<T: Clock> RateCounter<T> {
         self.items_sent
             .retain(|&instant| now.duration_since(instant) < self.max_age.into());
 
-        println!(
-            "max_age: {:?}, now: {:?}, items_sent: {:?}",
-            self.max_age, &now, self.items_sent
-        );
         self.items_sent.len() as u32 >= self.limit
     }
 }
