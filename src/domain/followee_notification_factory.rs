@@ -113,20 +113,17 @@ fn collect_follow_change<T: Clock>(
     let retained_for_too_long =
         clock.now().duration_since(*inserted_at) > Nanos::new(max_retention.as_nanos() as u64);
 
-    let rate_limited = rate_counter.is_hit();
-    if !rate_limited && !retained_for_too_long {
-        send_single(follow_change, follow_changes_to_publish, rate_counter);
+    if retained_for_too_long {
+        send_batchable(follow_change, follow_changes_to_publish, rate_counter);
         return false;
     }
 
+    let rate_limited = rate_counter.is_hit();
     if rate_limited && !retained_for_too_long {
         return true;
     }
 
-    // If we reached this point it means that the batch is full or the retention time has elapsed
-    send_batchable(follow_change, follow_changes_to_publish, rate_counter);
-
-    rate_counter.bump();
+    send_single(follow_change, follow_changes_to_publish, rate_counter);
     false
 }
 

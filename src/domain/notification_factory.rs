@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_single_item_batch_before_rate_limit_is_hit() {
-        let max_follows_per_hour = 10;
+        let max_follows_per_hour = 2;
         let max_retention_minutes = 10;
 
         let mut notification_factory = NotificationFactory::new(
@@ -297,6 +297,7 @@ mod tests {
 
         let follower1 = Keys::generate().public_key();
         let follower2 = Keys::generate().public_key();
+        let follower3 = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
         let change1 = create_follow_change(follower1, followee, seconds_to_datetime(1));
@@ -305,9 +306,17 @@ mod tests {
         let change2 = create_follow_change(follower2, followee, seconds_to_datetime(1));
         notification_factory.insert(change2.clone());
 
+        let change3 = create_follow_change(follower3, followee, seconds_to_datetime(1));
+        notification_factory.insert(change3.clone());
+
         let messages = notification_factory.drain_into_messages();
-        // Both changes are in separate batches for the same followee because we didn't hit a rate limit
+        // First couple are in separate messages for the same followee because we didn't hit a rate limit
         assert_batches_eq(&messages, &[(followee, &[change1]), (followee, &[change2])]);
+        assert_eq!(
+            notification_factory.follow_changes_len(),
+            1,
+            "Expected one follow change to be retained",
+        );
     }
 
     #[test]
