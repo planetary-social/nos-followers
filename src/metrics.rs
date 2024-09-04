@@ -1,55 +1,74 @@
 use metrics::{describe_counter, describe_gauge, describe_histogram, Counter, Gauge, Histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use std::sync::OnceLock;
 
-pub struct Metrics {
-    pub pubsub_messages: Counter,
-    pub contact_lists_processed: Counter,
-    pub follows: Counter,
-    pub unfollows: Counter,
-    pub worker_lagged: Counter,
-    pub worker_closed: Counter,
-    pub verified_nip05: Counter,
-    pub individual_follow_messages: Counter,
-    pub aggregated_follow_messages: Counter,
-    pub followers_per_message: Histogram,
-    pub unfollowers_per_message: Histogram,
-    pub retained_follow_changes: Gauge,
+// PubSub messages counter
+pub fn pubsub_messages() -> Counter {
+    metrics::counter!("pubsub_messages")
 }
 
-// Global OnceLock to hold the Metrics instance
-static METRICS: OnceLock<Metrics> = OnceLock::new();
-
-impl Metrics {
-    fn new() -> Self {
-        Self {
-            pubsub_messages: metrics::counter!("pubsub_messages"),
-            contact_lists_processed: metrics::counter!("contact_lists_processed"),
-            follows: metrics::counter!("follows"),
-            unfollows: metrics::counter!("unfollows"),
-            worker_lagged: metrics::counter!("worker_lagged"),
-            worker_closed: metrics::counter!("worker_closed"),
-            verified_nip05: metrics::counter!("verified_nip05"),
-            individual_follow_messages: metrics::counter!("individual_follow_messages"),
-            aggregated_follow_messages: metrics::counter!("aggregated_follow_messages"),
-            followers_per_message: metrics::histogram!("followers_per_message"),
-            unfollowers_per_message: metrics::histogram!("unfollowers_per_message"),
-            retained_follow_changes: metrics::gauge!("retained_follow_changes"),
-        }
-    }
-
-    pub fn worker_failures(&self, name: String, id: usize) -> Counter {
-        metrics::counter!("worker_failures", "name" => name, "id" => id.to_string())
-    }
-
-    pub fn worker_timeouts(&self, name: String, id: usize) -> Counter {
-        metrics::counter!("worker_timeouts", "name" => name, "id" => id.to_string())
-    }
+// Contact lists processed counter
+pub fn contact_lists_processed() -> Counter {
+    metrics::counter!("contact_lists_processed")
 }
 
-// Function to access the initialized metrics
-pub fn get_metrics() -> &'static Metrics {
-    METRICS.get_or_init(Metrics::new)
+// Follows counter
+pub fn follows() -> Counter {
+    metrics::counter!("follows")
+}
+
+// Unfollows counter
+pub fn unfollows() -> Counter {
+    metrics::counter!("unfollows")
+}
+
+// Worker lagged counter
+pub fn worker_lagged() -> Counter {
+    metrics::counter!("worker_lagged")
+}
+
+// Worker closed counter
+pub fn worker_closed() -> Counter {
+    metrics::counter!("worker_closed")
+}
+
+// Verified NIP05 counter
+pub fn verified_nip05() -> Counter {
+    metrics::counter!("verified_nip05")
+}
+
+// Individual follow messages counter
+pub fn individual_follow_messages() -> Counter {
+    metrics::counter!("individual_follow_messages")
+}
+
+// Aggregated follow messages counter
+pub fn aggregated_follow_messages() -> Counter {
+    metrics::counter!("aggregated_follow_messages")
+}
+
+// Worker failures counter (with labels)
+pub fn worker_failures(name: String, id: usize) -> Counter {
+    metrics::counter!("worker_failures", "name" => name, "id" => id.to_string())
+}
+
+// Worker timeouts counter (with labels)
+pub fn worker_timeouts(name: String, id: usize) -> Counter {
+    metrics::counter!("worker_timeouts", "name" => name, "id" => id.to_string())
+}
+
+// Followers per message histogram
+pub fn followers_per_message() -> Histogram {
+    metrics::histogram!("followers_per_message")
+}
+
+// Unfollowers per message histogram
+pub fn unfollowers_per_message() -> Histogram {
+    metrics::histogram!("unfollowers_per_message")
+}
+
+// Retained follow changes gauge
+pub fn retained_follow_changes() -> Gauge {
+    metrics::gauge!("retained_follow_changes")
 }
 
 // Setup metrics with descriptions
@@ -64,10 +83,7 @@ pub fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
     );
     describe_counter!("follows", "Number of follows");
     describe_counter!("unfollows", "Number of unfollows");
-    describe_counter!(
-        "worker_lagged",
-        "Number of times a worker lagged behind and missed messages, consider increasing worker pool size or channel buffer size"
-    );
+    describe_counter!("worker_lagged", "Number of times a worker lagged behind");
     describe_counter!("worker_closed", "Number of times a worker channel closed");
     describe_counter!(
         "worker_failures",
@@ -75,7 +91,6 @@ pub fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
     );
     describe_counter!("worker_timeouts", "Number of times a worker timed out");
     describe_counter!("verified_nip05", "Number of verified NIP05 ids fetched");
-
     describe_counter!(
         "individual_follow_messages",
         "Total number of individual follow messages sent"

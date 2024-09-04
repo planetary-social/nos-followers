@@ -1,5 +1,5 @@
 use crate::domain::NotificationMessage;
-use crate::metrics::get_metrics;
+use crate::metrics;
 use futures::Future;
 use gcloud_sdk::{
     google::pubsub::v1::{publisher_client::PublisherClient, PublishRequest, PubsubMessage},
@@ -116,7 +116,7 @@ impl PublishEvents for GooglePubSubClient {
             len, self.google_full_topic
         );
 
-        get_metrics().pubsub_messages.increment(len as u64);
+        metrics::pubsub_messages().increment(len as u64);
 
         Ok(())
     }

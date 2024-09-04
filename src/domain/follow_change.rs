@@ -1,5 +1,5 @@
 use crate::account_info::FriendlyId;
-use crate::metrics::get_metrics;
+use crate::metrics;
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use std::fmt;
@@ -33,7 +33,7 @@ impl Eq for FollowChange {}
 
 impl FollowChange {
     pub fn new_followed(at: DateTime<Utc>, follower: PublicKey, followee: PublicKey) -> Self {
-        get_metrics().follows.increment(1);
+        metrics::follows().increment(1);
 
         Self {
             change_type: ChangeType::Followed,
@@ -46,7 +46,7 @@ impl FollowChange {
     }
 
     pub fn new_unfollowed(at: DateTime<Utc>, follower: PublicKey, followee: PublicKey) -> Self {
-        get_metrics().unfollows.increment(1);
+        metrics::unfollows().increment(1);
 
         Self {
             change_type: ChangeType::Unfollowed,

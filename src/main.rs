@@ -26,7 +26,7 @@ use rustls::crypto::ring;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use worker_pool::WorkerPool;
 
@@ -113,12 +113,14 @@ async fn main() -> Result<()> {
     let http_server = HttpServer::run(cancellation_token.clone());
 
     tokio::select! {
-        _ = nostr_sub => info!("Nostr subscription ended"),
-        _ = http_server => info!("HTTP server ended"),
+        result = nostr_sub => if let Err(e) = result {
+            error!("Nostr subscription encountered an error: {:?}", e);
+        },
+        result = http_server => if let Err(e) = result {
+            error!("HTTP server encountered an error: {:?}", e);
+        },
         _ = cancellation_token.cancelled() => info!("Cancellation token cancelled"),
     }
-
-    info!("Finished Nostr subscription");
 
     follow_change_handle.wait().await;
     info!("Finished follow change worker pool");

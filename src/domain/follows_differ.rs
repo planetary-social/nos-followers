@@ -1,5 +1,5 @@
 use crate::account_info::{fetch_account_info, AccountInfo};
-use crate::metrics::get_metrics;
+use crate::metrics;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use crate::{
@@ -235,7 +235,7 @@ where
             info!("{}", log_line);
         }
 
-        get_metrics().contact_lists_processed.increment(1);
+        metrics::contact_lists_processed().increment(1);
         Ok(())
     }
 }
