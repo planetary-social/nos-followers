@@ -1,10 +1,10 @@
 use crate::domain::NotificationMessage;
+use crate::metrics::get_metrics;
 use futures::Future;
 use gcloud_sdk::{
     google::pubsub::v1::{publisher_client::PublisherClient, PublishRequest, PubsubMessage},
     *,
 };
-use metrics::counter;
 use thiserror::Error;
 use tracing::debug;
 
@@ -116,7 +116,7 @@ impl PublishEvents for GooglePubSubClient {
             len, self.google_full_topic
         );
 
-        counter!("pubsub_messages").increment(len as u64);
+        get_metrics().pubsub_messages.increment(len as u64);
 
         Ok(())
     }

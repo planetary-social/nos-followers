@@ -1,10 +1,10 @@
 use super::followee_notification_factory::CollectedFollowChange;
 use super::{NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
 use crate::domain::{FollowChange, FolloweeNotificationFactory};
+use crate::metrics::get_metrics;
 use anyhow::Result;
 use governor::clock::Clock;
 use governor::clock::DefaultClock;
-use metrics::{counter, gauge, histogram};
 use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
 use std::time::Duration;
@@ -134,6 +134,7 @@ impl<T: Clock> NotificationFactory<T> {
 }
 
 fn record_metrics(messages: &[NotificationMessage], retained_follow_changes: usize) {
+    let metrics = get_metrics();
     let mut individual_follow_changes = 0;
     let mut aggregated_follow_changes = 0;
 
@@ -145,13 +146,24 @@ fn record_metrics(messages: &[NotificationMessage], retained_follow_changes: usi
         } else {
             aggregated_follow_changes += 1;
         }
-        histogram!("followers_per_message").record(message.follows().len() as f64);
-        histogram!("unfollowers_per_message").record(message.unfollows().len() as f64);
+
+        metrics
+            .followers_per_message
+            .record(message.follows().len() as f64);
+        metrics
+            .unfollowers_per_message
+            .record(message.unfollows().len() as f64);
     }
 
-    counter!("individual_follow_messages").increment(individual_follow_changes as u64);
-    counter!("aggregated_follow_messages").increment(aggregated_follow_changes as u64);
-    gauge!("retained_follow_changes").set(retained_follow_changes as f64);
+    metrics
+        .individual_follow_messages
+        .increment(individual_follow_changes as u64);
+    metrics
+        .aggregated_follow_messages
+        .increment(aggregated_follow_changes as u64);
+    metrics
+        .retained_follow_changes
+        .set(retained_follow_changes as f64);
 }
 
 #[cfg(test)]

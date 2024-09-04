@@ -4,6 +4,7 @@ mod domain;
 mod follow_change_handler;
 mod google_pubsub_client;
 mod http_server;
+mod metrics;
 mod migrations;
 mod publisher;
 mod rate_counter;

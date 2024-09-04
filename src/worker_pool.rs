@@ -1,5 +1,5 @@
+use crate::metrics::get_metrics;
 use futures::Future;
-use metrics::counter;
 use std::error::Error;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -46,6 +46,7 @@ impl WorkerPool {
             let name_clone = name.to_string();
             let worker_name = format!("{}-{}", name, i);
             tracker.spawn(async move {
+                let metrics = get_metrics();
                 loop {
                     tokio::select! {
                         _ = token_clone.cancelled() => {
@@ -62,11 +63,11 @@ impl WorkerPool {
                                         trace!("{}: Worker task finished successfully processing item", worker_name);
                                   },
                                   Ok(Err(e)) => {
-                                      counter!("worker_failures", "name" => name_clone.to_string(), "id" => i.to_string()).increment(1);
+                                      metrics.worker_failures(name_clone.to_string(), i).increment(1);
                                       error!("{}: Worker failed: {}", worker_name, e);
                                   },
                                   Err(_) => {
-                                      counter!("worker_timeouts", "name" => name_clone.to_string(), "id" => i.to_string()).increment(1);
+                                      metrics.worker_timeouts(name_clone.to_string(), i).increment(1);
                                       error!("{}: Worker task timed out after {} seconds", worker_name, worker_timeout_secs);
                                   }
                               }
@@ -86,6 +87,7 @@ impl WorkerPool {
         tracker.spawn(async move {
             // Simple cycle iterator to distribute work to workers in a round-robin fashion.
             let mut worker_txs_cycle = worker_txs.iter().cycle();
+            let metrics = get_metrics();
 
             loop {
                 tokio::select! {
@@ -111,11 +113,11 @@ impl WorkerPool {
                                 }
                             }
                             Err(RecvError::Lagged(n)) => {
-                                counter!("worker_lagged").increment(1);
+                                metrics.worker_lagged.increment(1);
                                 warn!("{}: Receiver lagged and missed {} messages", name_clone, n);
                             }
                             Err(RecvError::Closed) => {
-                                counter!("worker_closed").increment(1);
+                                metrics.worker_closed.increment(1);
                                 error!("{}: Item receiver channel closed", name_clone);
                                 break;
                             }

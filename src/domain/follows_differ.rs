@@ -1,4 +1,5 @@
 use crate::account_info::{fetch_account_info, AccountInfo};
+use crate::metrics::get_metrics;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use crate::{
@@ -6,7 +7,6 @@ use crate::{
     worker_pool::{WorkerTask, WorkerTaskItem},
 };
 use chrono::{DateTime, Duration, Utc};
-use metrics::counter;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -235,7 +235,7 @@ where
             info!("{}", log_line);
         }
 
-        counter!("contact_lists_processed").increment(1);
+        get_metrics().contact_lists_processed.increment(1);
         Ok(())
     }
 }
