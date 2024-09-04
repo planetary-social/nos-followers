@@ -1,7 +1,7 @@
 use core::panic;
 
 use crate::account_info::FriendlyId;
-use crate::domain::Follow;
+use crate::domain::ContactListFollow;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
@@ -50,7 +50,7 @@ pub trait RepoTrait {
     /// Upsert a follow relationship
     fn upsert_follow(
         &self,
-        _follow: &Follow,
+        _follow: &ContactListFollow,
     ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
         async { panic!("Not implemented") }
     }
@@ -68,7 +68,8 @@ pub trait RepoTrait {
     fn get_follows(
         &self,
         _follower: &PublicKey,
-    ) -> impl std::future::Future<Output = Result<Vec<Follow>, RepoError>> + std::marker::Send {
+    ) -> impl std::future::Future<Output = Result<Vec<ContactListFollow>, RepoError>> + std::marker::Send
+    {
         async { panic!("Not implemented") }
     }
 }
@@ -164,7 +165,7 @@ impl RepoTrait for Repo {
         Ok(())
     }
 
-    async fn upsert_follow(&self, follow: &Follow) -> Result<(), RepoError> {
+    async fn upsert_follow(&self, follow: &ContactListFollow) -> Result<(), RepoError> {
         let statement = r#"
             MERGE (followee:User {pubkey: $followee_val})
             MERGE (follower:User {pubkey: $follower_val})
@@ -207,7 +208,7 @@ impl RepoTrait for Repo {
         Ok(())
     }
 
-    async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<Follow>, RepoError> {
+    async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<ContactListFollow>, RepoError> {
         let statement = r#"
             MATCH (follower:User {pubkey: $follower_val})-[r:FOLLOWS]->(followee:User)
             RETURN followee.pubkey AS followee, follower.pubkey AS follower, r.created_at AS created_at, r.updated_at AS updated_at
@@ -221,7 +222,7 @@ impl RepoTrait for Repo {
             .await
             .map_err(RepoError::GetFollows)?;
 
-        let mut follows: Vec<Follow> = Vec::new();
+        let mut follows: Vec<ContactListFollow> = Vec::new();
         while let Ok(Some(row)) = records.next().await {
             let followee = row.get::<String>("followee").map_err(|e| {
                 RepoError::deserialization_with_context(e, "deserializing 'followee' field")
@@ -240,7 +241,7 @@ impl RepoTrait for Repo {
                 )));
             };
 
-            follows.push(Follow {
+            follows.push(ContactListFollow {
                 followee: PublicKey::from_hex(&followee).map_err(RepoError::GetFollowsPubkey)?,
                 follower: PublicKey::from_hex(&follower).map_err(RepoError::GetFollowsPubkey)?,
                 updated_at,

@@ -2,7 +2,7 @@ use crate::account_info::{fetch_account_info, AccountInfo};
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use crate::{
-    domain::{follow::Follow, follow_change::FollowChange},
+    domain::{contact_list_follow::ContactListFollow, follow_change::FollowChange},
     worker_pool::{WorkerTask, WorkerTaskItem},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -16,7 +16,7 @@ use tracing::{debug, info};
 
 #[derive(Default, Debug)]
 struct FollowsDiff {
-    stored_follow: Option<Follow>,
+    stored_follow: Option<ContactListFollow>,
     exists_in_latest_contact_list: bool,
 }
 
@@ -120,7 +120,7 @@ where
                 }
                 None => {
                     if followee != *follower {
-                        let follow = Follow {
+                        let follow = ContactListFollow {
                             followee,
                             follower: *follower,
                             updated_at: event_created_at,
@@ -340,7 +340,7 @@ fn convert_timestamp(timestamp: u64) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::follow::Follow;
+    use crate::domain::contact_list_follow::ContactListFollow;
     use crate::repo::RepoError;
     use chrono::{Duration, Utc};
     use nostr_sdk::PublicKey;
@@ -364,7 +364,7 @@ mod tests {
         }
     }
     struct MockRepo {
-        follows: Arc<Mutex<HashMap<PublicKey, (Vec<Follow>, Option<DateTime<Utc>>)>>>,
+        follows: Arc<Mutex<HashMap<PublicKey, (Vec<ContactListFollow>, Option<DateTime<Utc>>)>>>,
     }
 
     impl Default for MockRepo {
@@ -392,7 +392,7 @@ mod tests {
             Ok(previous_value)
         }
 
-        async fn upsert_follow(&self, follow: &Follow) -> Result<(), RepoError> {
+        async fn upsert_follow(&self, follow: &ContactListFollow) -> Result<(), RepoError> {
             let mut follows = self.follows.lock().await;
             let entry = follows.entry(follow.follower).or_default();
             let follow = follow.clone();
@@ -412,7 +412,10 @@ mod tests {
             Ok(())
         }
 
-        async fn get_follows(&self, follower: &PublicKey) -> Result<Vec<Follow>, RepoError> {
+        async fn get_follows(
+            &self,
+            follower: &PublicKey,
+        ) -> Result<Vec<ContactListFollow>, RepoError> {
             let follows = self.follows.lock().await;
             Ok(follows.get(follower).cloned().unwrap_or_default().0)
         }

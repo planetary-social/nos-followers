@@ -1,5 +1,5 @@
 use crate::domain::FollowChange;
-use crate::domain::FollowChangeAggregator;
+use crate::domain::NotificationFactory;
 use crate::google_pubsub_client::{PublishEvents, PublisherError};
 use governor::clock::Clock;
 use tokio::select;
@@ -27,7 +27,7 @@ impl Publisher {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
         let mut buffer =
-            FollowChangeAggregator::new(max_follows_per_hour, max_retention_minutes, clock)
+            NotificationFactory::new(max_follows_per_hour, max_retention_minutes, clock)
                 .map_err(|_| PublisherError::BufferInit)?;
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(seconds_threshold));
@@ -46,7 +46,7 @@ impl Publisher {
                         if !buffer.is_empty() {
                             debug!("Time based threshold of {} seconds reached, publishing buffer", seconds_threshold);
 
-                            if let Err(e) = client.publish_events(buffer.drain_into_batches()).await {
+                            if let Err(e) = client.publish_events(buffer.drain_into_messages()).await {
                                 match &e {
                                     // We've seen this happen sporadically, we don't neet to kill the look in this situation
                                     PublisherError::PublishError(_) => {
@@ -92,7 +92,7 @@ impl Publisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{FollowChange, FollowChangeBatch};
+    use crate::domain::{FollowChange, NotificationMessage};
     use crate::google_pubsub_client::PublisherError;
     use assertables::*;
     use chrono::{DateTime, Duration, Utc};
@@ -107,14 +107,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     struct MockPublishEvents {
-        published_events: Arc<Mutex<Vec<FollowChangeBatch>>>,
+        published_events: Arc<Mutex<Vec<NotificationMessage>>>,
         fail_publish: bool,
     }
 
     impl PublishEvents for MockPublishEvents {
         fn publish_events(
             &mut self,
-            messages: Vec<FollowChangeBatch>,
+            messages: Vec<NotificationMessage>,
         ) -> impl Future<Output = Result<(), PublisherError>> + std::marker::Send {
             let published_events = self.published_events.clone();
             let fail_publish = self.fail_publish;
@@ -203,14 +203,14 @@ mod tests {
         assert_bag_eq!(
             events.clone(),
             [
-                FollowChangeBatch::from(FollowChange::new_followed(
+                NotificationMessage::from(FollowChange::new_followed(
                     seconds_to_datetime(1),
                     follower_pubkey,
                     followee1_pubkey
                 )),
                 // The second follow change for the same followee should have collapsed
                 // to a single change. We only keep the last one
-                FollowChangeBatch::from(FollowChange::new_unfollowed(
+                NotificationMessage::from(FollowChange::new_unfollowed(
                     seconds_to_datetime(2),
                     follower_pubkey,
                     followee2_pubkey
@@ -271,12 +271,12 @@ mod tests {
         assert_bag_eq!(
             events.clone(),
             [
-                FollowChangeBatch::from(FollowChange::new_followed(
+                NotificationMessage::from(FollowChange::new_followed(
                     seconds_to_datetime(2),
                     follower_pubkey,
                     followee1_pubkey,
                 )),
-                FollowChangeBatch::from(FollowChange::new_unfollowed(
+                NotificationMessage::from(FollowChange::new_unfollowed(
                     seconds_to_datetime(1),
                     follower_pubkey,
                     followee2_pubkey,

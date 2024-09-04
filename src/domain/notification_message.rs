@@ -14,7 +14,7 @@ pub const MAX_FOLLOWERS_PER_BATCH: usize = 58;
 /// An serializable message containing follow changes for a single followee.
 #[derive(Clone, Serialize, Eq, PartialEq, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
-pub struct FollowChangeBatch {
+pub struct NotificationMessage {
     #[serde(serialize_with = "serialize_as_vec_of_npubs")]
     follows: OrderSet<PublicKey>,
     #[serde(serialize_with = "serialize_as_vec_of_npubs")]
@@ -24,7 +24,7 @@ pub struct FollowChangeBatch {
     friendly_follower: Option<FriendlyId>,
 }
 
-impl FollowChangeBatch {
+impl NotificationMessage {
     pub fn new(followee: PublicKey) -> Self {
         Self {
             follows: OrderSet::new(),
@@ -48,6 +48,11 @@ impl FollowChangeBatch {
 
     pub fn add(&mut self, follow_change: FollowChange) {
         assert!(self.followee == follow_change.followee, "Followee mismatch");
+        assert!(
+            self.len() < MAX_FOLLOWERS_PER_BATCH,
+            "Too many followers in a single message, can't exceed {}",
+            MAX_FOLLOWERS_PER_BATCH
+        );
 
         if follow_change.change_type == ChangeType::Followed {
             self.follows.insert(follow_change.follower);
@@ -60,10 +65,6 @@ impl FollowChangeBatch {
         } else {
             self.friendly_follower = None;
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.follows.is_empty() && self.unfollows.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -102,9 +103,9 @@ where
     serializer.serialize_str(&npub)
 }
 
-impl Debug for FollowChangeBatch {
+impl Debug for NotificationMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FollowChangeBatch")
+        f.debug_struct("NotificationMessage")
             .field(
                 "follows",
                 &self
@@ -130,9 +131,9 @@ impl Debug for FollowChangeBatch {
     }
 }
 
-impl From<FollowChange> for FollowChangeBatch {
+impl From<FollowChange> for NotificationMessage {
     fn from(val: FollowChange) -> Self {
-        let mut message = FollowChangeBatch::new(val.followee);
+        let mut message = NotificationMessage::new(val.followee);
         message.add(val);
         message
     }
@@ -152,7 +153,7 @@ mod tests {
         let follower1_follow = FollowChange::new_followed(Utc::now(), follower1, followee1)
             .with_friendly_follower(FriendlyId::Name("Alice".to_string()));
 
-        let mut message = FollowChangeBatch::new(followee1);
+        let mut message = NotificationMessage::new(followee1);
 
         message.add(follower1_follow);
 
@@ -183,7 +184,7 @@ mod tests {
         let follower4_unfollow = FollowChange::new_unfollowed(Utc::now(), follower4, followee1);
         let wrong_followee_change = FollowChange::new_followed(Utc::now(), follower4, followee2);
 
-        let mut message = FollowChangeBatch::new(followee1);
+        let mut message = NotificationMessage::new(followee1);
 
         message.add(follower1_follow);
         message.add(follower2_follow);
@@ -195,7 +196,7 @@ mod tests {
         #[cfg(not(feature = "ci"))]
         {
             let result = std::panic::catch_unwind(|| {
-                FollowChangeBatch::new(followee1).add(wrong_followee_change)
+                NotificationMessage::new(followee1).add(wrong_followee_change)
             });
             assert!(result.is_err());
         }

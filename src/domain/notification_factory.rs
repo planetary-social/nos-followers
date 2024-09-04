@@ -1,5 +1,6 @@
-use super::{FollowChangeBatch, MAX_FOLLOWERS_PER_BATCH};
-use crate::domain::{FollowChange, FolloweeAggregator};
+use super::followee_notification_factory::CollectedFollowChange;
+use super::{NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
+use crate::domain::{FollowChange, FolloweeNotificationFactory};
 use anyhow::Result;
 use governor::clock::Clock;
 use governor::clock::DefaultClock;
@@ -13,15 +14,15 @@ type Followee = PublicKey;
 
 /// Aggregates `FollowChange` events by merging redundant follow/unfollow actions
 /// for the same follower-followee pair, managing message batching, and compiling
-/// the results into `FollowChangeBatch` instances per followee.
-pub struct FollowChangeAggregator<T: Clock = DefaultClock> {
-    followee_maps: OrderMap<Followee, FolloweeAggregator<T>>,
+/// the results into `NotificationMessage` instances per followee.
+pub struct NotificationFactory<T: Clock = DefaultClock> {
+    followee_maps: OrderMap<Followee, FolloweeNotificationFactory<T>>,
     max_retention: Duration,
     max_messages_per_hour: u32,
     clock: T,
 }
 
-impl<T: Clock> FollowChangeAggregator<T> {
+impl<T: Clock> NotificationFactory<T> {
     pub fn new(max_messages_per_hour: u32, max_retention_minutes: i64, clock: T) -> Result<Self> {
         Ok(Self {
             followee_maps: OrderMap::with_capacity(1_000),
@@ -36,34 +37,61 @@ impl<T: Clock> FollowChangeAggregator<T> {
             .followee_maps
             .entry(follow_change.followee)
             .or_insert_with_key(|_| {
-                FolloweeAggregator::new(self.max_messages_per_hour, self.clock.clone())
+                FolloweeNotificationFactory::new(self.max_messages_per_hour, self.clock.clone())
             });
 
         followee_info.add_follower_change(follow_change)
     }
 
-    /// Collects follow/unfollow changes per followee into FollowChangeBatch objects,
+    /// Collects follow/unfollow changes per followee into NotificationMessage objects,
     /// which essentially map to push notifications. Rate-limited changes are retained
     /// for later so they can be included in a batch rather than sent individually and immediately.
     /// Follow changes retained for over an hour, or those that fit within the current
     /// batch, bypass the rate limit and are included immediately.
-    pub fn drain_into_batches(&mut self) -> Vec<FollowChangeBatch> {
+    pub fn drain_into_messages(&mut self) -> Vec<NotificationMessage> {
         let initial_follow_changes_len = self.follow_changes_len();
         let initial_followees_len = self.followees_len();
 
-        let mut messages_map: OrderMap<PublicKey, Vec<FollowChangeBatch>> =
+        let mut messages_map: OrderMap<PublicKey, Vec<CollectedFollowChange>> =
             OrderMap::with_capacity(self.followee_maps.len() / MAX_FOLLOWERS_PER_BATCH);
 
-        self.followee_maps.retain(|_followee, followee_changes| {
-            followee_changes.drain_into_batches(&self.max_retention, &mut messages_map);
-            followee_changes.is_deletable()
+        self.followee_maps.retain(|followee, followee_changes| {
+            let messages_from_followee = messages_map.entry(*followee).or_default();
+            followee_changes.drain_into_messages(&self.max_retention, messages_from_followee);
+            !followee_changes.is_deletable()
         });
 
         let messages = messages_map
-            .into_values()
-            .flatten()
-            .filter(|m| !m.is_empty())
-            .collect::<Vec<FollowChangeBatch>>();
+            .into_iter()
+            .flat_map(|(followee, follow_changes)| {
+                let mut messages = Vec::new();
+                let mut batchables = Vec::new();
+
+                follow_changes
+                    .into_iter()
+                    .for_each(|collected_change| match collected_change {
+                        CollectedFollowChange::Single(change) => {
+                            let mut message = NotificationMessage::new(followee);
+                            message.add(change);
+                            messages.push(message);
+                        }
+                        CollectedFollowChange::Batchable(change) => {
+                            batchables.push(change);
+                        }
+                    });
+
+                batchables
+                    .chunks(MAX_FOLLOWERS_PER_BATCH)
+                    .for_each(|batch| {
+                        let mut message = NotificationMessage::new(followee);
+                        for change in batch {
+                            message.add(change.clone());
+                        }
+                        messages.push(message);
+                    });
+                messages
+            })
+            .collect::<Vec<NotificationMessage>>();
 
         if messages.is_empty() {
             debug!(
@@ -105,7 +133,7 @@ impl<T: Clock> FollowChangeAggregator<T> {
     }
 }
 
-fn record_metrics(messages: &[FollowChangeBatch], retained_follow_changes: usize) {
+fn record_metrics(messages: &[NotificationMessage], retained_follow_changes: usize) {
     let mut individual_follow_changes = 0;
     let mut aggregated_follow_changes = 0;
 
@@ -129,6 +157,7 @@ fn record_metrics(messages: &[FollowChangeBatch], retained_follow_changes: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::followee_notification_factory::ONE_HOUR;
     use assertables::*;
     use chrono::{DateTime, Utc};
     use governor::clock::FakeRelativeClock;
@@ -153,20 +182,20 @@ mod tests {
 
     #[test]
     fn test_insert_unique_follow_change() {
-        let mut aggregator =
-            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
         let change1 = create_follow_change(follower, followee, seconds_to_datetime(1));
-        aggregator.insert(change1);
+        notification_factory.insert(change1);
 
         let change2 = create_follow_change(follower, followee, seconds_to_datetime(1));
-        aggregator.insert(change2.clone());
+        notification_factory.insert(change2.clone());
 
         // When they share the same time, the last change added should be kept
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_message_eq(message, &followee, [follower], &[]);
@@ -175,7 +204,7 @@ mod tests {
     #[test]
     fn test_does_not_replace_with_older_change() {
         let mut unique_changes =
-            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
+            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -186,7 +215,7 @@ mod tests {
         let older_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(older_change);
 
-        let messages = unique_changes.drain_into_batches();
+        let messages = unique_changes.drain_into_messages();
         assert_eq!(messages.len(), 1);
         assert_message_eq(&messages[0], &followee, [follower], &[]);
     }
@@ -194,7 +223,7 @@ mod tests {
     #[test]
     fn test_insert_same_follower_different_followee() {
         let mut unique_changes =
-            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
+            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee1 = Keys::generate().public_key();
@@ -206,13 +235,13 @@ mod tests {
         unique_changes.insert(change1.clone());
         unique_changes.insert(change2.clone());
 
-        let messages = unique_changes.drain_into_batches();
+        let messages = unique_changes.drain_into_messages();
         // Both changes should be kept since they have different followees
         assert_bag_eq!(
             messages,
             [
-                FollowChangeBatch::from(change1.clone()),
-                FollowChangeBatch::from(change2.clone())
+                NotificationMessage::from(change1.clone()),
+                NotificationMessage::from(change2.clone())
             ]
         );
     }
@@ -220,7 +249,7 @@ mod tests {
     #[test]
     fn test_an_unfollow_cancels_a_follow() {
         let mut unique_changes =
-            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
+            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -232,13 +261,13 @@ mod tests {
         unique_changes.insert(unfollow_change.clone());
 
         // The unfollow should cancel the follow
-        assert_eq!(unique_changes.drain_into_batches(), []);
+        assert_eq!(unique_changes.drain_into_messages(), []);
     }
 
     #[test]
     fn test_a_follow_cancels_an_unfollow() {
         let mut unique_changes =
-            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
+            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -250,7 +279,7 @@ mod tests {
         unique_changes.insert(follow_change.clone());
 
         // The follow should cancel the unfollow
-        assert_eq!(unique_changes.drain_into_batches(), []);
+        assert_eq!(unique_changes.drain_into_messages(), []);
     }
 
     #[test]
@@ -258,7 +287,7 @@ mod tests {
         let max_follows_per_hour = 10;
         let max_retention_minutes = 10;
 
-        let mut aggregator = FollowChangeAggregator::new(
+        let mut notification_factory = NotificationFactory::new(
             max_follows_per_hour,
             max_retention_minutes,
             FakeRelativeClock::default(),
@@ -270,12 +299,12 @@ mod tests {
         let followee = Keys::generate().public_key();
 
         let change1 = create_follow_change(follower1, followee, seconds_to_datetime(1));
-        aggregator.insert(change1.clone());
+        notification_factory.insert(change1.clone());
 
         let change2 = create_follow_change(follower2, followee, seconds_to_datetime(1));
-        aggregator.insert(change2.clone());
+        notification_factory.insert(change2.clone());
 
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         // Both changes are in separate batches for the same followee because we didn't hit a rate limit
         assert_batches_eq(&messages, &[(followee, &[change1]), (followee, &[change2])]);
     }
@@ -287,12 +316,9 @@ mod tests {
         let max_retention_minutes = 10;
 
         let clock = FakeRelativeClock::default();
-        let mut aggregator = FollowChangeAggregator::new(
-            max_messages_per_hour,
-            max_retention_minutes,
-            clock.clone(),
-        )
-        .unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(max_messages_per_hour, max_retention_minutes, clock.clone())
+                .unwrap();
 
         let follower1 = Keys::generate().public_key();
         let follower2 = Keys::generate().public_key();
@@ -300,33 +326,33 @@ mod tests {
         let followee = Keys::generate().public_key();
 
         let change1 = create_follow_change(follower1, followee, seconds_to_datetime(1));
-        aggregator.insert(change1.clone());
+        notification_factory.insert(change1.clone());
 
         // We hit the rate limit, but the retention time hasn't elapsed yet.
         // The rate is one follow per hour, so we only get one message, the
         // other one is retained.
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         assert_batches_eq(&messages, &[(followee, &[change1])]);
 
         let change2 = create_follow_change(follower2, followee, seconds_to_datetime(1));
-        aggregator.insert(change2.clone());
+        notification_factory.insert(change2.clone());
 
         let change3 = create_follow_change(follower3, followee, seconds_to_datetime(1));
-        aggregator.insert(change3.clone());
+        notification_factory.insert(change3.clone());
 
         // We hit the limit so the rest of the messages are retained
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         assert_batches_eq(&messages, &[]);
-        assert_eq!(aggregator.follow_changes_len(), 2);
+        assert_eq!(notification_factory.follow_changes_len(), 2);
 
         // We pass the max retention time, but we still are under the rate limit so we get nothing
         clock.advance(Duration::from_secs((max_retention_minutes as u64) * 60));
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         assert_batches_eq(&messages, &[]);
 
         // We clear the rate limit
         clock.advance(Duration::from_secs(50 * 60));
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         assert_batches_eq(&messages, &[(followee, &[change2, change3])]);
     }
 
@@ -337,28 +363,23 @@ mod tests {
         const MAX_FOLLOWERS_TRIPLED: usize = 3 * MAX_FOLLOWERS_PER_BATCH as usize; // The number of messages we will send for testing
 
         let clock = FakeRelativeClock::default();
-        let mut aggregator = FollowChangeAggregator::new(
-            max_messages_per_hour,
-            max_retention_minutes,
-            clock.clone(),
-        )
-        .unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(max_messages_per_hour, max_retention_minutes, clock.clone())
+                .unwrap();
 
         let followee = Keys::generate().public_key();
 
-        let mut changes = Vec::new();
         for i in 0..MAX_FOLLOWERS_TRIPLED {
             let follower = Keys::generate().public_key();
             let change = create_follow_change(follower, followee, seconds_to_datetime(i));
-            aggregator.insert(change.clone());
+            notification_factory.insert(change.clone());
 
             clock.advance(Duration::from_secs(1));
-            changes.push(change);
         }
 
         // After inserting MAX_FOLLOWERS_TRIPLED changes, we hit the rate limit immediately after the first message.
         // The first message will be sent immediately, while the rest should be retained.
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         assert_eq!(
             messages.len(),
             1,
@@ -366,12 +387,19 @@ mod tests {
             messages,
             messages.iter().map(|m| m.len()).sum::<usize>()
         );
-        assert_eq!(messages[0].len(), MAX_FOLLOWERS_PER_BATCH);
+        assert_eq!(
+            messages[0].len(),
+            1,
+            "Expected a single follow change in the message"
+        );
 
         // All other messages are retained due to rate limiting
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
         assert_eq!(messages.len(), 0);
-        assert_eq!(aggregator.follow_changes_len(), 2 * MAX_FOLLOWERS_PER_BATCH,);
+        assert_eq!(
+            notification_factory.follow_changes_len(),
+            MAX_FOLLOWERS_TRIPLED - 1,
+        );
 
         // Just before the max_retention time elapses..
         clock.advance(Duration::from_secs((max_retention_minutes as u64 - 1) * 60));
@@ -383,24 +411,22 @@ mod tests {
             followee,
             seconds_to_datetime(MAX_FOLLOWERS_TRIPLED + 1),
         );
-        aggregator.insert(change.clone());
+        notification_factory.insert(change.clone());
 
         assert_eq!(
-            aggregator.follow_changes_len(),
-            2 * MAX_FOLLOWERS_PER_BATCH + 1
+            notification_factory.follow_changes_len(),
+            MAX_FOLLOWERS_TRIPLED
         );
         // After the max retention time elapses, all retained changes should be sent, in batches.
-        clock.advance(Duration::from_secs(2 * 60));
+        clock.advance(Duration::from_secs((max_retention_minutes as u64 + 1) * 60));
 
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         // First couple should contain MAX_FOLLOWERS_BATCH changes, they surpassed the maximum retention time, so they are sent regardless of being rate limited
         assert_eq!(messages[0].len(), MAX_FOLLOWERS_PER_BATCH);
         assert_eq!(messages[1].len(), MAX_FOLLOWERS_PER_BATCH);
-
-        // The last change added is not sent, is too new and we already sent the maximum amount of messages for the period
-        assert_eq!(aggregator.follow_changes_len(), 1);
+        assert_eq!(messages[2].len(), MAX_FOLLOWERS_PER_BATCH);
 
         // And another change arrives
         let follower = Keys::generate().public_key();
@@ -409,7 +435,7 @@ mod tests {
             followee,
             seconds_to_datetime(MAX_FOLLOWERS_TRIPLED),
         );
-        aggregator.insert(change.clone());
+        notification_factory.insert(change.clone());
 
         // And another one for a different followee
         let followee2 = Keys::generate().public_key();
@@ -419,29 +445,42 @@ mod tests {
             followee2,
             seconds_to_datetime(MAX_FOLLOWERS_TRIPLED),
         );
-        aggregator.insert(change.clone());
+        notification_factory.insert(change.clone());
 
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
 
-        // Only the one for the new followee is sent as it's not rate limited, the rest already hit the limit.
+        // Only the one for the new followee is sent as it's not rate limited, the other one hit the limit so it's retained.
         assert_eq!(messages.len(), 1);
-        assert_eq!(aggregator.follow_changes_len(), 2);
+        assert_eq!(notification_factory.follow_changes_len(), 1);
 
         // The max retention time elapses again, all retained changes should be sent, in batches.
         clock.advance(Duration::from_secs((max_retention_minutes as u64 + 1) * 60));
 
-        let messages = aggregator.drain_into_batches();
+        let messages = notification_factory.drain_into_messages();
 
         // This one has a single item
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].len(), 2);
-        assert_eq!(aggregator.follow_changes_len(), 0);
+        assert_eq!(messages[0].len(), 1);
+
+        // We keep the followee info for the time the rate limit counter can
+        // calculate the rate which is one hour. This is in case new changes
+        // arrive so we remember the rate limit for one more period
+        assert_eq!(notification_factory.followees_len(), 2);
+        assert_eq!(notification_factory.follow_changes_len(), 0);
+
+        clock.advance(ONE_HOUR);
+        let messages = notification_factory.drain_into_messages();
+
+        // Now all is cleared
+        assert_eq!(notification_factory.followees_len(), 0);
+        assert_eq!(notification_factory.follow_changes_len(), 0);
+        assert_eq!(messages.len(), 0);
     }
 
     #[test]
     fn test_is_empty_and_len() {
         let mut unique_changes =
-            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
+            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower1 = Keys::generate().public_key();
         let follower2 = Keys::generate().public_key();
@@ -468,7 +507,7 @@ mod tests {
     #[test]
     fn test_drain_clears_map() {
         let mut unique_changes =
-            FollowChangeAggregator::new(10, 10, FakeRelativeClock::default()).unwrap();
+            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -479,13 +518,13 @@ mod tests {
         let change2 = create_follow_change(follower, followee, seconds_to_datetime(1));
         unique_changes.insert(change2);
 
-        let changes = unique_changes.drain_into_batches();
+        let changes = unique_changes.drain_into_messages();
         assert_eq!(changes.len(), 1);
         assert_message_eq(&changes[0], &followee, [follower], &[])
     }
 
     fn assert_message_eq(
-        message: &FollowChangeBatch,
+        message: &NotificationMessage,
         followee: &PublicKey,
         follows: impl AsRef<[PublicKey]>,
         unfollows: impl AsRef<[PublicKey]>,
@@ -503,11 +542,14 @@ mod tests {
         DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(seconds as u64))
     }
 
-    fn assert_batches_eq(actual: &[FollowChangeBatch], expected: &[(PublicKey, &[FollowChange])]) {
+    fn assert_batches_eq(
+        actual: &[NotificationMessage],
+        expected: &[(PublicKey, &[FollowChange])],
+    ) {
         let mut expected_batches = Vec::new();
 
         for (followee, changes) in expected {
-            let mut batch = FollowChangeBatch::new(*followee);
+            let mut batch = NotificationMessage::new(*followee);
             for change in *changes {
                 batch.add(change.clone());
             }

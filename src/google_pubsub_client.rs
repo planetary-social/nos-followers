@@ -1,4 +1,4 @@
-use crate::domain::FollowChangeBatch;
+use crate::domain::NotificationMessage;
 use futures::Future;
 use gcloud_sdk::{
     google::pubsub::v1::{publisher_client::PublisherClient, PublishRequest, PubsubMessage},
@@ -41,7 +41,7 @@ pub enum PublisherError {
 pub trait PublishEvents {
     fn publish_events(
         &mut self,
-        follow_changes: Vec<FollowChangeBatch>,
+        follow_changes: Vec<NotificationMessage>,
     ) -> impl Future<Output = Result<(), PublisherError>> + std::marker::Send;
 }
 
@@ -73,7 +73,7 @@ impl GooglePubSubClient {
 impl PublishEvents for GooglePubSubClient {
     async fn publish_events(
         &mut self,
-        follow_changes: Vec<FollowChangeBatch>,
+        follow_changes: Vec<NotificationMessage>,
     ) -> Result<(), PublisherError> {
         let pubsub_messages: Result<Vec<PubsubMessage>, PublisherError> = follow_changes
             .iter()

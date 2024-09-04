@@ -2,6 +2,7 @@ use governor::clock::Clock;
 use governor::clock::Reference;
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct RateCounter<T>
 where
     T: Clock,
@@ -25,13 +26,18 @@ impl<T: Clock> RateCounter<T> {
     pub fn bump(&mut self) {
         let now = self.clock.now();
         self.items_sent.push(now);
-
-        // Remove all items older than max_age
-        self.items_sent
-            .retain(|&instant| now.duration_since(instant) < self.max_age.into());
     }
 
     pub fn is_hit(&mut self) -> bool {
+        // Remove all items older than max_age
+        let now = self.clock.now();
+        self.items_sent
+            .retain(|&instant| now.duration_since(instant) < self.max_age.into());
+
+        println!(
+            "max_age: {:?}, now: {:?}, items_sent: {:?}",
+            self.max_age, &now, self.items_sent
+        );
         self.items_sent.len() as u32 >= self.limit
     }
 }
