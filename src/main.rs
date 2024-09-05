@@ -119,14 +119,10 @@ async fn main() -> Result<()> {
         result = http_server => if let Err(e) = result {
             error!("HTTP server encountered an error: {:?}", e);
         },
+        _ = follow_change_handle.wait() => {},
+        _ = event_worker_pool_task_tracker.wait() => {},
         _ = cancellation_token.cancelled() => info!("Cancellation token cancelled"),
     }
-
-    follow_change_handle.wait().await;
-    info!("Finished follow change worker pool");
-
-    event_worker_pool_task_tracker.wait().await;
-    info!("Finished Nostr event worker pool");
 
     info!("Follower server stopped");
     Ok(())

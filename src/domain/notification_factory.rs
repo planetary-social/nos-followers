@@ -1,4 +1,4 @@
-use super::followee_notification_factory::CollectedFollowChange;
+use super::followee_notification_factory::SendableFollowChange;
 use super::{NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
 use crate::domain::{FollowChange, FolloweeNotificationFactory};
 use crate::metrics;
@@ -7,8 +7,9 @@ use governor::clock::Clock;
 use governor::clock::DefaultClock;
 use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
+use std::collections::HashSet;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::info;
 
 type Followee = PublicKey;
 
@@ -18,12 +19,18 @@ type Followee = PublicKey;
 pub struct NotificationFactory<T: Clock = DefaultClock> {
     followee_maps: OrderMap<Followee, FolloweeNotificationFactory<T>>,
     max_retention: Duration,
-    max_messages_per_hour: u32,
+    max_messages_per_hour: usize,
     clock: T,
 }
 
 impl<T: Clock> NotificationFactory<T> {
-    pub fn new(max_messages_per_hour: u32, max_retention_minutes: i64, clock: T) -> Result<Self> {
+    pub fn new(max_messages_per_hour: usize, max_retention_minutes: i64, clock: T) -> Result<Self> {
+        assert!(max_messages_per_hour > 0);
+        info!(
+            "After {} messages per hour, additional messages will be retained for {} minutes.",
+            max_messages_per_hour, max_retention_minutes
+        );
+
         Ok(Self {
             followee_maps: OrderMap::with_capacity(1_000),
             max_retention: Duration::from_secs(max_retention_minutes as u64 * 60),
@@ -37,10 +44,22 @@ impl<T: Clock> NotificationFactory<T> {
             .followee_maps
             .entry(follow_change.followee)
             .or_insert_with_key(|_| {
-                FolloweeNotificationFactory::new(self.max_messages_per_hour, self.clock.clone())
+                FolloweeNotificationFactory::new(
+                    self.max_messages_per_hour,
+                    self.max_retention,
+                    self.clock.clone(),
+                )
             });
 
         followee_info.add_follower_change(follow_change)
+    }
+
+    #[cfg(test)]
+    pub fn expired_retains_count(&self) -> usize {
+        self.followee_maps
+            .values()
+            .map(|followee_info| followee_info.expired_retains_count())
+            .sum()
     }
 
     /// Collects follow/unfollow changes per followee into NotificationMessage
@@ -54,73 +73,86 @@ impl<T: Clock> NotificationFactory<T> {
         let initial_follow_changes_len = self.follow_changes_len();
         let initial_followees_len = self.followees_len();
 
-        let mut messages_map: OrderMap<PublicKey, Vec<CollectedFollowChange>> =
+        let prepared_follow_changes = self.drain_sendable_follow_changes();
+
+        let (mut total_changes, mut at_least_one_batch, mut at_least_one_single) =
+            (0, false, false);
+        for (_, changes) in &prepared_follow_changes {
+            total_changes += changes.len();
+            at_least_one_batch |= changes.iter().any(|change| change.is_batchable());
+            at_least_one_single |= changes.iter().any(|change| !change.is_batchable());
+        }
+
+        let messages = construct_messages(prepared_follow_changes);
+
+        // Call follow_changes_len() once and reuse in both places
+        let follow_changes_len = self.follow_changes_len();
+        record_metrics(&messages, follow_changes_len);
+        self.log_report(&messages, initial_follow_changes_len, initial_followees_len);
+
+        // Check if a mix of batchable and single messages were sent
+        if at_least_one_batch && at_least_one_single {
+            assert!(
+            messages.iter().any(|m| m.len() > 1),
+            "A mix of batchable and single messages should send at least one message with more than one item, none was found"
+        );
+        }
+
+        // Ensure all changes were sent
+        let total_sent = messages.iter().map(|m| m.len()).sum::<usize>();
+        assert!(
+            total_changes == total_sent,
+            "{} changes were processed, but only {} were sent",
+            total_changes,
+            total_sent
+        );
+
+        messages
+    }
+
+    fn drain_sendable_follow_changes(
+        &mut self,
+    ) -> OrderMap<PublicKey, Vec<SendableFollowChange<T>>> {
+        let mut sendable_follow_changes: OrderMap<PublicKey, Vec<SendableFollowChange<T>>> =
             OrderMap::with_capacity(self.followee_maps.len() / MAX_FOLLOWERS_PER_BATCH);
 
         self.followee_maps.retain(|followee, followee_changes| {
-            let messages_from_followee = messages_map.entry(*followee).or_default();
-            followee_changes.drain_into_messages(&self.max_retention, messages_from_followee);
+            let sendables_for_followee = sendable_follow_changes.entry(*followee).or_default();
+            followee_changes.drain_into_sendables(sendables_for_followee);
             !followee_changes.is_deletable()
         });
+        sendable_follow_changes
+    }
 
-        let mut messages = Vec::new();
-        for (followee, follow_changes) in messages_map.into_iter() {
-            let mut followee_messages = Vec::new();
-            let mut singles = Vec::new();
-            let mut batchables = Vec::new();
+    pub fn log_report(
+        &self,
+        messages: &[NotificationMessage],
+        initial_follow_changes_len: usize,
+        initial_followees_len: usize,
+    ) {
+        info!(
+            "Processed a total of {} follow changes for {} followees.",
+            initial_follow_changes_len, initial_followees_len
+        );
 
-            for collected_change in follow_changes {
-                match collected_change {
-                    CollectedFollowChange::Single(change) => {
-                        singles.push(change);
-                    }
-                    CollectedFollowChange::Batchable(change) => {
-                        batchables.push(change);
-                    }
-                }
-            }
+        info!(
+            "    Retained {} follow changes for {} followees.",
+            self.follow_changes_len(),
+            self.followees_len()
+        );
 
-            for batch in batchables.chunks(MAX_FOLLOWERS_PER_BATCH) {
-                let mut message = NotificationMessage::new(followee);
-                message.add_all(batch.to_owned());
-                followee_messages.push(message);
-            }
+        info!(
+            "    Created {} notification messages for {} followees, wrapping a total of {} follow changes.",
+            messages.len(),
+            messages.iter().map(|m| m.followee()).collect::<HashSet<&PublicKey>>().len(),
+            messages.iter().map(|batch| batch.len()).sum::<usize>()
+        );
 
-            // If the batches created have room for more changes, we can add
-            // the singles to them, those that don't fit are sent as single
-            for message in followee_messages.iter_mut() {
-                message.drain_from(&mut singles);
-            }
-
-            for change in singles {
-                followee_messages.push(change.into());
-            }
-
-            messages.extend(followee_messages);
-        }
-
-        if messages.is_empty() {
-            debug!(
-                "Processed {} follow changes for {} followees, no messages created.",
-                initial_follow_changes_len, initial_followees_len
-            );
-        } else {
-            record_metrics(&messages, self.follow_changes_len());
-
-            info!(
-                "Processed {} follow changes for {} followees, retaining {} changes for {} followees. {} messages created, wrapping {} follow changes.",
-                initial_follow_changes_len,
-                initial_followees_len,
-                self.follow_changes_len(),
-                self.followees_len(),
-                messages.len(),
-                // We can calculate this indirectly through a substraction but for a
-                // debug message it's better to be direct
-                messages.iter().map(|batch| batch.len()).sum::<usize>(),
-            );
-        }
-
-        messages
+        info!(
+            "    {} singles and {} batched follow changes were sent.",
+            messages.iter().filter(|m| m.is_single()).count(),
+            messages.iter().filter(|m| !m.is_single()).count()
+        );
     }
 
     pub fn is_empty(&self) -> bool {
@@ -137,6 +169,78 @@ impl<T: Clock> NotificationFactory<T> {
     pub fn followees_len(&self) -> usize {
         self.followee_maps.len()
     }
+}
+
+fn construct_messages<T: Clock>(
+    sendable_follow_changes: OrderMap<PublicKey, Vec<SendableFollowChange<T>>>,
+) -> Vec<NotificationMessage> {
+    let mut messages = Vec::new();
+    for (followee, follow_changes) in sendable_follow_changes.into_iter() {
+        let mut followee_messages: Vec<NotificationMessage> = Vec::new();
+        let mut singles = Vec::new();
+        let mut batchables = Vec::new();
+
+        for collected_change in follow_changes {
+            match collected_change {
+                SendableFollowChange::Single(change) => {
+                    assert_eq!(followee, change.follow_change.followee);
+                    singles.push(change);
+                }
+                SendableFollowChange::Batchable(change) => {
+                    assert_eq!(followee, change.follow_change.followee);
+                    batchables.push(change);
+                }
+            }
+        }
+
+        if batchables.is_empty() {
+            let singles_len = singles.len();
+            for change in singles {
+                followee_messages.push(change.follow_change.into());
+            }
+
+            assert!(followee_messages.len() == singles_len);
+        } else {
+            for batch in batchables.chunks(MAX_FOLLOWERS_PER_BATCH) {
+                followee_messages.push(
+                    batch
+                        .iter()
+                        .map(|collected| collected.follow_change.clone())
+                        .collect::<Vec<FollowChange>>()
+                        .into(),
+                );
+            }
+
+            // Merge singles into batchables, we don't want to have both
+            if let Some(last) = followee_messages.last_mut() {
+                last.drain_from(
+                    &mut singles
+                        .iter()
+                        .cloned()
+                        .map(|change| change.follow_change)
+                        .collect(),
+                );
+            }
+
+            for single in singles.drain(..) {
+                if let Some(last) = followee_messages.last_mut() {
+                    if last.has_room() {
+                        last.add(single.follow_change);
+                    } else {
+                        followee_messages.push(single.follow_change.into());
+                    }
+                }
+            }
+
+            assert!(
+                singles.is_empty(),
+                "All singles should have been merged into batches"
+            );
+        }
+
+        messages.extend(followee_messages);
+    }
+    messages
 }
 
 fn record_metrics(messages: &[NotificationMessage], retained_follow_changes: usize) {
@@ -240,14 +344,15 @@ mod tests {
         unique_changes.insert(change1.clone());
         unique_changes.insert(change2.clone());
 
-        let messages = unique_changes.drain_into_messages();
+        let mut messages = unique_changes.drain_into_messages();
         // Both changes should be kept since they have different followees
-        assert_bag_eq!(
-            messages,
+        assert_eq!(
+            messages.sort(),
             [
                 NotificationMessage::from(change1.clone()),
                 NotificationMessage::from(change2.clone())
             ]
+            .sort()
         );
     }
 
@@ -387,8 +492,6 @@ mod tests {
             let follower = Keys::generate().public_key();
             let change = create_follow_change(follower, followee, seconds_to_datetime(i));
             notification_factory.insert(change.clone());
-
-            clock.advance(Duration::from_secs(1));
         }
 
         // After inserting MAX_FOLLOWERS_TRIPLED changes, we hit the rate limit immediately after the first message.
@@ -405,17 +508,18 @@ mod tests {
             messages[0].is_single(),
             "Expected a single follow change in the message"
         );
-
-        // All other messages are retained due to rate limiting
-        let messages = notification_factory.drain_into_messages();
-        assert_eq!(messages.len(), 0);
         assert_eq!(
             notification_factory.follow_changes_len(),
             MAX_FOLLOWERS_TRIPLED - 1,
         );
 
-        // Just before the max_retention time elapses..
-        clock.advance(Duration::from_secs((max_retention_minutes as u64 - 1) * 60));
+        // All other messages are retained due to rate limiting
+        let messages = notification_factory.drain_into_messages();
+        assert_eq!(messages.len(), 0);
+        assert_eq!(notification_factory.expired_retains_count(), 0);
+
+        // Just after before the max_retention time elapses..
+        clock.advance(Duration::from_secs((max_retention_minutes as u64 + 1) * 60));
 
         // .. we insert another change
         let follower = Keys::generate().public_key();
@@ -430,13 +534,17 @@ mod tests {
             notification_factory.follow_changes_len(),
             MAX_FOLLOWERS_TRIPLED
         );
-        // After the max retention time elapses, all retained changes should be sent, in batches.
-        clock.advance(Duration::from_secs((max_retention_minutes as u64 + 1) * 60));
+
+        // Which is not included in the expired retains
+        assert_eq!(
+            notification_factory.expired_retains_count(),
+            MAX_FOLLOWERS_TRIPLED - 1
+        );
 
         let messages = notification_factory.drain_into_messages();
 
+        // But it will be included in the next batch anyways, regardless of the rate limit
         assert_eq!(messages.len(), 3);
-        // First couple should contain MAX_FOLLOWERS_BATCH changes, they surpassed the maximum retention time, so they are sent regardless of being rate limited
         assert_eq!(messages[0].len(), MAX_FOLLOWERS_PER_BATCH);
         assert_eq!(messages[1].len(), MAX_FOLLOWERS_PER_BATCH);
         assert_eq!(messages[2].len(), MAX_FOLLOWERS_PER_BATCH);
@@ -478,7 +586,7 @@ mod tests {
         assert_eq!(notification_factory.followees_len(), 2);
         assert_eq!(notification_factory.follow_changes_len(), 0);
 
-        clock.advance(ONE_HOUR);
+        clock.advance(ONE_HOUR + Duration::from_secs(1));
         let messages = notification_factory.drain_into_messages();
 
         // Now all is cleared
@@ -558,11 +666,8 @@ mod tests {
     ) {
         let mut expected_batches = Vec::new();
 
-        for (followee, changes) in expected {
-            let mut batch = NotificationMessage::new(*followee);
-            for change in *changes {
-                batch.add(change.clone());
-            }
+        for (_, changes) in expected {
+            let batch: NotificationMessage = (*changes).to_vec().into();
             expected_batches.push(batch);
         }
 

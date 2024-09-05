@@ -18,7 +18,7 @@ pub struct Settings {
     pub google_project_id: String,
     pub google_topic: String,
     pub seconds_threshold: u64,
-    pub followers_per_hour_before_rate_limit: u32,
+    pub max_messages_per_hour: usize,
     pub max_retention_minutes: i64,
 }
 

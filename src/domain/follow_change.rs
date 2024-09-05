@@ -14,7 +14,7 @@ pub enum ChangeType {
 #[derive(Clone, PartialOrd, Ord)]
 pub struct FollowChange {
     pub change_type: ChangeType,
-    pub at: DateTime<Utc>,
+    pub followed_at: DateTime<Utc>,
     pub follower: PublicKey,
     pub friendly_follower: FriendlyId,
     pub followee: PublicKey,
@@ -23,7 +23,7 @@ pub struct FollowChange {
 impl PartialEq for FollowChange {
     fn eq(&self, other: &Self) -> bool {
         self.change_type == other.change_type
-            && self.at == other.at
+            && self.followed_at == other.followed_at
             && self.follower == other.follower
             && self.followee == other.followee
     }
@@ -37,7 +37,7 @@ impl FollowChange {
 
         Self {
             change_type: ChangeType::Followed,
-            at,
+            followed_at: at,
             follower,
             friendly_follower: FriendlyId::PublicKey(follower.to_hex()),
             followee,
@@ -50,7 +50,7 @@ impl FollowChange {
 
         Self {
             change_type: ChangeType::Unfollowed,
-            at,
+            followed_at: at,
             follower,
             friendly_follower: FriendlyId::PublicKey(follower.to_hex()),
             followee,
@@ -78,7 +78,7 @@ impl fmt::Display for FollowChange {
             self.friendly_follower,
             self.followee,
             self.friendly_followee,
-            self.at.to_rfc3339(),
+            self.followed_at.to_rfc3339(),
         )
     }
 }
@@ -94,7 +94,7 @@ impl fmt::Debug for FollowChange {
                 ChangeType::Unfollowed => "-x->",
             },
             &self.followee.to_hex()[..3],
-            self.at,
+            self.followed_at,
         )
     }
 }

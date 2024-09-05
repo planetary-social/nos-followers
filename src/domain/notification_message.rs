@@ -67,6 +67,10 @@ impl NotificationMessage {
         }
     }
 
+    pub fn has_room(&self) -> bool {
+        self.len() < MAX_FOLLOWERS_PER_BATCH
+    }
+
     pub fn drain_from(&mut self, changes: &mut Vec<FollowChange>) {
         let batch_len = self.len();
         let remaining = MAX_FOLLOWERS_PER_BATCH - batch_len;
@@ -155,6 +159,22 @@ impl From<FollowChange> for NotificationMessage {
     fn from(change: FollowChange) -> Self {
         let mut message = NotificationMessage::new(change.followee);
         message.add(change);
+        message
+    }
+}
+
+impl<T> From<T> for NotificationMessage
+where
+    T: IntoIterator<Item = FollowChange>,
+{
+    fn from(changes: T) -> Self {
+        let mut changes = changes.into_iter();
+        let first_change = changes
+            .next()
+            .expect("Empty changes cannot be converted into NotificationMessage");
+
+        let mut message: NotificationMessage = first_change.into();
+        message.add_all(changes);
         message
     }
 }

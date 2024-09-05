@@ -6,7 +6,7 @@ use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 /// Publisher for follow changes. It batches follow changes and publishes
 /// them to Google PubSub after certain time is elapsed or a size threshold is
@@ -20,16 +20,18 @@ impl Publisher {
         cancellation_token: CancellationToken,
         mut client: impl PublishEvents + Send + Sync + 'static,
         seconds_threshold: u64,
-        max_follows_per_hour: u32,
+        max_messages_per_hour: usize,
         max_retention_minutes: i64,
         clock: T,
     ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
         let mut buffer =
-            NotificationFactory::new(max_follows_per_hour, max_retention_minutes, clock)
+            NotificationFactory::new(max_messages_per_hour, max_retention_minutes, clock)
                 .map_err(|_| PublisherError::BufferInit)?;
         tokio::spawn(async move {
+            info!("Publishing messages every {} seconds", seconds_threshold);
+
             let mut interval = time::interval(Duration::from_secs(seconds_threshold));
 
             loop {
@@ -54,6 +56,7 @@ impl Publisher {
                                     }
                                     _ => {
                                         error!("Failed to publish events: {}", e);
+                                        cancellation_token.cancel();
                                         break;
                                     }
                                 }

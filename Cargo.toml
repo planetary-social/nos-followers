@@ -34,3 +34,9 @@ pretty_assertions = "1.2"
 
 [features]
 ci = []
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

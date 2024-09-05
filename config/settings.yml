@@ -4,12 +4,12 @@ followers:
   neo4j_user: "neo4j"
   neo4j_password: "mydevpassword"
   event_channel_size: 500
-  diff_workers: 5
+  diff_workers: 20
   follow_change_channel_size: 50000
   follow_change_workers: 30
-  worker_timeout_secs: 10
+  worker_timeout_secs: 15
   google_project_id: "pub-verse-app"
   google_topic: "follow-changes"
   seconds_threshold: 60
-  followers_per_hour_before_rate_limit: 2
+  max_messages_per_hour: 2
   max_retention_minutes: 60
