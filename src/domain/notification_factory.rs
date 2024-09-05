@@ -43,11 +43,13 @@ impl<T: Clock> NotificationFactory<T> {
         followee_info.add_follower_change(follow_change)
     }
 
-    /// Collects follow/unfollow changes per followee into NotificationMessage objects,
-    /// which essentially map to push notifications. Rate-limited changes are retained
-    /// for later so they can be included in a batch rather than sent individually and immediately.
-    /// Follow changes retained for over an hour, or those that fit within the current
-    /// batch, bypass the rate limit and are included immediately.
+    /// Collects follow/unfollow changes per followee into NotificationMessage
+    /// objects, which essentially map to push notifications. Rate-limited
+    /// changes are retained for later so they can be included in a batch rather
+    /// than sent individually and immediately.  Those retained for
+    /// over an hour, or those that fit within the current batch, bypass the
+    /// rate limit and are included immediately. When there are not rate limits
+    /// and no retained messages, notifications are not batched.
     pub fn drain_into_messages(&mut self) -> Vec<NotificationMessage> {
         let initial_follow_changes_len = self.follow_changes_len();
         let initial_followees_len = self.followees_len();
@@ -61,37 +63,41 @@ impl<T: Clock> NotificationFactory<T> {
             !followee_changes.is_deletable()
         });
 
-        let messages = messages_map
-            .into_iter()
-            .flat_map(|(followee, follow_changes)| {
-                let mut messages = Vec::new();
-                let mut batchables = Vec::new();
+        let mut messages = Vec::new();
+        for (followee, follow_changes) in messages_map.into_iter() {
+            let mut followee_messages = Vec::new();
+            let mut singles = Vec::new();
+            let mut batchables = Vec::new();
 
-                follow_changes
-                    .into_iter()
-                    .for_each(|collected_change| match collected_change {
-                        CollectedFollowChange::Single(change) => {
-                            let mut message = NotificationMessage::new(followee);
-                            message.add(change);
-                            messages.push(message);
-                        }
-                        CollectedFollowChange::Batchable(change) => {
-                            batchables.push(change);
-                        }
-                    });
+            for collected_change in follow_changes {
+                match collected_change {
+                    CollectedFollowChange::Single(change) => {
+                        singles.push(change);
+                    }
+                    CollectedFollowChange::Batchable(change) => {
+                        batchables.push(change);
+                    }
+                }
+            }
 
-                batchables
-                    .chunks(MAX_FOLLOWERS_PER_BATCH)
-                    .for_each(|batch| {
-                        let mut message = NotificationMessage::new(followee);
-                        for change in batch {
-                            message.add(change.clone());
-                        }
-                        messages.push(message);
-                    });
-                messages
-            })
-            .collect::<Vec<NotificationMessage>>();
+            for batch in batchables.chunks(MAX_FOLLOWERS_PER_BATCH) {
+                let mut message = NotificationMessage::new(followee);
+                message.add_all(batch.to_owned());
+                followee_messages.push(message);
+            }
+
+            // If the batches created have room for more changes, we can add
+            // the singles to them, those that don't fit are sent as single
+            for message in followee_messages.iter_mut() {
+                message.drain_from(&mut singles);
+            }
+
+            for change in singles {
+                followee_messages.push(change.into());
+            }
+
+            messages.extend(followee_messages);
+        }
 
         if messages.is_empty() {
             debug!(
@@ -138,9 +144,7 @@ fn record_metrics(messages: &[NotificationMessage], retained_follow_changes: usi
     let mut aggregated_follow_changes = 0;
 
     for message in messages {
-        let message_len = message.len();
-
-        if message_len == 1 {
+        if message.is_single() {
             individual_follow_changes += 1;
         } else {
             aggregated_follow_changes += 1;
@@ -397,9 +401,8 @@ mod tests {
             messages,
             messages.iter().map(|m| m.len()).sum::<usize>()
         );
-        assert_eq!(
-            messages[0].len(),
-            1,
+        assert!(
+            messages[0].is_single(),
             "Expected a single follow change in the message"
         );
 
@@ -458,7 +461,6 @@ mod tests {
         notification_factory.insert(change.clone());
 
         let messages = notification_factory.drain_into_messages();
-
         // Only the one for the new followee is sent as it's not rate limited, the other one hit the limit so it's retained.
         assert_eq!(messages.len(), 1);
         assert_eq!(notification_factory.follow_changes_len(), 1);
@@ -467,11 +469,9 @@ mod tests {
         clock.advance(Duration::from_secs((max_retention_minutes as u64 + 1) * 60));
 
         let messages = notification_factory.drain_into_messages();
-
         // This one has a single item
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].len(), 1);
-
         // We keep the followee info for the time the rate limit counter can
         // calculate the rate which is one hour. This is in case new changes
         // arrive so we remember the rate limit for one more period

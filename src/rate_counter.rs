@@ -37,3 +37,50 @@ impl<T: Clock> RateCounter<T> {
         self.items_sent.len() as u32 >= self.limit
     }
 }
+
+#[cfg(test)]
+
+mod tests {
+    use super::*;
+    use governor::clock::FakeRelativeClock;
+
+    #[test]
+    fn test_rate_counter() {
+        let clock = FakeRelativeClock::default();
+        // Configured for a rate of 2 items in 10 seconds before hitting the limit
+        let mut rate_counter = RateCounter::new(2, Duration::from_secs(10), clock.clone());
+
+        rate_counter.bump();
+        rate_counter.bump();
+        assert!(
+            rate_counter.is_hit(),
+            "2 items in 0 seconds should hit the limit"
+        );
+
+        clock.advance(Duration::from_secs(5));
+        assert!(
+            rate_counter.is_hit(),
+            "2 items in 5 seconds should hit the limit"
+        );
+
+        clock.advance(Duration::from_secs(5));
+        rate_counter.bump();
+        rate_counter.bump();
+        assert!(
+            rate_counter.is_hit(),
+            "4 items in 10 seconds should hit the limit"
+        );
+
+        clock.advance(Duration::from_secs(5));
+        assert!(
+            rate_counter.is_hit(),
+            "4 items in 15 seconds should hit the limit"
+        );
+
+        clock.advance(Duration::from_secs(5));
+        assert!(
+            !rate_counter.is_hit(),
+            "4 items in 20 seconds should not hit the limit"
+        );
+    }
+}

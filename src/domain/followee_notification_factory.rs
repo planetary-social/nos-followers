@@ -1,6 +1,6 @@
 use super::FollowChange;
 use crate::rate_counter::RateCounter;
-use governor::{clock::Clock, clock::Reference, nanos::Nanos};
+use governor::{clock::Clock, clock::Reference};
 use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
 use std::fmt::Debug;
@@ -63,19 +63,17 @@ impl<T: Clock> FolloweeNotificationFactory<T> {
         follow_changes_to_publish: &mut Vec<CollectedFollowChange>,
     ) {
         // TODO: extract_if would have been great here, keep an eye on nightly
-        let rate_counter = &mut self.rate_counter;
-        let follow_change_map = &mut self.follow_changes;
-
-        follow_change_map.retain(|_follower, (inserted_at, follow_change)| {
-            collect_follow_change(
-                max_retention,
-                inserted_at,
-                follow_changes_to_publish,
-                follow_change,
-                &self.clock,
-                rate_counter,
-            )
-        });
+        self.follow_changes
+            .retain(|_follower, (inserted_at, follow_change)| {
+                collect_follow_change(
+                    max_retention,
+                    inserted_at,
+                    follow_changes_to_publish,
+                    follow_change,
+                    &self.clock,
+                    &mut self.rate_counter,
+                )
+            });
     }
 }
 
@@ -87,21 +85,6 @@ impl<T: Clock> Debug for FolloweeNotificationFactory<T> {
     }
 }
 
-/// Collects a follow change into a batched message and returns whether the change should
-/// be retained for later due to rate limits.
-///
-/// - If the messages sent so far have been rate-limited, the change will be
-///   retained for later processing but only within the max retention period.
-///
-/// - Once the retention period is elapsed, the retained changes are sent in batched messages.
-///   Messages with only one item will include friendly ID information, the
-///   notification service will show them as "foobar@nos.social is a new
-///   follower!"
-///   Messages with multiple items will be shown as "You have 29 new followers and 29 unfollows!"
-///
-/// - The batching process ensures that no message contains more than
-///   MAX_FOLLOWERS_PER_BATCH changes. If it didn't we'd hit the APNS max
-///   payload limit.
 fn collect_follow_change<T: Clock>(
     max_retention: &Duration,
     inserted_at: &mut T::Instant,
@@ -110,8 +93,7 @@ fn collect_follow_change<T: Clock>(
     clock: &T,
     rate_counter: &mut RateCounter<T>,
 ) -> bool {
-    let retained_for_too_long =
-        clock.now().duration_since(*inserted_at) > Nanos::new(max_retention.as_nanos() as u64);
+    let retained_for_too_long = clock.now().duration_since(*inserted_at) > (*max_retention).into();
 
     if retained_for_too_long {
         send_batchable(follow_change, follow_changes_to_publish, rate_counter);
@@ -119,7 +101,7 @@ fn collect_follow_change<T: Clock>(
     }
 
     let rate_limited = rate_counter.is_hit();
-    if rate_limited && !retained_for_too_long {
+    if rate_limited {
         return true;
     }
 

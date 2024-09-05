@@ -67,8 +67,28 @@ impl NotificationMessage {
         }
     }
 
+    pub fn drain_from(&mut self, changes: &mut Vec<FollowChange>) {
+        let batch_len = self.len();
+        let remaining = MAX_FOLLOWERS_PER_BATCH - batch_len;
+        let end = remaining.min(changes.len());
+
+        let singles_to_add: Vec<FollowChange> = changes.drain(..end).collect();
+
+        self.add_all(singles_to_add);
+    }
+
+    pub fn add_all(&mut self, follow_changes: impl IntoIterator<Item = FollowChange>) {
+        for follow_change in follow_changes {
+            self.add(follow_change);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.follows.len() + self.unfollows.len()
+    }
+
+    pub fn is_single(&self) -> bool {
+        self.len() == 1
     }
 }
 
@@ -132,9 +152,9 @@ impl Debug for NotificationMessage {
 }
 
 impl From<FollowChange> for NotificationMessage {
-    fn from(val: FollowChange) -> Self {
-        let mut message = NotificationMessage::new(val.followee);
-        message.add(val);
+    fn from(change: FollowChange) -> Self {
+        let mut message = NotificationMessage::new(change.followee);
+        message.add(change);
         message
     }
 }
