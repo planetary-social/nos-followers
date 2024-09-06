@@ -38,7 +38,8 @@ where
             cancellation_token.clone(),
             google_publisher_client,
             settings.seconds_threshold,
-            settings.max_messages_per_hour,
+            settings.max_messages_per_rate_period,
+            settings.rate_period_minutes,
             settings.max_retention_minutes,
             DefaultClock::default(),
         )

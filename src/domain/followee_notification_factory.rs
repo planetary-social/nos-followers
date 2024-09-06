@@ -9,8 +9,6 @@ use std::time::Duration;
 type Follower = PublicKey;
 type Followee = PublicKey;
 
-pub const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
-
 pub enum SendableFollowChange<T: Clock> {
     Single(RetainedFollowChange<T>),
     Batchable(RetainedFollowChange<T>),
@@ -65,8 +63,17 @@ pub struct FolloweeNotificationFactory<T: Clock> {
 }
 
 impl<T: Clock> FolloweeNotificationFactory<T> {
-    pub fn new(max_messages_per_hour: usize, max_retention: Duration, clock: T) -> Self {
-        let rate_counter = RateCounter::new(max_messages_per_hour, ONE_HOUR, clock.clone());
+    pub fn new(
+        max_messages_per_rate_period: usize,
+        rate_period_minutes: Duration,
+        max_retention: Duration,
+        clock: T,
+    ) -> Self {
+        let rate_counter = RateCounter::new(
+            max_messages_per_rate_period,
+            rate_period_minutes,
+            clock.clone(),
+        );
 
         Self {
             rate_counter,
@@ -167,14 +174,6 @@ impl<T: Clock> FolloweeNotificationFactory<T> {
     }
 }
 
-impl<T: Clock> Debug for FolloweeNotificationFactory<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FolloweeNotificationFactory")
-            .field("follow_changes", &self.follow_changes)
-            .finish()
-    }
-}
-
 fn collect_sendables<T: Clock>(
     max_retention: &Duration,
     follow_changes_to_publish: &mut Vec<SendableFollowChange<T>>,
@@ -219,4 +218,12 @@ fn send<T: Clock>(
     };
     follow_changes_to_publish.push(collected_follow_change);
     rate_counter.bump();
+}
+
+impl<T: Clock> Debug for FolloweeNotificationFactory<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FolloweeNotificationFactory")
+            .field("follow_changes", &self.follow_changes)
+            .finish()
+    }
 }

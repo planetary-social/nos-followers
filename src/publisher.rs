@@ -20,15 +20,20 @@ impl Publisher {
         cancellation_token: CancellationToken,
         mut client: impl PublishEvents + Send + Sync + 'static,
         seconds_threshold: u64,
-        max_messages_per_hour: usize,
-        max_retention_minutes: i64,
+        max_messages_per_rate_period: usize,
+        rate_period_minutes: usize,
+        max_retention_minutes: usize,
         clock: T,
     ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
-        let mut buffer =
-            NotificationFactory::new(max_messages_per_hour, max_retention_minutes, clock)
-                .map_err(|_| PublisherError::BufferInit)?;
+        let mut buffer = NotificationFactory::new(
+            max_messages_per_rate_period,
+            rate_period_minutes,
+            max_retention_minutes,
+            clock,
+        )
+        .map_err(|_| PublisherError::BufferInit)?;
         tokio::spawn(async move {
             info!("Publishing messages every {} seconds", seconds_threshold);
 
@@ -147,6 +152,7 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
         let max_follows_per_hour = 10;
+        let rate_period_minutes = 10;
         let max_retention_minutes = 1;
 
         let publisher = Publisher::create(
@@ -154,6 +160,7 @@ mod tests {
             mock_client,
             seconds_threshold,
             max_follows_per_hour,
+            rate_period_minutes,
             max_retention_minutes,
             FakeRelativeClock::default(),
         )
@@ -232,14 +239,16 @@ mod tests {
 
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
-        let max_follows_per_hour = 10;
+        let max_messages_per_rate_period = 10;
+        let rate_period_minutes = 10;
         let max_retention_minutes = 1;
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
-            max_follows_per_hour,
+            max_messages_per_rate_period,
+            rate_period_minutes,
             max_retention_minutes,
             FakeRelativeClock::default(),
         )
@@ -298,14 +307,16 @@ mod tests {
 
         let cancellation_token = CancellationToken::new();
         let seconds_threshold = 1;
-        let max_follows_per_hour = 10;
+        let max_messages_per_rate_period = 10;
+        let rate_period_minutes = 10;
         let max_retention_minutes = 1;
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             seconds_threshold,
-            max_follows_per_hour,
+            max_messages_per_rate_period,
+            rate_period_minutes,
             max_retention_minutes,
             FakeRelativeClock::default(),
         )

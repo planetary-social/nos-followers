@@ -18,23 +18,40 @@ type Followee = PublicKey;
 /// the results into `NotificationMessage` instances per followee.
 pub struct NotificationFactory<T: Clock = DefaultClock> {
     followee_maps: OrderMap<Followee, FolloweeNotificationFactory<T>>,
+    max_messages_per_rate_period: usize,
+    rate_period: Duration,
     max_retention: Duration,
-    max_messages_per_hour: usize,
     clock: T,
 }
 
 impl<T: Clock> NotificationFactory<T> {
-    pub fn new(max_messages_per_hour: usize, max_retention_minutes: i64, clock: T) -> Result<Self> {
-        assert!(max_messages_per_hour > 0);
+    pub fn new(
+        max_messages_per_rate_period: usize,
+        rate_period_minutes: usize,
+        max_retention_minutes: usize,
+        clock: T,
+    ) -> Result<Self> {
+        if max_messages_per_rate_period == 0
+            || rate_period_minutes == 0
+            || max_retention_minutes == 0
+        {
+            anyhow::bail!("Rate limit, rate period, and max retention must be greater than 0");
+        }
+
+        if rate_period_minutes <= max_retention_minutes {
+            anyhow::bail!("Rate period must be greater than max retention");
+        }
+
         info!(
-            "After {} messages per hour, additional messages will be retained for {} minutes.",
-            max_messages_per_hour, max_retention_minutes
+            "After {} messages in {} minutes, additional messages will be retained for {} minutes.",
+            max_messages_per_rate_period, rate_period_minutes, max_retention_minutes
         );
 
         Ok(Self {
             followee_maps: OrderMap::with_capacity(1_000),
             max_retention: Duration::from_secs(max_retention_minutes as u64 * 60),
-            max_messages_per_hour,
+            max_messages_per_rate_period,
+            rate_period: Duration::from_secs(rate_period_minutes as u64 * 60),
             clock,
         })
     }
@@ -45,7 +62,8 @@ impl<T: Clock> NotificationFactory<T> {
             .entry(follow_change.followee)
             .or_insert_with_key(|_| {
                 FolloweeNotificationFactory::new(
-                    self.max_messages_per_hour,
+                    self.max_messages_per_rate_period,
+                    self.rate_period,
                     self.max_retention,
                     self.clock.clone(),
                 )
@@ -266,7 +284,6 @@ fn record_metrics(messages: &[NotificationMessage], retained_follow_changes: usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::followee_notification_factory::ONE_HOUR;
     use assertables::*;
     use chrono::{DateTime, Utc};
     use governor::clock::FakeRelativeClock;
@@ -290,9 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_unique_follow_change() {
+    fn test_insert_follow_change() {
         let mut notification_factory =
-            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
+            NotificationFactory::new(10, 10, 9, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -312,27 +329,27 @@ mod tests {
 
     #[test]
     fn test_does_not_replace_with_older_change() {
-        let mut unique_changes =
-            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(10, 10, 9, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
         let newer_change = create_follow_change(follower, followee, seconds_to_datetime(2));
-        unique_changes.insert(newer_change.clone());
+        notification_factory.insert(newer_change.clone());
 
         let older_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
-        unique_changes.insert(older_change);
+        notification_factory.insert(older_change);
 
-        let messages = unique_changes.drain_into_messages();
+        let messages = notification_factory.drain_into_messages();
         assert_eq!(messages.len(), 1);
         assert_message_eq(&messages[0], &followee, [follower], &[]);
     }
 
     #[test]
     fn test_insert_same_follower_different_followee() {
-        let mut unique_changes =
-            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(10, 10, 9, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee1 = Keys::generate().public_key();
@@ -341,10 +358,10 @@ mod tests {
         let change1 = create_follow_change(follower, followee1, seconds_to_datetime(2));
         let change2 = create_follow_change(follower, followee2, seconds_to_datetime(1));
 
-        unique_changes.insert(change1.clone());
-        unique_changes.insert(change2.clone());
+        notification_factory.insert(change1.clone());
+        notification_factory.insert(change2.clone());
 
-        let mut messages = unique_changes.drain_into_messages();
+        let mut messages = notification_factory.drain_into_messages();
         // Both changes should be kept since they have different followees
         assert_eq!(
             messages.sort(),
@@ -358,8 +375,8 @@ mod tests {
 
     #[test]
     fn test_an_unfollow_cancels_a_follow() {
-        let mut unique_changes =
-            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(10, 10, 9, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -367,17 +384,17 @@ mod tests {
         let follow_change = create_follow_change(follower, followee, seconds_to_datetime(1));
         let unfollow_change = create_unfollow_change(follower, followee, seconds_to_datetime(2));
 
-        unique_changes.insert(follow_change.clone());
-        unique_changes.insert(unfollow_change.clone());
+        notification_factory.insert(follow_change.clone());
+        notification_factory.insert(unfollow_change.clone());
 
         // The unfollow should cancel the follow
-        assert_eq!(unique_changes.drain_into_messages(), []);
+        assert_eq!(notification_factory.drain_into_messages(), []);
     }
 
     #[test]
     fn test_a_follow_cancels_an_unfollow() {
-        let mut unique_changes =
-            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(10, 10, 9, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -385,20 +402,22 @@ mod tests {
         let unfollow_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
         let follow_change = create_follow_change(follower, followee, seconds_to_datetime(2));
 
-        unique_changes.insert(unfollow_change.clone());
-        unique_changes.insert(follow_change.clone());
+        notification_factory.insert(unfollow_change.clone());
+        notification_factory.insert(follow_change.clone());
 
         // The follow should cancel the unfollow
-        assert_eq!(unique_changes.drain_into_messages(), []);
+        assert_eq!(notification_factory.drain_into_messages(), []);
     }
 
     #[test]
     fn test_single_item_batch_before_rate_limit_is_hit() {
-        let max_follows_per_hour = 2;
-        let max_retention_minutes = 10;
+        let max_messages_per_rate_period = 2;
+        let max_retention_minutes = 9;
+        let rate_period_minutes = 10;
 
         let mut notification_factory = NotificationFactory::new(
-            max_follows_per_hour,
+            max_messages_per_rate_period,
+            rate_period_minutes,
             max_retention_minutes,
             FakeRelativeClock::default(),
         )
@@ -431,13 +450,18 @@ mod tests {
     #[test]
     fn test_no_message_after_rate_limit_is_hit_but_retention_not_elapsed() {
         // After one single follow change the rate limit will be hit
-        let max_messages_per_hour = 1;
-        let max_retention_minutes = 10;
+        let max_messages_per_rate_period = 1;
+        let max_retention_minutes = 9;
+        let rate_period_minutes = 10;
 
         let clock = FakeRelativeClock::default();
-        let mut notification_factory =
-            NotificationFactory::new(max_messages_per_hour, max_retention_minutes, clock.clone())
-                .unwrap();
+        let mut notification_factory = NotificationFactory::new(
+            max_messages_per_rate_period,
+            rate_period_minutes,
+            max_retention_minutes,
+            clock.clone(),
+        )
+        .unwrap();
 
         let follower1 = Keys::generate().public_key();
         let follower2 = Keys::generate().public_key();
@@ -448,7 +472,7 @@ mod tests {
         notification_factory.insert(change1.clone());
 
         // We hit the rate limit, but the retention time hasn't elapsed yet.
-        // The rate is one follow per hour, so we only get one message, the
+        // The rate is one follow per 10 minutes, so we only get one message, the
         // other one is retained.
         let messages = notification_factory.drain_into_messages();
         assert_batches_eq(&messages, &[(followee, &[change1])]);
@@ -470,21 +494,26 @@ mod tests {
         assert_batches_eq(&messages, &[]);
 
         // We clear the rate limit
-        clock.advance(Duration::from_secs(50 * 60));
+        clock.advance(Duration::from_secs(rate_period_minutes as u64 * 60));
         let messages = notification_factory.drain_into_messages();
         assert_batches_eq(&messages, &[(followee, &[change2, change3])]);
     }
 
     #[test]
     fn test_batch_sizes_after_rate_limit_and_retention_period() {
-        let max_messages_per_hour = 1; // After one single follow change, the rate limit will be hit
+        let max_messages_per_rate_period = 1; // After one single follow change, the rate limit will be hit
         let max_retention_minutes = 10;
+        let rate_period_minutes = 20;
         const MAX_FOLLOWERS_TRIPLED: usize = 3 * MAX_FOLLOWERS_PER_BATCH as usize; // The number of messages we will send for testing
 
         let clock = FakeRelativeClock::default();
-        let mut notification_factory =
-            NotificationFactory::new(max_messages_per_hour, max_retention_minutes, clock.clone())
-                .unwrap();
+        let mut notification_factory = NotificationFactory::new(
+            max_messages_per_rate_period,
+            rate_period_minutes,
+            max_retention_minutes,
+            clock.clone(),
+        )
+        .unwrap();
 
         let followee = Keys::generate().public_key();
 
@@ -586,7 +615,7 @@ mod tests {
         assert_eq!(notification_factory.followees_len(), 2);
         assert_eq!(notification_factory.follow_changes_len(), 0);
 
-        clock.advance(ONE_HOUR + Duration::from_secs(1));
+        clock.advance(Duration::from_secs(rate_period_minutes as u64 * 60 + 1));
         let messages = notification_factory.drain_into_messages();
 
         // Now all is cleared
@@ -597,46 +626,46 @@ mod tests {
 
     #[test]
     fn test_is_empty_and_len() {
-        let mut unique_changes =
-            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(10, 10, 9, FakeRelativeClock::default()).unwrap();
 
         let follower1 = Keys::generate().public_key();
         let follower2 = Keys::generate().public_key();
         let followee1 = Keys::generate().public_key();
         let followee2 = Keys::generate().public_key();
 
-        assert!(unique_changes.is_empty());
-        assert_eq!(unique_changes.follow_changes_len(), 0);
-        assert_eq!(unique_changes.followees_len(), 0);
+        assert!(notification_factory.is_empty());
+        assert_eq!(notification_factory.follow_changes_len(), 0);
+        assert_eq!(notification_factory.followees_len(), 0);
 
         let change1 = create_follow_change(follower1, followee1, seconds_to_datetime(1));
         let change2 = create_follow_change(follower1, followee2, seconds_to_datetime(1));
         let change3 = create_follow_change(follower2, followee2, seconds_to_datetime(1));
 
-        unique_changes.insert(change1);
-        unique_changes.insert(change2);
-        unique_changes.insert(change3);
+        notification_factory.insert(change1);
+        notification_factory.insert(change2);
+        notification_factory.insert(change3);
 
-        assert!(!unique_changes.is_empty());
-        assert_eq!(unique_changes.follow_changes_len(), 3);
-        assert_eq!(unique_changes.followees_len(), 2);
+        assert!(!notification_factory.is_empty());
+        assert_eq!(notification_factory.follow_changes_len(), 3);
+        assert_eq!(notification_factory.followees_len(), 2);
     }
 
     #[test]
     fn test_drain_clears_map() {
-        let mut unique_changes =
-            NotificationFactory::new(10, 10, FakeRelativeClock::default()).unwrap();
+        let mut notification_factory =
+            NotificationFactory::new(10, 10, 9, FakeRelativeClock::default()).unwrap();
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
         let change1 = create_follow_change(follower, followee, seconds_to_datetime(2));
-        unique_changes.insert(change1);
+        notification_factory.insert(change1);
 
         let change2 = create_follow_change(follower, followee, seconds_to_datetime(1));
-        unique_changes.insert(change2);
+        notification_factory.insert(change2);
 
-        let changes = unique_changes.drain_into_messages();
+        let changes = notification_factory.drain_into_messages();
         assert_eq!(changes.len(), 1);
         assert_message_eq(&changes[0], &followee, [follower], &[])
     }

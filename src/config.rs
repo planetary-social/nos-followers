@@ -18,8 +18,9 @@ pub struct Settings {
     pub google_project_id: String,
     pub google_topic: String,
     pub seconds_threshold: u64,
-    pub max_messages_per_hour: usize,
-    pub max_retention_minutes: i64,
+    pub max_retention_minutes: usize,
+    pub max_messages_per_rate_period: usize,
+    pub rate_period_minutes: usize,
 }
 
 impl Configurable for Settings {
