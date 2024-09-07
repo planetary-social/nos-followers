@@ -1,8 +1,8 @@
 use crate::metrics;
 use futures::Future;
-use std::error::Error;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::{error::Error, num::NonZeroUsize};
 use tokio::sync::{
     broadcast::{self, error::RecvError},
     mpsc,
@@ -19,8 +19,8 @@ pub struct WorkerPool {}
 impl WorkerPool {
     pub fn start<Item, Worker>(
         name: &str,
-        num_workers: usize,
-        worker_timeout_secs: u64,
+        num_workers: NonZeroUsize,
+        worker_timeout_secs: NonZeroUsize,
         mut item_receiver: broadcast::Receiver<Item>,
         cancellation_token: CancellationToken,
         worker: Worker,
@@ -37,7 +37,7 @@ impl WorkerPool {
         let worker_clone = Arc::new(worker);
         let token_clone = cancellation_token.clone();
 
-        for i in 0..num_workers {
+        for i in 0..num_workers.get() {
             let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerTaskItem<Item>>(1);
             worker_txs.push(worker_tx);
 
@@ -55,7 +55,7 @@ impl WorkerPool {
 
                         Some(item) = worker_rx.recv() => {
                               trace!("{}: Worker task processing item {:?}", worker_name, item);
-                              let result = timeout(Duration::from_secs(worker_timeout_secs), worker.call(item)).await;
+                              let result = timeout(Duration::from_secs(worker_timeout_secs.get() as u64), worker.call(item)).await;
 
                               match result {
                                   Ok(Ok(())) => {

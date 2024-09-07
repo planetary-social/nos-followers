@@ -67,20 +67,6 @@ impl NotificationMessage {
         }
     }
 
-    pub fn has_room(&self) -> bool {
-        self.len() < MAX_FOLLOWERS_PER_BATCH
-    }
-
-    pub fn drain_from(&mut self, changes: &mut Vec<FollowChange>) {
-        let batch_len = self.len();
-        let remaining = MAX_FOLLOWERS_PER_BATCH - batch_len;
-        let end = remaining.min(changes.len());
-
-        let singles_to_add: Vec<FollowChange> = changes.drain(..end).collect();
-
-        self.add_all(singles_to_add);
-    }
-
     pub fn add_all(&mut self, follow_changes: impl IntoIterator<Item = FollowChange>) {
         for follow_change in follow_changes {
             self.add(follow_change);

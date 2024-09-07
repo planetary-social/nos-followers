@@ -1,7 +1,7 @@
 use crate::domain::FollowChange;
 use crate::domain::NotificationFactory;
 use crate::google_pubsub_client::{PublishEvents, PublisherError};
-use governor::clock::Clock;
+use std::num::NonZeroUsize;
 use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
@@ -16,28 +16,20 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    pub async fn create<T: Clock + Send + Sync + 'static>(
+    pub async fn create(
         cancellation_token: CancellationToken,
         mut client: impl PublishEvents + Send + Sync + 'static,
-        seconds_threshold: u64,
-        max_messages_per_rate_period: usize,
-        rate_period_minutes: usize,
-        max_retention_minutes: usize,
-        clock: T,
+        flush_period_seconds: NonZeroUsize,
+        min_seconds_between_messages: NonZeroUsize,
     ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
 
-        let mut buffer = NotificationFactory::new(
-            max_messages_per_rate_period,
-            rate_period_minutes,
-            max_retention_minutes,
-            clock,
-        )
-        .map_err(|_| PublisherError::BufferInit)?;
+        let mut buffer = NotificationFactory::new(min_seconds_between_messages);
         tokio::spawn(async move {
-            info!("Publishing messages every {} seconds", seconds_threshold);
+            info!("Publishing messages every {} seconds", flush_period_seconds);
 
-            let mut interval = time::interval(Duration::from_secs(seconds_threshold));
+            let mut interval =
+                time::interval(Duration::from_secs(flush_period_seconds.get() as u64));
 
             loop {
                 select! {
@@ -51,7 +43,7 @@ impl Publisher {
                     // seconds, after that the buffer is cleared and sent
                     _ = interval.tick() => {
                         if !buffer.is_empty() {
-                            debug!("Time based threshold of {} seconds reached, publishing buffer", seconds_threshold);
+                            debug!("Time based threshold of {} seconds reached, publishing buffer", flush_period_seconds);
 
                             if let Err(e) = client.publish_events(buffer.drain_into_messages()).await {
                                 match &e {
@@ -106,7 +98,7 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use futures::Future;
     use gcloud_sdk::tonic::Status;
-    use governor::clock::FakeRelativeClock;
+    use nonzero_ext::nonzero;
     use nostr_sdk::prelude::Keys;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
@@ -150,19 +142,14 @@ mod tests {
         };
 
         let cancellation_token = CancellationToken::new();
-        let seconds_threshold = 1;
-        let max_follows_per_hour = 10;
-        let rate_period_minutes = 10;
-        let max_retention_minutes = 1;
+        let flush_period_seconds = nonzero!(1usize);
+        let min_seconds_between_messages = nonzero!(60usize);
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
-            seconds_threshold,
-            max_follows_per_hour,
-            rate_period_minutes,
-            max_retention_minutes,
-            FakeRelativeClock::default(),
+            flush_period_seconds,
+            min_seconds_between_messages,
         )
         .await
         .unwrap();
@@ -238,19 +225,14 @@ mod tests {
         };
 
         let cancellation_token = CancellationToken::new();
-        let seconds_threshold = 1;
-        let max_messages_per_rate_period = 10;
-        let rate_period_minutes = 10;
-        let max_retention_minutes = 1;
+        let flush_period_seconds = nonzero!(1usize);
+        let min_seconds_between_messages = nonzero!(60usize);
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
-            seconds_threshold,
-            max_messages_per_rate_period,
-            rate_period_minutes,
-            max_retention_minutes,
-            FakeRelativeClock::default(),
+            flush_period_seconds,
+            min_seconds_between_messages,
         )
         .await
         .unwrap();
@@ -306,19 +288,14 @@ mod tests {
         };
 
         let cancellation_token = CancellationToken::new();
-        let seconds_threshold = 1;
-        let max_messages_per_rate_period = 10;
-        let rate_period_minutes = 10;
-        let max_retention_minutes = 1;
+        let flush_period_seconds = nonzero!(1usize);
+        let min_seconds_between_messages = nonzero!(60usize);
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
-            seconds_threshold,
-            max_messages_per_rate_period,
-            rate_period_minutes,
-            max_retention_minutes,
-            FakeRelativeClock::default(),
+            flush_period_seconds,
+            min_seconds_between_messages,
         )
         .await
         .unwrap();

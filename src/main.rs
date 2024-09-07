@@ -7,7 +7,6 @@ mod http_server;
 mod metrics;
 mod migrations;
 mod publisher;
-mod rate_counter;
 mod relay_subscriber;
 mod repo;
 mod worker_pool;
@@ -23,6 +22,7 @@ use nostr_sdk::prelude::*;
 use relay_subscriber::{create_client, start_nostr_subscription};
 use repo::Repo;
 use rustls::crypto::ring;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     info!("Initializing workers for follower list diff calculation");
     let shared_nostr_client = Arc::new(create_client());
     let (follow_change_sender, _) =
-        broadcast::channel::<FollowChange>(settings.follow_change_channel_size);
+        broadcast::channel::<FollowChange>(settings.follow_change_channel_size.get());
     let follows_differ_worker = FollowsDiffer::new(
         repo.clone(),
         shared_nostr_client.clone(),
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     );
     let cancellation_token = CancellationToken::new();
     let (event_sender, event_receiver) =
-        broadcast::channel::<Box<Event>>(settings.event_channel_size);
+        broadcast::channel::<Box<Event>>(settings.event_channel_size.get());
     let event_worker_pool_task_tracker = WorkerPool::start(
         "Differ",
         settings.diff_workers,
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     let follow_change_handle = WorkerPool::start(
         "FollowChangeHandler",
         settings.follow_change_workers,
-        settings.worker_timeout_secs * 2,
+        NonZeroUsize::new(settings.worker_timeout_secs.get() * 2).unwrap(),
         follow_change_sender.subscribe(),
         cancellation_token.clone(),
         follow_change_task_tracker,

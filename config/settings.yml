@@ -10,8 +10,6 @@ followers:
   worker_timeout_secs: 15
   google_project_id: "pub-verse-app"
   google_topic: "follow-changes"
-  seconds_threshold: 60
-  max_retention_minutes: 60
-  max_messages_per_rate_period: 2
-  # Must be bigger than max_retention_minutes
-  rate_period_minutes: 61
+  flush_period_seconds: 60
+  # 30 minutes, so no more than 2 messages per hour
+  min_seconds_between_messages: 1800

@@ -6,7 +6,6 @@ use crate::publisher::Publisher;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{Repo, RepoTrait};
 use crate::worker_pool::{WorkerTask, WorkerTaskItem};
-use governor::clock::DefaultClock;
 use nostr_sdk::prelude::*;
 use std::error::Error;
 use std::sync::Arc;
@@ -37,11 +36,8 @@ where
         let google_publisher = Publisher::create(
             cancellation_token.clone(),
             google_publisher_client,
-            settings.seconds_threshold,
-            settings.max_messages_per_rate_period,
-            settings.rate_period_minutes,
-            settings.max_retention_minutes,
-            DefaultClock::default(),
+            settings.flush_period_seconds,
+            settings.min_seconds_between_messages,
         )
         .await?;
 
@@ -49,7 +45,7 @@ where
             repo,
             nostr_client,
             google_publisher,
-            timeout_secs: settings.worker_timeout_secs,
+            timeout_secs: settings.worker_timeout_secs.get() as u64,
         })
     }
 }

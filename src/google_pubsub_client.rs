@@ -33,9 +33,6 @@ pub enum PublisherError {
 
     #[error("Failed to initialize Google publisher: {0}")]
     Init(#[from] gcloud_sdk::error::Error),
-
-    #[error("Failed to initialize buffer")]
-    BufferInit,
 }
 
 pub trait PublishEvents {

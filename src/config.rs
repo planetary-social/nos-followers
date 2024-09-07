@@ -2,6 +2,7 @@ use config_rs::{Config as ConfigTree, ConfigError, Environment, File};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::env;
+use std::num::NonZeroUsize;
 use tracing::info;
 
 #[derive(Debug, Deserialize)]
@@ -10,17 +11,15 @@ pub struct Settings {
     pub neo4j_uri: String,
     pub neo4j_user: String,
     pub neo4j_password: String,
-    pub event_channel_size: usize,
-    pub diff_workers: usize,
-    pub follow_change_channel_size: usize,
-    pub follow_change_workers: usize,
-    pub worker_timeout_secs: u64,
+    pub event_channel_size: NonZeroUsize,
+    pub diff_workers: NonZeroUsize,
+    pub follow_change_channel_size: NonZeroUsize,
+    pub follow_change_workers: NonZeroUsize,
+    pub worker_timeout_secs: NonZeroUsize,
     pub google_project_id: String,
     pub google_topic: String,
-    pub seconds_threshold: u64,
-    pub max_retention_minutes: usize,
-    pub max_messages_per_rate_period: usize,
-    pub rate_period_minutes: usize,
+    pub flush_period_seconds: NonZeroUsize,
+    pub min_seconds_between_messages: NonZeroUsize,
 }
 
 impl Configurable for Settings {
