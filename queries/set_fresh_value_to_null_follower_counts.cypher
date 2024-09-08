@@ -9,6 +9,18 @@ OPTIONAL MATCH (follower:User)-[:FOLLOWS]->(user)
 WITH user, COUNT(follower) AS follower_count
 SET user.follower_count = follower_count;
 
+// This query sets the follower_count to null for all users.
+
+MATCH (user:User)
+WHERE user.follower_count IS NOT NULL
+SET user.follower_count = null;
+
+// Check how many still have a non-null follower_count (should return 0 if all were set to null)
+
+MATCH (user:User)
+WHERE user.follower_count IS NOT NULL
+RETURN COUNT(user) AS num_users_with_non_null_follower_count;
+
 // Check how many still are null
 
 MATCH (user:User)

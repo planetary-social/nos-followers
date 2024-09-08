@@ -166,15 +166,19 @@ impl RepoTrait for Repo {
     }
 
     async fn upsert_follow(&self, follow: &ContactListFollow) -> Result<(), RepoError> {
-        // Notice we only increment follower_count if it is not null.  This
-        // allows an external script to initialize the count with fresh,
-        // non-cached values.
+        // Notice we only increment follower_count and followee_count if they
+        // are not null.  This allows an external script to initialize the
+        // counts with fresh, non-cached values.
         let statement = r#"
+            // Ensure the followee exists and initialize follower_count to 0 if created
             MERGE (followee:User {pubkey: $followee_val})
             ON CREATE SET followee.follower_count = 0
 
+            // Ensure the follower exists and initialize followee_count to 0 if created
             MERGE (follower:User {pubkey: $follower_val})
+            ON CREATE SET follower.followee_count = 0
 
+            // Create the FOLLOWS relationship between follower and followee
             MERGE (follower)-[r:FOLLOWS]->(followee)
             ON CREATE SET
                 r.created_at = $updated_at,
@@ -182,10 +186,14 @@ impl RepoTrait for Repo {
                 followee.follower_count = CASE
                     WHEN followee.follower_count IS NOT NULL THEN followee.follower_count + 1
                     ELSE followee.follower_count
+                END,
+                follower.followee_count = CASE
+                    WHEN follower.followee_count IS NOT NULL THEN follower.followee_count + 1
+                    ELSE follower.followee_count
                 END
             ON MATCH SET
                 r.updated_at = $updated_at
-            "#;
+        "#;
 
         let query = query(statement)
             .param("updated_at", (follow.updated_at.naive_utc(), "Etc/UTC"))
@@ -199,7 +207,6 @@ impl RepoTrait for Repo {
 
         Ok(())
     }
-
     async fn delete_follow(
         &self,
         followee: &PublicKey,
@@ -208,12 +215,16 @@ impl RepoTrait for Repo {
         let statement = r#"
             MATCH (follower:User {pubkey: $follower_val})-[r:FOLLOWS]->(followee:User {pubkey: $followee_val})
             DELETE r
-            WITH followee
+            WITH followee, follower
             SET followee.follower_count = CASE
                 WHEN followee.follower_count > 0 THEN followee.follower_count - 1
                 ELSE 0
+            END,
+            follower.followee_count = CASE
+                WHEN follower.followee_count > 0 THEN follower.followee_count - 1
+                ELSE 0
             END
-            "#;
+        "#;
 
         let query = query(statement)
             .param("followee_val", followee.to_hex())
@@ -223,6 +234,7 @@ impl RepoTrait for Repo {
             .run(query)
             .await
             .map_err(RepoError::DeleteFollow)?;
+
         Ok(())
     }
 
