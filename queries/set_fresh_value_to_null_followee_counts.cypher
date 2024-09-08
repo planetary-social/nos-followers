@@ -1,3 +1,6 @@
+// This are scripts to manually update, revert and check the followee_count cache
+// At some point we could integrate paginated queries in the migration system to reduce manual backfills
+
 // This query selects up to 1000 users with a null followee count, counts their
 // followees and updates the followee count.
 

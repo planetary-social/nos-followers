@@ -1,5 +1,5 @@
 ARG RUST_VERSION=1.80.0
-ARG APP_NAME=followers_server
+ARG APP_NAME=nos_followers
 
 ################################################################################
 # Create a stage for building the application.
