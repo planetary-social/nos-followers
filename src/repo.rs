@@ -166,12 +166,25 @@ impl RepoTrait for Repo {
     }
 
     async fn upsert_follow(&self, follow: &ContactListFollow) -> Result<(), RepoError> {
+        // Notice we only increment follower_count if it is not null.  This
+        // allows an external script to initialize the count with fresh,
+        // non-cached values.
         let statement = r#"
             MERGE (followee:User {pubkey: $followee_val})
+            ON CREATE SET followee.follower_count = 0
+
             MERGE (follower:User {pubkey: $follower_val})
+
             MERGE (follower)-[r:FOLLOWS]->(followee)
-            ON CREATE SET r.created_at = $updated_at, r.updated_at = $updated_at
-            ON MATCH SET r.updated_at = $updated_at
+            ON CREATE SET
+                r.created_at = $updated_at,
+                r.updated_at = $updated_at,
+                followee.follower_count = CASE
+                    WHEN followee.follower_count IS NOT NULL THEN followee.follower_count + 1
+                    ELSE followee.follower_count
+                END
+            ON MATCH SET
+                r.updated_at = $updated_at
             "#;
 
         let query = query(statement)
@@ -195,6 +208,11 @@ impl RepoTrait for Repo {
         let statement = r#"
             MATCH (follower:User {pubkey: $follower_val})-[r:FOLLOWS]->(followee:User {pubkey: $followee_val})
             DELETE r
+            WITH followee
+            SET followee.follower_count = CASE
+                WHEN followee.follower_count > 0 THEN followee.follower_count - 1
+                ELSE 0
+            END
             "#;
 
         let query = query(statement)
