@@ -1,7 +1,16 @@
 [package]
-name = "nos-followers"
+name = "nos_followers"
 version = "0.1.0"
 edition = "2021"
+default-run = "nos_followers"
+
+[[bin]]
+name = "nos_followers"
+path = "src/main.rs"
+
+[[bin]]
+name = "jsonl_importer"
+path = "src/bin/jsonl_importer.rs"
 
 [dependencies]
 anyhow = "1.0.86"
@@ -9,6 +18,7 @@ async-trait = "0.1.82"
 axum = "0.7.5"
 cached = { version = "0.53.1", features = ["async"] }
 chrono = { version = "0.4.38", features = ["serde"] }
+clap = { version = "4.5.17", features = ["derive"] }
 config_rs = { version = "0.14", package = "config", features = ["yaml"] }
 futures = "0.3.30"
 gcloud-sdk = { version = "0.25.5", features = ["google-pubsub-v1"] }
@@ -27,7 +37,7 @@ tokio = { version = "1.39.3", features = ["full", "test-util"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 tower-http = { version = "0.5.2", features = ["timeout", "trace"] }
 tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "tracing-log"] }
 
 [dev-dependencies]
 assertables = "7.0.1"

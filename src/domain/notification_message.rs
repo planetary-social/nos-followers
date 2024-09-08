@@ -77,6 +77,10 @@ impl NotificationMessage {
         self.follows.len() + self.unfollows.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn is_single(&self) -> bool {
         self.len() == 1
     }

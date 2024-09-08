@@ -1,39 +1,30 @@
-mod account_info;
-mod config;
-mod domain;
-mod follow_change_handler;
-mod google_pubsub_client;
-mod http_server;
-mod metrics;
-mod migrations;
-mod publisher;
-mod relay_subscriber;
-mod repo;
-mod worker_pool;
-
-use config::{Config, Settings};
-use core::panic;
-use domain::{FollowChange, FollowsDiffer};
-use follow_change_handler::FollowChangeHandler;
-use http_server::HttpServer;
-use migrations::apply_migrations;
+use anyhow::{Context, Result};
 use neo4rs::Graph;
+use nos_followers::{
+    config::{Config, Settings},
+    domain::{FollowChange, FollowsDiffer},
+    follow_change_handler::FollowChangeHandler,
+    http_server::HttpServer,
+    migrations::apply_migrations,
+    relay_subscriber::{create_client, start_nostr_subscription},
+    repo::Repo,
+    tcp_importer::start_tcp_importer,
+    worker_pool::WorkerPool,
+};
 use nostr_sdk::prelude::*;
-use relay_subscriber::{create_client, start_nostr_subscription};
-use repo::Repo;
 use rustls::crypto::ring;
+use signal::unix::{signal, SignalKind};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use tokio::signal;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
+use tokio::time::Duration;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use worker_pool::WorkerPool;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    info!("Follower server started");
-
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
@@ -43,18 +34,64 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("Failed to install ring crypto provider");
 
-    // Load the configuration
+    info!("Follower server started");
+
     let config = Config::new("config")?;
     let settings = config.get::<Settings>()?;
 
+    if let Err(e) = start(settings).await {
+        error!("Failed to start the server: {}", e);
+    }
+
+    Ok(())
+}
+
+// Listen to ctrl-c, terminate and cancellation token
+async fn cancel_on_stop_signals(cancellation_token: CancellationToken) -> Result<()> {
+    #[cfg(unix)]
+    let terminate = async {
+        signal(SignalKind::terminate())
+            .expect("Failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            info!("Starting graceful termination, from cancellation token");
+        },
+        _ = signal::ctrl_c() => {
+            info!("Starting graceful termination, from ctrl-c");
+        },
+        _ = terminate => {
+            info!("Starting graceful termination, from terminate signal");
+        },
+    }
+
+    cancellation_token.cancel();
+
+    info!("Waiting 3 seconds before exiting");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    Ok(())
+}
+
+async fn start(settings: Settings) -> Result<()> {
     info!("Initializing repository at {}", settings.neo4j_uri);
     let graph = Graph::new(
         &settings.neo4j_uri,
         &settings.neo4j_user,
         &settings.neo4j_password,
     )
-    .await?;
-    apply_migrations(&graph).await?;
+    .await
+    .context("Failed to connect to Neo4j")?;
+
+    apply_migrations(&graph)
+        .await
+        .context("Failed applying migrations")?;
     let repo = Arc::new(Repo::new(graph));
 
     info!("Initializing workers for follower list diff calculation");
@@ -66,35 +103,40 @@ async fn main() -> Result<()> {
         shared_nostr_client.clone(),
         follow_change_sender.clone(),
     );
+
+    let task_tracker = TaskTracker::new();
     let cancellation_token = CancellationToken::new();
     let (event_sender, event_receiver) =
         broadcast::channel::<Box<Event>>(settings.event_channel_size.get());
-    let event_worker_pool_task_tracker = WorkerPool::start(
+    WorkerPool::start(
+        task_tracker.clone(),
         "Differ",
         settings.diff_workers,
         settings.worker_timeout_secs,
         event_receiver,
         cancellation_token.clone(),
         follows_differ_worker,
-    )?;
+    );
 
     info!("Starting follower change processing task");
-    let follow_change_task_tracker = FollowChangeHandler::new(
+    let follow_change_worker = FollowChangeHandler::new(
         repo.clone(),
         shared_nostr_client.clone(),
         cancellation_token.clone(),
         &settings,
     )
-    .await?;
+    .await
+    .context("Failed starting the follow change processing task")?;
 
-    let follow_change_handle = WorkerPool::start(
+    WorkerPool::start(
+        task_tracker.clone(),
         "FollowChangeHandler",
         settings.follow_change_workers,
         NonZeroUsize::new(settings.worker_timeout_secs.get() * 2).unwrap(),
         follow_change_sender.subscribe(),
         cancellation_token.clone(),
-        follow_change_task_tracker,
-    )?;
+        follow_change_worker,
+    );
 
     info!("Subscribing to kind 3 events");
     let five_minutes_ago = Timestamp::now() - 60 * 5;
@@ -102,27 +144,39 @@ async fn main() -> Result<()> {
         .since(five_minutes_ago)
         .kind(Kind::ContactList)];
 
-    let nostr_sub = start_nostr_subscription(
-        shared_nostr_client.clone(),
+    start_nostr_subscription(
+        task_tracker.clone(),
+        shared_nostr_client,
         [settings.relay].into(),
         filters,
         event_sender.clone(),
         cancellation_token.clone(),
     );
 
-    let http_server = HttpServer::run(cancellation_token.clone());
+    info!("Starting jsonl listener");
+    start_tcp_importer(
+        task_tracker.clone(),
+        settings.tcp_importer_port,
+        event_sender,
+        cancellation_token.clone(),
+    )
+    .await?;
 
-    tokio::select! {
-        result = nostr_sub => if let Err(e) = result {
-            error!("Nostr subscription encountered an error: {:?}", e);
-        },
-        result = http_server => if let Err(e) = result {
-            error!("HTTP server encountered an error: {:?}", e);
-        },
-        _ = follow_change_handle.wait() => {},
-        _ = event_worker_pool_task_tracker.wait() => {},
-        _ = cancellation_token.cancelled() => info!("Cancellation token cancelled"),
-    }
+    HttpServer::start(
+        task_tracker.clone(),
+        settings.http_port,
+        cancellation_token.clone(),
+    )?;
+
+    tokio::spawn(async move {
+        if let Err(e) = cancel_on_stop_signals(cancellation_token).await {
+            error!("Failed to listen stop signals: {}", e);
+        }
+    });
+
+    info!("Server is ready");
+    task_tracker.close();
+    task_tracker.wait().await;
 
     info!("Follower server stopped");
     Ok(())

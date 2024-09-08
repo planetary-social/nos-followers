@@ -20,6 +20,8 @@ pub struct Settings {
     pub google_topic: String,
     pub flush_period_seconds: NonZeroUsize,
     pub min_seconds_between_messages: NonZeroUsize,
+    pub tcp_importer_port: u16,
+    pub http_port: u16,
 }
 
 impl Configurable for Settings {

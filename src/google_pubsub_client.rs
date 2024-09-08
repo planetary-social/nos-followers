@@ -1,11 +1,10 @@
 use crate::domain::NotificationMessage;
 use crate::metrics;
-use futures::Future;
+use crate::publisher::{PublishEvents, PublisherError};
 use gcloud_sdk::{
     google::pubsub::v1::{publisher_client::PublisherClient, PublishRequest, PubsubMessage},
     *,
 };
-use thiserror::Error;
 use tracing::debug;
 
 const ALLOWED_PUBKEYS: &[&str] = &[
@@ -23,25 +22,6 @@ const ALLOWED_PUBKEYS: &[&str] = &[
     "806d236c19d4771153406e150b1baf6257725cda781bf57442aeef53ed6cb727", // Shaina
 ];
 
-#[derive(Error, Debug)]
-pub enum PublisherError {
-    #[error("Failed to publish events: {0}")]
-    PublishError(#[from] tonic::Status),
-
-    #[error("Failed to serialize event to JSON: {0}")]
-    SerializationError(#[from] serde_json::Error),
-
-    #[error("Failed to initialize Google publisher: {0}")]
-    Init(#[from] gcloud_sdk::error::Error),
-}
-
-pub trait PublishEvents {
-    fn publish_events(
-        &mut self,
-        follow_changes: Vec<NotificationMessage>,
-    ) -> impl Future<Output = Result<(), PublisherError>> + std::marker::Send;
-}
-
 pub struct GooglePubSubClient {
     pubsub_client: GoogleApi<PublisherClient<GoogleAuthMiddleware>>,
     google_full_topic: String,
@@ -58,7 +38,7 @@ impl GooglePubSubClient {
                 Some(google_full_topic.clone()),
             )
             .await
-            .map_err(PublisherError::Init)?;
+            .map_err(|_| PublisherError::Init)?;
 
         Ok(Self {
             pubsub_client,
@@ -80,7 +60,7 @@ impl PublishEvents for GooglePubSubClient {
             })
             .map(|message| {
                 let data =
-                    serde_json::to_vec(message).map_err(PublisherError::SerializationError)?;
+                    serde_json::to_vec(message).map_err(|_| PublisherError::SerializationError)?;
 
                 Ok(PubsubMessage {
                     data,
@@ -106,7 +86,7 @@ impl PublishEvents for GooglePubSubClient {
             .get()
             .publish(request)
             .await
-            .map_err(PublisherError::PublishError)?;
+            .map_err(|_| PublisherError::PublishError)?;
 
         debug!(
             "Published {} messages to Google PubSub {}",

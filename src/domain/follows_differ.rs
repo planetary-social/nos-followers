@@ -30,6 +30,75 @@ where
     follow_change_sender: Sender<FollowChange>,
 }
 
+#[async_trait]
+impl<T, U> WorkerTask<Box<Event>> for FollowsDiffer<T, U>
+where
+    T: RepoTrait + Sync + Send,
+    U: GetEventsOf + Sync + Send,
+{
+    async fn call(&self, event: Box<Event>) -> Result<()> {
+        debug!("Processing event here");
+
+        if event.kind != Kind::ContactList {
+            debug!(
+                "Skipping event of kind {:?} for {}",
+                event.kind,
+                event.pubkey.to_bech32().unwrap_or_default()
+            );
+            return Ok(());
+        }
+
+        let follower = event.pubkey;
+
+        let event_created_at = convert_timestamp(event.created_at.as_u64())?;
+        let maybe_last_seen_contact_list = self
+            .repo
+            .maybe_update_last_contact_list_at(&follower, &event_created_at)
+            .await?;
+
+        // Check if the event is older than the latest stored update and skip if so
+        if let Some(last_seen_contact_list) = maybe_last_seen_contact_list {
+            if event.created_at <= (last_seen_contact_list.timestamp() as u64).into() {
+                debug!(
+                    "Skipping follow list for {} as it's older than the last update",
+                    follower.to_bech32().unwrap_or_default()
+                );
+                return Ok(());
+            }
+        }
+
+        // Get the stored follows and the latest update time from the database
+        let mut follows_diff = self.initialize_follows_diff(&follower).await?;
+
+        // Populate the new follows from the event tags
+        self.populate_new_follows(&mut follows_diff, &event);
+
+        // Process the follows_diff and apply changes
+        let (followed_counter, unfollowed_counter, unchanged) = self
+            .process_follows_diff(
+                follows_diff,
+                &follower,
+                event_created_at,
+                maybe_last_seen_contact_list,
+            )
+            .await?;
+
+        if let Some(log_line) = log_line(
+            follower,
+            followed_counter,
+            unfollowed_counter,
+            unchanged,
+            maybe_last_seen_contact_list,
+            &event,
+        ) {
+            info!("{}", log_line);
+        }
+
+        metrics::contact_lists_processed().increment(1);
+        Ok(())
+    }
+}
+
 impl<T, U> FollowsDiffer<T, U>
 where
     T: RepoTrait + Sync + Send,
@@ -156,100 +225,32 @@ where
 const ONE_DAY_DURATION: Duration = Duration::seconds(60 * 60 * 24);
 const ONE_WEEK_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7);
 
-#[async_trait]
-impl<T, U> WorkerTask<Box<Event>> for FollowsDiffer<T, U>
-where
-    T: RepoTrait + Sync + Send,
-    U: GetEventsOf + Sync + Send,
-{
-    async fn call(&self, event: Box<Event>) -> Result<()> {
-        debug!("Processing event here");
-
-        let one_day_ago = Timestamp::from(
-            (Instant::now() - ONE_DAY_DURATION.to_std()?)
-                .elapsed()
-                .as_secs(),
-        );
-
-        if event.kind != Kind::ContactList {
-            debug!(
-                "Skipping event of kind {:?} for {}",
-                event.kind,
-                event.pubkey.to_bech32().unwrap_or_default()
-            );
-            return Ok(());
-        }
-
-        if event.created_at < one_day_ago {
-            debug!(
-                "Skipping event older than a day for {}. Created on {}",
-                event.pubkey.to_bech32().unwrap_or_default(),
-                event.created_at.to_human_datetime()
-            );
-            return Ok(());
-        }
-
-        let follower = event.pubkey;
-
-        let event_created_at = convert_timestamp(event.created_at.as_u64())?;
-        let maybe_last_seen_contact_list = self
-            .repo
-            .maybe_update_last_contact_list_at(&follower, &event_created_at)
-            .await?;
-
-        // Check if the event is older than the latest stored update and skip if so
-        if let Some(last_seen_contact_list) = maybe_last_seen_contact_list {
-            if event.created_at <= (last_seen_contact_list.timestamp() as u64).into() {
-                debug!(
-                    "Skipping follow list for {} as it's older than the last update",
-                    follower.to_bech32().unwrap_or_default()
-                );
-                return Ok(());
-            }
-        }
-
-        // Get the stored follows and the latest update time from the database
-        let mut follows_diff = self.initialize_follows_diff(&follower).await?;
-
-        // Populate the new follows from the event tags
-        self.populate_new_follows(&mut follows_diff, &event);
-
-        // Process the follows_diff and apply changes
-        let (followed_counter, unfollowed_counter, unchanged) = self
-            .process_follows_diff(
-                follows_diff,
-                &follower,
-                event_created_at,
-                maybe_last_seen_contact_list,
-            )
-            .await?;
-
-        if let Some(log_line) = log_line(
-            follower,
-            followed_counter,
-            unfollowed_counter,
-            unchanged,
-            maybe_last_seen_contact_list,
-            &event,
-        ) {
-            info!("{}", log_line);
-        }
-
-        metrics::contact_lists_processed().increment(1);
-        Ok(())
-    }
-}
-
-/// An heuristic to decide if we should send notifications for a contact list
+/// Heuristics to decide if we should send notifications for a contact list or just update the DB.
 async fn should_send_notifications<T: GetEventsOf>(
     nostr_client: &Arc<T>,
     maybe_last_seen_contact_list: Option<DateTime<Utc>>,
     follower: &PublicKey,
     event_created_at: DateTime<Utc>,
 ) -> Result<bool> {
+    // We use tokio instant here so we can easily mock
+    let one_day_ago = (Instant::now() - ONE_DAY_DURATION.to_std()?)
+        .elapsed()
+        .as_secs();
+
+    if (event_created_at.timestamp() as u64) < one_day_ago {
+        debug!(
+            "Event from {} is older than a day {}. Skipping notifications.",
+            follower.to_bech32().unwrap_or_default(),
+            event_created_at.to_rfc3339()
+        );
+        return Ok(false);
+    }
+
     if maybe_last_seen_contact_list.is_none() {
         // This is the first time we see a contact list from this follower.
         let AccountInfo { created_at, .. } = fetch_account_info(nostr_client, follower).await;
+
+        // Not really the creation date, but the last time the profile was updated
         let Some(follower_created_at) = created_at else {
             return Ok(true);
         };

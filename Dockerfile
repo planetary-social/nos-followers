@@ -1,13 +1,5 @@
-# syntax=docker/dockerfile:1
-
-# Comments are provided throughout this file to help you get started.
-# If you need more help, visit the Dockerfile reference guide at
-# https://docs.docker.com/go/dockerfile-reference/
-
-# Want to help us make this template better? Share your feedback here: https://forms.gle/ybq9Krt8jtBL3iCk7
-
 ARG RUST_VERSION=1.80.0
-ARG APP_NAME=nos-followers
+ARG APP_NAME=followers_server
 
 ################################################################################
 # Create a stage for building the application.
@@ -20,37 +12,27 @@ WORKDIR /app
 RUN apk update \
     && apk add --no-cache --purge pkgconfig clang lld musl-dev git openssl-dev openssl-libs-static libc-dev
 
-# Build the application.
-# Leverage a cache mount to /usr/local/cargo/registry/
-# for downloaded dependencies, a cache mount to /usr/local/cargo/git/db
-# for git repository dependencies, and a cache mount to /app/target/ for
-# compiled dependencies which will speed up subsequent builds.
-# Leverage a bind mount to the src directory to avoid having to copy the
-# source code into the container. Once built, copy the executable to an
-# output directory before the cache mounted /app/target is unmounted.
-
 # Create and set the working directory
 WORKDIR /app
 
+# Leverage a cache mount to /usr/local/cargo/registry/ for downloaded dependencies,
+# a cache mount to /usr/local/cargo/git/db for git dependencies, and a cache mount
+# to /app/target/ for compiled dependencies which will speed up subsequent builds.
 RUN --mount=type=bind,source=src,target=src \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
     --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
-    cargo build --locked --release && \
-    cp ./target/release/$APP_NAME /bin/server
+    cargo build --locked --release --bin $APP_NAME --bin jsonl_importer && \
+    cp ./target/release/$APP_NAME /bin/server && \
+    cp ./target/release/jsonl_importer /bin/jsonl_importer
 
 ################################################################################
 # Create a new stage for running the application that contains the minimal
 # runtime dependencies for the application. This often uses a different base
 # image from the build stage where the necessary files are copied from the build
 # stage.
-#
-# The example below uses the alpine image as the foundation for running the app.
-# By specifying the "3.18" tag, it will use version 3.18 of alpine. If
-# reproducability is important, consider using a digest
-# (e.g., alpine@sha256:664888ac9cfd28068e062c991ebcff4b4c7307dc8dd4df9e728bedde5c449d91).
 FROM alpine:3.18 AS final
 
 WORKDIR /app
@@ -68,12 +50,16 @@ RUN adduser \
     appuser
 USER appuser
 
-# Copy the executable from the "build" stage.
+# Copy the executables from the "build" stage.
 COPY --from=build /bin/server /bin/
+COPY --from=build /bin/jsonl_importer /bin/
+
+# Copy any necessary configuration or migration files
 COPY ./migrations /app/migrations
 COPY ./config/settings.yml /app/config/settings.yml
 
-# Expose the port that the application listens on.
+# Expose the port that the main server listens on.
 EXPOSE 3000
 
+# By default, run the main server binary. You can override this in `docker run`
 ENTRYPOINT ["/bin/server"]

@@ -1,13 +1,11 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
-use signal::unix::{signal, SignalKind};
 use std::marker::Send;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::signal;
 use tokio::sync::broadcast::Sender;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, error, info};
 
 #[async_trait]
@@ -41,38 +39,34 @@ pub fn create_client() -> Client {
     ClientBuilder::default().opts(opts).build()
 }
 
-pub async fn start_nostr_subscription(
+pub fn start_nostr_subscription(
+    task_tracker: TaskTracker,
     nostr_client: Arc<Client>,
     relays: Vec<String>,
     filters: Vec<Filter>,
     event_tx: Sender<Box<Event>>,
     cancellation_token: CancellationToken,
-) -> Result<()> {
-    for relay in relays {
-        info!("Connecting to relay: {}", relay);
-        if let Err(e) = nostr_client.add_relay(relay).await {
-            bail!("Failed to add relay: {}", e);
+) {
+    task_tracker.spawn(async move {
+        for relay in relays {
+            info!("Connecting to relay: {}", relay);
+            if let Err(e) = nostr_client.add_relay(relay).await {
+                bail!("Failed to add relay: {}", e);
+            }
         }
-    }
 
-    let token_clone = cancellation_token.clone();
-    tokio::spawn(async move {
-        if let Err(e) = cancel_on_stop_signals(token_clone).await {
-            error!("Failed to listen stop signals: {}", e);
-        }
+        start_subscription(
+            &nostr_client,
+            &filters,
+            event_tx.clone(),
+            cancellation_token.clone(),
+        )
+        .await?;
+
+        info!("Subscription ended");
+
+        Ok(())
     });
-
-    start_subscription(
-        &nostr_client,
-        &filters,
-        event_tx.clone(),
-        cancellation_token.clone(),
-    )
-    .await?;
-
-    info!("Subscription ended");
-
-    Ok(())
 }
 
 async fn start_subscription(
@@ -121,39 +115,6 @@ async fn start_subscription(
             Ok(false)
         })
         .await?;
-
-    Ok(())
-}
-
-// Listen to ctrl-c, terminate and cancellation token
-async fn cancel_on_stop_signals(cancellation_token: CancellationToken) -> Result<()> {
-    #[cfg(unix)]
-    let terminate = async {
-        signal(SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = cancellation_token.cancelled() => {
-            info!("Starting graceful termination, from cancellation token");
-        },
-        _ = signal::ctrl_c() => {
-            info!("Starting graceful termination, from ctrl-c");
-        },
-        _ = terminate => {
-            info!("Starting graceful termination, from terminate signal");
-        },
-    }
-
-    cancellation_token.cancel();
-
-    info!("Waiting 3 seconds before exiting");
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     Ok(())
 }

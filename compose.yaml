@@ -18,11 +18,13 @@ services:
       - cargo-git:/usr/local/cargo/git/db
       - build-cache:/app/target
       - ${HOME}/.config/gcloud/application_default_credentials.json:/app/gcloud/application_default_credentials.json
+
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "3000:3000"
+      - "3001:3001"
     restart: always
     attach: true
 

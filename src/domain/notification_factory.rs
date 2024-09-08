@@ -376,7 +376,6 @@ mod tests {
             min_seconds_between_messages.get() as u64 * 60 + 1,
         ))
         .await;
-        println!("0");
         let messages = notification_factory.drain_into_messages();
 
         // Now all is cleared

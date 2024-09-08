@@ -1,12 +1,33 @@
 use crate::domain::FollowChange;
 use crate::domain::NotificationFactory;
-use crate::google_pubsub_client::{PublishEvents, PublisherError};
+use crate::domain::NotificationMessage;
+use futures::Future;
 use std::num::NonZeroUsize;
+use thiserror::Error;
 use tokio::select;
 use tokio::sync::mpsc::{self, error::SendError};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+
+#[derive(Error, Debug)]
+pub enum PublisherError {
+    #[error("Failed to publish events")]
+    PublishError,
+
+    #[error("Failed to serialize event")]
+    SerializationError,
+
+    #[error("Failed to initialize publisher")]
+    Init,
+}
+
+pub trait PublishEvents {
+    fn publish_events(
+        &mut self,
+        follow_changes: Vec<NotificationMessage>,
+    ) -> impl Future<Output = Result<(), PublisherError>> + std::marker::Send;
+}
 
 /// Publisher for follow changes. It batches follow changes and publishes
 /// them to Google PubSub after certain time is elapsed or a size threshold is
@@ -48,7 +69,7 @@ impl Publisher {
                             if let Err(e) = client.publish_events(buffer.drain_into_messages()).await {
                                 match &e {
                                     // We've seen this happen sporadically, we don't neet to kill the look in this situation
-                                    PublisherError::PublishError(_) => {
+                                    PublisherError::PublishError => {
                                         error!("{}", e);
                                     }
                                     _ => {
@@ -93,11 +114,9 @@ impl Publisher {
 mod tests {
     use super::*;
     use crate::domain::{FollowChange, NotificationMessage};
-    use crate::google_pubsub_client::PublisherError;
     use assertables::*;
     use chrono::{DateTime, Duration, Utc};
     use futures::Future;
-    use gcloud_sdk::tonic::Status;
     use nonzero_ext::nonzero;
     use nostr_sdk::prelude::Keys;
     use pretty_assertions::assert_eq;
@@ -121,9 +140,7 @@ mod tests {
 
             async move {
                 if fail_publish {
-                    Err(PublisherError::PublishError(Status::cancelled(
-                        "Mock error",
-                    )))
+                    Err(PublisherError::PublishError)
                 } else {
                     let mut published_events = published_events.lock().await;
                     published_events.extend(messages);

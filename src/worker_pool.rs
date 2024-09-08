@@ -18,19 +18,18 @@ pub struct WorkerPool {}
 // Workers implement the WorkerTask trait that receives the item to process.
 impl WorkerPool {
     pub fn start<Item, Worker>(
+        tracker: TaskTracker,
         pool_name: &str,
         num_workers: NonZeroUsize,
         worker_timeout_secs: NonZeroUsize,
         item_receiver: broadcast::Receiver<Item>,
         cancellation_token: CancellationToken,
         worker: Worker,
-    ) -> Result<TaskTracker, Box<dyn Error>>
+    ) -> TaskTracker
     where
         Item: Debug + Send + Sync + Clone + 'static,
         Worker: WorkerTask<Item> + Send + Sync + 'static,
     {
-        let tracker = TaskTracker::new();
-
         // Spawn a pool of worker tasks to process each item. Call the worker_fn for each item.
         let mut worker_txs = Vec::new();
 
@@ -59,8 +58,7 @@ impl WorkerPool {
             cancellation_token,
         );
 
-        tracker.close();
-        Ok(tracker)
+        tracker
     }
 }
 

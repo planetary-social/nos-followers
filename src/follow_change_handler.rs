@@ -2,7 +2,7 @@ use crate::account_info::{refresh_friendly_id, FriendlyId};
 use crate::config::Settings;
 use crate::domain::FollowChange;
 use crate::google_pubsub_client::GooglePubSubClient;
-use crate::publisher::Publisher;
+use crate::publisher::{Publisher, PublisherError};
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{Repo, RepoTrait};
 use crate::worker_pool::WorkerTask;
@@ -16,7 +16,7 @@ use tracing::debug;
 /// Fetches friendly ids and then sends follow change to google pubsub
 pub struct FollowChangeHandler<T: GetEventsOf> {
     repo: Arc<Repo>,
-    google_publisher: Publisher,
+    publisher: Publisher,
     nostr_client: Arc<T>,
     timeout_secs: u64,
 }
@@ -30,7 +30,7 @@ where
         nostr_client: Arc<T>,
         cancellation_token: CancellationToken,
         settings: &Settings,
-    ) -> Result<Self> {
+    ) -> Result<Self, PublisherError> {
         let google_publisher_client =
             GooglePubSubClient::new(&settings.google_project_id, &settings.google_topic).await?;
 
@@ -45,7 +45,7 @@ where
         Ok(Self {
             repo,
             nostr_client,
-            google_publisher,
+            publisher: google_publisher,
             timeout_secs: settings.worker_timeout_secs.get() as u64,
         })
     }
@@ -74,9 +74,7 @@ impl<T: GetEventsOf> WorkerTask<FollowChange> for FollowChangeHandler<T> {
             follow_change.friendly_follower, follow_change.friendly_followee
         );
 
-        self.google_publisher
-            .queue_publication(follow_change)
-            .await?;
+        self.publisher.queue_publication(follow_change).await?;
         Ok(())
     }
 }
