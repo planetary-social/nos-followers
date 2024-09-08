@@ -10,6 +10,7 @@ followers:
   worker_timeout_secs: 15
   google_project_id: "pub-verse-app"
   google_topic: "follow-changes"
+  # how often to flush the buffer to generate messages
   flush_period_seconds: 60
   # 30 minutes, so no more than 2 messages per hour
   min_seconds_between_messages: 1800

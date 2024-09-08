@@ -4,7 +4,7 @@ use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use crate::{
     domain::{contact_list_follow::ContactListFollow, follow_change::FollowChange},
-    worker_pool::{WorkerTask, WorkerTaskItem},
+    worker_pool::WorkerTask,
 };
 use chrono::{DateTime, Duration, Utc};
 use nostr_sdk::prelude::*;
@@ -156,14 +156,14 @@ where
 const ONE_DAY_DURATION: Duration = Duration::seconds(60 * 60 * 24);
 const ONE_WEEK_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7);
 
+#[async_trait]
 impl<T, U> WorkerTask<Box<Event>> for FollowsDiffer<T, U>
 where
     T: RepoTrait + Sync + Send,
     U: GetEventsOf + Sync + Send,
 {
-    async fn call(&self, worker_task_item: WorkerTaskItem<Box<Event>>) -> Result<()> {
+    async fn call(&self, event: Box<Event>) -> Result<()> {
         debug!("Processing event here");
-        let WorkerTaskItem { item: event } = worker_task_item;
 
         let one_day_ago = Timestamp::from(
             (Instant::now() - ONE_DAY_DURATION.to_std()?)
@@ -354,6 +354,8 @@ mod tests {
     #[derive(Default)]
 
     struct MockNostrClient;
+
+    #[async_trait]
     impl GetEventsOf for MockNostrClient {
         async fn get_events_of(
             &self,
@@ -937,9 +939,7 @@ mod tests {
         });
 
         for event in contact_events {
-            follows_differ
-                .call(WorkerTaskItem::new(Box::new(event)))
-                .await?
+            follows_differ.call(Box::new(event)).await?
         }
 
         sleep(Duration::milliseconds(100).to_std()?).await;

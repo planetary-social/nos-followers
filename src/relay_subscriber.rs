@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use futures::Future;
+use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use signal::unix::{signal, SignalKind};
 use std::marker::Send;
@@ -10,21 +10,23 @@ use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+#[async_trait]
 pub trait GetEventsOf: Send + Sync {
-    fn get_events_of(
+    async fn get_events_of(
         &self,
         filters: Vec<Filter>,
         timeout: Option<Duration>,
-    ) -> impl Future<Output = Result<Vec<Event>, Error>> + Send;
+    ) -> Result<Vec<Event>, Error>;
 }
 
+#[async_trait]
 impl GetEventsOf for Client {
-    fn get_events_of(
+    async fn get_events_of(
         &self,
         filters: Vec<Filter>,
         timeout: Option<Duration>,
-    ) -> impl Future<Output = Result<Vec<Event>, Error>> + Send {
-        self.get_events_of(filters, timeout)
+    ) -> Result<Vec<Event>, Error> {
+        self.get_events_of(filters, timeout).await
     }
 }
 

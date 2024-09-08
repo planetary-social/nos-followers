@@ -5,7 +5,8 @@ use crate::google_pubsub_client::GooglePubSubClient;
 use crate::publisher::Publisher;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{Repo, RepoTrait};
-use crate::worker_pool::{WorkerTask, WorkerTaskItem};
+use crate::worker_pool::WorkerTask;
+use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use std::error::Error;
 use std::sync::Arc;
@@ -50,14 +51,9 @@ where
     }
 }
 
+#[async_trait]
 impl<T: GetEventsOf> WorkerTask<FollowChange> for FollowChangeHandler<T> {
-    async fn call(
-        &self,
-        worker_task_item: WorkerTaskItem<FollowChange>,
-    ) -> Result<(), Box<dyn Error>> {
-        let WorkerTaskItem {
-            item: mut follow_change,
-        } = worker_task_item;
+    async fn call(&self, mut follow_change: FollowChange) -> Result<(), Box<dyn Error>> {
         // Fetch friendly IDs for the pubkeys or fallback to the DB if it takes
         // more than timeout_secs. Whatever is found through the network is
         // cached.
