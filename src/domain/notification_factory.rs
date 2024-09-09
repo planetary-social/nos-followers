@@ -144,8 +144,13 @@ mod tests {
     use nonzero_ext::nonzero;
     use nostr_sdk::prelude::Keys;
     use std::iter::repeat;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::sync::LazyLock;
+    use std::time::Duration;
     use tokio::time::advance;
+
+    static NOW: LazyLock<DateTime<Utc>> = LazyLock::new(|| {
+        DateTime::<Utc>::from_timestamp(Utc::now().timestamp() as i64, 0).unwrap()
+    });
 
     #[test]
     fn test_insert_follow_change() {
@@ -448,7 +453,7 @@ mod tests {
     }
 
     fn seconds_to_datetime(seconds: usize) -> DateTime<Utc> {
-        DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(seconds as u64))
+        NOW.to_utc() + Duration::from_secs(seconds as u64)
     }
 
     fn assert_batches_eq(

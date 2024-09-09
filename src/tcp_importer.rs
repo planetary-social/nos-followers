@@ -19,7 +19,7 @@ pub async fn start_tcp_importer(
         .await
         .context(format!("Error opening TCP listener on port {tcp_port}"))?;
 
-    info!("Listening for jsonl connections on {}", address);
+    info!("Listening for tcp connections on {}", address);
 
     task_tracker.spawn(async move {
         loop {

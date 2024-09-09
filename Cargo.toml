@@ -8,17 +8,12 @@ default-run = "nos_followers"
 name = "nos_followers"
 path = "src/main.rs"
 
-[[bin]]
-name = "jsonl_importer"
-path = "src/bin/jsonl_importer.rs"
-
 [dependencies]
 anyhow = "1.0.86"
 async-trait = "0.1.82"
 axum = "0.7.5"
 cached = { version = "0.53.1", features = ["async"] }
 chrono = { version = "0.4.38", features = ["serde"] }
-clap = { version = "4.5.17", features = ["derive"] }
 config_rs = { version = "0.14", package = "config", features = ["yaml"] }
 futures = "0.3.30"
 gcloud-sdk = { version = "0.25.5", features = ["google-pubsub-v1"] }

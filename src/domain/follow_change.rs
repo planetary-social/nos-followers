@@ -94,7 +94,7 @@ impl fmt::Debug for FollowChange {
                 ChangeType::Unfollowed => "-x->",
             },
             &self.followee.to_hex()[..3],
-            self.followed_at,
+            self.followed_at.to_rfc3339(),
         )
     }
 }

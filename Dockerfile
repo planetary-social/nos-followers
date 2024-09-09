@@ -24,9 +24,8 @@ RUN --mount=type=bind,source=src,target=src \
     --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
-    cargo build --locked --release --bin $APP_NAME --bin jsonl_importer && \
-    cp ./target/release/$APP_NAME /bin/server && \
-    cp ./target/release/jsonl_importer /bin/jsonl_importer
+    cargo build --locked --release --bin $APP_NAME && \
+    cp ./target/release/$APP_NAME /bin/server
 
 ################################################################################
 # Create a new stage for running the application that contains the minimal
@@ -52,7 +51,6 @@ USER appuser
 
 # Copy the executables from the "build" stage.
 COPY --from=build /bin/server /bin/
-COPY --from=build /bin/jsonl_importer /bin/
 
 # Copy any necessary configuration or migration files
 COPY ./migrations /app/migrations

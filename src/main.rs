@@ -153,7 +153,7 @@ async fn start(settings: Settings) -> Result<()> {
         cancellation_token.clone(),
     );
 
-    info!("Starting jsonl listener");
+    info!("Starting tcp listener for jsonl contact streams");
     start_tcp_importer(
         task_tracker.clone(),
         settings.tcp_importer_port,

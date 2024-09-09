@@ -1,16 +1,17 @@
-// Looks for users with more than 100 followers that have too many followers with very few followees
+// Looks for users with more than 50 followers that have too many followers with very few followees
 
-MATCH (suspect:User)-[f:FOLLOWS]->(target:User)
-WITH target, COUNT(DISTINCT suspect) AS num_followers
-WHERE num_followers > 100
-WITH target, num_followers
+MATCH (target:User)
+WHERE target.follower_count > 50
+WITH target, target.follower_count AS num_followers, target.followee_count AS num_followees
 ORDER BY num_followers DESC
-LIMIT 10
-MATCH (suspect:User)-[f:FOLLOWS]->(target:User)
-MATCH (suspect)-[:FOLLOWS]->(others:User)
-WITH target, num_followers, suspect, COUNT(DISTINCT others) AS num_followees
-WHERE num_followees < 3
-WITH target, num_followers, COUNT(DISTINCT suspect) AS num_suspects
-ORDER BY num_suspects DESC
-RETURN target, num_followers, num_suspects
+
+
+// Now find the suspects (followers of target) and check their followee_count
+MATCH (suspect:User)-[f:FOLLOWS]->(target)
+WHERE suspect.followee_count < 4
+WITH target, num_followers, num_followees, COUNT(DISTINCT suspect) AS num_suspects
+WITH target, num_followers, num_followees, num_suspects,
+    TOFLOAT(num_suspects) / TOFLOAT(num_followers) AS suspect_ratio
+ORDER BY suspect_ratio DESC
+RETURN target, num_followers, num_followees, num_suspects, suspect_ratio
 LIMIT 10;

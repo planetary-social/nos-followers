@@ -11,7 +11,6 @@ use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
-use tokio::time::Instant;
 use tracing::{debug, info};
 
 #[derive(Default, Debug)]
@@ -43,6 +42,14 @@ where
             debug!(
                 "Skipping event of kind {:?} for {}",
                 event.kind,
+                event.pubkey.to_bech32().unwrap_or_default()
+            );
+            return Ok(());
+        }
+
+        if probably_inactive_or_spam(&event) {
+            info!(
+                "Skipping event from {} as it's probably spam",
                 event.pubkey.to_bech32().unwrap_or_default()
             );
             return Ok(());
@@ -224,6 +231,7 @@ where
 
 const ONE_DAY_DURATION: Duration = Duration::seconds(60 * 60 * 24);
 const ONE_WEEK_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7);
+const ONE_MONTH_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7 * 4);
 
 /// Heuristics to decide if we should send notifications for a contact list or just update the DB.
 async fn should_send_notifications<T: GetEventsOf>(
@@ -232,12 +240,8 @@ async fn should_send_notifications<T: GetEventsOf>(
     follower: &PublicKey,
     event_created_at: DateTime<Utc>,
 ) -> Result<bool> {
-    // We use tokio instant here so we can easily mock
-    let one_day_ago = (Instant::now() - ONE_DAY_DURATION.to_std()?)
-        .elapsed()
-        .as_secs();
-
-    if (event_created_at.timestamp() as u64) < one_day_ago {
+    let older_than_a_day = older_than_a_day(event_created_at.timestamp() as u64);
+    if older_than_a_day {
         debug!(
             "Event from {} is older than a day {}. Skipping notifications.",
             follower.to_bech32().unwrap_or_default(),
@@ -272,6 +276,45 @@ async fn should_send_notifications<T: GetEventsOf>(
     }
 
     Ok(true)
+}
+
+/// Heuristic to decide whether to skip processing a contact list event.  We
+/// don't skip old lists unless they have one or fewer follows. This is because
+/// we could be running a backfill from the TCP port, so we won't send
+/// notifications in that case, but we still want to process the contact list.
+fn probably_inactive_or_spam(event: &Event) -> bool {
+    if older_than_a_month(event.created_at.as_u64()) {
+        let number_of_p_tags = event
+            .tags()
+            .iter()
+            .filter(|tag| {
+                if let Some(TagStandard::PublicKey { .. }) = tag.as_standardized() {
+                    true
+                } else {
+                    false
+                }
+            })
+            .count();
+
+        return number_of_p_tags < 2;
+    }
+
+    false
+}
+
+fn older_than_a_day(event_created_at_timestamp: u64) -> bool {
+    older_than(event_created_at_timestamp, ONE_DAY_DURATION)
+}
+
+fn older_than_a_month(event_created_at_timestamp: u64) -> bool {
+    older_than(event_created_at_timestamp, ONE_MONTH_DURATION)
+}
+
+fn older_than(event_created_at_timestamp: u64, duration: Duration) -> bool {
+    // We use tokio instant here so we can easily mock
+    let time_ago = (Utc::now() - duration.to_std().unwrap()).timestamp();
+
+    event_created_at_timestamp < time_ago as u64
 }
 
 fn log_line(
@@ -347,10 +390,14 @@ mod tests {
     use nostr_sdk::PublicKey;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::UNIX_EPOCH;
+    use std::sync::LazyLock;
     use tokio::sync::broadcast::channel;
     use tokio::sync::Mutex;
     use tokio::time::sleep;
+
+    static NOW: LazyLock<DateTime<Utc>> = LazyLock::new(|| {
+        DateTime::<Utc>::from_timestamp(Utc::now().timestamp() as i64, 0).unwrap()
+    });
 
     #[derive(Default)]
 
@@ -952,11 +999,7 @@ mod tests {
         Ok(follow_changes_vec)
     }
 
-    fn seconds_to_datetime(seconds: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::from(
-            UNIX_EPOCH
-                + Duration::days(100).to_std().unwrap()
-                + Duration::seconds(seconds).to_std().unwrap(),
-        )
+    fn seconds_to_datetime(seconds: usize) -> DateTime<Utc> {
+        NOW.to_utc() + Duration::seconds(seconds as i64)
     }
 }
