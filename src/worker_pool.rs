@@ -64,7 +64,7 @@ impl WorkerPool {
 
 fn create_dispatcher_task<Item>(
     tracker: &TaskTracker,
-    name: String,
+    pool_name: String,
     mut item_receiver: broadcast::Receiver<Item>,
     worker_txs: Vec<Sender<Item>>,
     cancellation_token: CancellationToken,
@@ -78,31 +78,31 @@ fn create_dispatcher_task<Item>(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
-                    info!("{}: Cancellation cancellation_token is cancelled, stopping worker pool", name);
+                    info!("{}: Cancellation cancellation_token is cancelled, stopping worker pool", pool_name);
                     break;
                 }
 
                 result = item_receiver.recv() => {
                     match result {
                         Ok(item) => {
-                            trace!("{}: Worker pool dispatching item {:?}", name, item);
+                            trace!("{}: Worker pool dispatching item {:?}", pool_name, item);
                             let Some(worker_tx) = worker_txs_cycle.next() else {
-                                error!("{}: Failed to get worker", name);
+                                error!("{}: Failed to get worker", pool_name);
                                 break;
                             };
 
                             if let Err(e) = worker_tx.send(item).await {
-                                error!("{}: Failed to send to worker: {}", name, e);
+                                error!("{}: Failed to send to worker: {}", pool_name, e);
                                 break;
                             }
                         }
                         Err(RecvError::Lagged(n)) => {
-                            metrics::worker_lagged().increment(1);
-                            warn!("{}: Receiver lagged and missed {} messages", name, n);
+                            metrics::worker_lagged(pool_name.to_string()).increment(1);
+                            warn!("{}: Receiver lagged and missed {} messages", pool_name, n);
                         }
                         Err(RecvError::Closed) => {
-                            metrics::worker_closed().increment(1);
-                            error!("{}: Item receiver channel closed", name);
+                            metrics::worker_closed(pool_name.to_string()).increment(1);
+                            error!("{}: Item receiver channel closed", pool_name);
                             break;
                         }
                     }
@@ -111,7 +111,7 @@ fn create_dispatcher_task<Item>(
         }
 
         cancellation_token.cancel();
-        info!("{}: Worker pool finished", name);
+        info!("{}: Worker pool finished", pool_name);
     });
 }
 
@@ -162,10 +162,12 @@ fn create_worker_task<Item, Worker>(
     });
 }
 
+/// The worker task trait that workers must implement to process items.
+/// The same instance will be used for all items so common global state can be shared.
 #[async_trait]
-pub trait WorkerTask<T>
+pub trait WorkerTask<Item>
 where
-    T: Debug + Send + Sync + Clone + 'static,
+    Item: Debug + Send + Sync + Clone + 'static,
 {
-    async fn call(&self, args: T) -> Result<(), Box<dyn Error>>;
+    async fn call(&self, args: Item) -> Result<(), Box<dyn Error>>;
 }
