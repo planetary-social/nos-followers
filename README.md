@@ -19,6 +19,11 @@ Once the server is running, an easy way to test is using nak with kind 3 events 
 nak event -k 3 -t 'p=7286f8fc095cfa1de9b08afcf8adacdccf75e8c337a09407ec713c751202d894' -t 'p=7286f8fc095cfa1de9b08afcf8adacdccf75e8c337a09407ec713c751202d897' ws://localhost:7777
 ```
 
+### Deployment
+
+When changes are pushed to the `main` branch and tests pass, the `latest` Docker image is created, but this does not trigger a deployment.
+To trigger a deployment, promote the `latest` image to `stable` by running `./scripts/tag_latest_as_stable.sh`.
+
 ## Contributing
 Contributions are welcome! Fork the project, submit pull requests, or report issues.
 
