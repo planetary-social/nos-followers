@@ -70,6 +70,7 @@ where
                     "Skipping follow list for {} as it's older than the last update",
                     follower.to_bech32().unwrap_or_default()
                 );
+                metrics::already_seen_contact_lists().increment(1);
                 return Ok(());
             }
         }
@@ -287,13 +288,7 @@ fn probably_inactive_or_spam(event: &Event) -> bool {
         let number_of_p_tags = event
             .tags()
             .iter()
-            .filter(|tag| {
-                if let Some(TagStandard::PublicKey { .. }) = tag.as_standardized() {
-                    true
-                } else {
-                    false
-                }
-            })
+            .filter(|tag| matches!(tag.as_standardized(), Some(TagStandard::PublicKey { .. })))
             .count();
 
         return number_of_p_tags < 2;
@@ -357,13 +352,19 @@ fn log_line(
 
     // Investigate states in which there are no followees but there are unfollowed followees
     if followed_counter == 0 && unfollowed_counter > 0 && unchanged == 0 {
+        metrics::sudden_follow_drops().increment(1);
+
+        if has_nos_agent(event) {
+            metrics::nos_sudden_follow_drops().increment(1);
+        }
+
         return Some(format!(
             "ALL UNFOLLOWED: Npub {}: date {}, {} unfollowed, {} unchanged, {}",
             follower.to_bech32().unwrap_or_default(),
             timestamp_diff,
             unfollowed_counter,
             unchanged,
-            event.as_json()
+            event.as_json(),
         ));
     }
 
@@ -377,6 +378,14 @@ fn log_line(
     ))
 }
 
+fn has_nos_agent(event: &Event) -> bool {
+    event.tags.iter().any(|tag| {
+        let tag_components = tag.as_vec();
+
+        tag_components[0] == "client" && tag_components[1] == "nos"
+    })
+}
+
 fn convert_timestamp(timestamp: u64) -> Result<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(timestamp as i64, 0).ok_or("Invalid timestamp".into())
 }
@@ -388,6 +397,7 @@ mod tests {
     use crate::repo::RepoError;
     use chrono::{Duration, Utc};
     use nostr_sdk::PublicKey;
+    use std::borrow::Cow;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::LazyLock;
@@ -920,6 +930,29 @@ mod tests {
         );
 
         assert_follow_changes(vec![wrong_event], vec![]).await;
+    }
+
+    #[test]
+    fn test_nos_client_tag() {
+        let tag = Tag::custom(TagKind::Custom(Cow::Borrowed("client")), ["foobar"]);
+
+        let keys = Keys::generate();
+        let event_not_matching = EventBuilder::new(Kind::ContactList, "", vec![tag])
+            .to_event(&keys)
+            .unwrap();
+
+        let tag = Tag::custom(TagKind::Custom(Cow::Borrowed("client")), ["nos"]);
+        let event_matching = EventBuilder::new(Kind::ContactList, "", vec![tag])
+            .to_event(&keys)
+            .unwrap();
+
+        let event_with_no_tag = EventBuilder::new(Kind::ContactList, "", vec![])
+            .to_event(&keys)
+            .unwrap();
+
+        assert!(has_nos_agent(&event_matching));
+        assert!(!has_nos_agent(&event_not_matching));
+        assert!(!has_nos_agent(&event_with_no_tag));
     }
 
     async fn assert_follow_changes(contact_events: Vec<Event>, mut expected: Vec<FollowChange>) {

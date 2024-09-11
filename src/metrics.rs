@@ -9,6 +9,18 @@ pub fn contact_lists_processed() -> Counter {
     metrics::counter!("contact_lists_processed")
 }
 
+pub fn already_seen_contact_lists() -> Counter {
+    metrics::counter!("already_seen_contact_lists")
+}
+
+pub fn sudden_follow_drops() -> Counter {
+    metrics::counter!("sudden_follow_drops")
+}
+
+pub fn nos_sudden_follow_drops() -> Counter {
+    metrics::counter!("nos_sudden_follow_drops")
+}
+
 pub fn follows() -> Counter {
     metrics::counter!("follows")
 }
@@ -65,6 +77,18 @@ pub fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
     describe_counter!(
         "contact_lists_processed",
         "Number of contact lists processed"
+    );
+    describe_counter!(
+        "already_seen_contact_lists",
+        "Number of contact lists we have already processed"
+    );
+    describe_counter!(
+        "sudden_follow_drops",
+        "Number of contact lists that got a sudden drop on followees"
+    );
+    describe_counter!(
+        "nos_sudden_follow_drops",
+        "Number of contact lists that got a sudden drop on followees using the Nos agent"
     );
     describe_counter!("follows", "Number of follows");
     describe_counter!("unfollows", "Number of unfollows");
