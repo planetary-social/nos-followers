@@ -32,7 +32,7 @@ RUN --mount=type=bind,source=src,target=src \
 # runtime dependencies for the application. This often uses a different base
 # image from the build stage where the necessary files are copied from the build
 # stage.
-FROM alpine:3.18 AS final
+FROM alpine:3.20 AS final
 
 WORKDIR /app
 
