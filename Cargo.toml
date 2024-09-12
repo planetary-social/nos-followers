@@ -16,7 +16,7 @@ cached = { version = "0.53.1", features = ["async"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 config_rs = { version = "0.14", package = "config", features = ["yaml"] }
 futures = "0.3.30"
-gcloud-sdk = { version = "0.25.5", features = ["google-pubsub-v1"] }
+gcloud-sdk = { version = "0.25.6", features = ["google-pubsub-v1"] }
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
 neo4rs = "0.8.0"
