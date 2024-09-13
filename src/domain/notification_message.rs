@@ -39,20 +39,22 @@ impl NotificationMessage {
         &self.followee
     }
 
-    pub fn add(&mut self, follow_change: FollowChange) {
+    pub fn add(&mut self, follow_change: Box<FollowChange>) {
         assert!(self.followee == follow_change.followee, "Followee mismatch");
+
         assert!(
             self.len() < MAX_FOLLOWERS_PER_BATCH,
             "Too many followers in a single message, can't exceed {}",
             MAX_FOLLOWERS_PER_BATCH
         );
 
-        if follow_change.change_type == ChangeType::Followed {
-            self.follows.insert(follow_change.follower);
-        } else {
-            //TODO typed instead of conditional
-            panic!("Only followed changes are allowed");
-        }
+        assert_eq!(
+            follow_change.change_type,
+            ChangeType::Followed,
+            "Only followed changes can be messaged"
+        );
+
+        self.follows.insert(follow_change.follower);
 
         if self.len() == 1 {
             self.friendly_follower = Some(follow_change.friendly_follower);
@@ -61,7 +63,7 @@ impl NotificationMessage {
         }
     }
 
-    pub fn add_all(&mut self, follow_changes: impl IntoIterator<Item = FollowChange>) {
+    pub fn add_all(&mut self, follow_changes: impl IntoIterator<Item = Box<FollowChange>>) {
         for follow_change in follow_changes {
             self.add(follow_change);
         }
@@ -131,8 +133,8 @@ impl Debug for NotificationMessage {
     }
 }
 
-impl From<FollowChange> for NotificationMessage {
-    fn from(change: FollowChange) -> Self {
+impl From<Box<FollowChange>> for NotificationMessage {
+    fn from(change: Box<FollowChange>) -> Self {
         let mut message = NotificationMessage::new(change.followee);
         message.add(change);
         message
@@ -141,7 +143,7 @@ impl From<FollowChange> for NotificationMessage {
 
 impl<T> From<T> for NotificationMessage
 where
-    T: IntoIterator<Item = FollowChange>,
+    T: IntoIterator<Item = Box<FollowChange>>,
 {
     fn from(changes: T) -> Self {
         let mut changes = changes.into_iter();
@@ -171,7 +173,7 @@ mod tests {
 
         let mut message = NotificationMessage::new(followee1);
 
-        message.add(follower1_follow);
+        message.add(Box::new(follower1_follow));
 
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
@@ -201,16 +203,16 @@ mod tests {
 
         let mut message = NotificationMessage::new(followee1);
 
-        message.add(follower1_follow);
-        message.add(follower2_follow);
-        message.add(follower2_follow2);
-        message.add(follower3_follow);
+        message.add(follower1_follow.into());
+        message.add(follower2_follow.into());
+        message.add(follower2_follow2.into());
+        message.add(follower3_follow.into());
 
         // TODO: This panics on github CI, but not locally. Investigate.
         #[cfg(not(feature = "ci"))]
         {
             let result = std::panic::catch_unwind(|| {
-                NotificationMessage::new(followee1).add(wrong_followee_change)
+                NotificationMessage::new(followee1).add(wrong_followee_change.into())
             });
             assert!(result.is_err());
         }

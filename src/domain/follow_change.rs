@@ -58,6 +58,10 @@ impl FollowChange {
         }
     }
 
+    pub fn is_notifiable(&self) -> bool {
+        matches!(self.change_type, ChangeType::Followed)
+    }
+
     #[cfg(test)]
     pub fn with_friendly_follower(mut self, name: FriendlyId) -> Self {
         self.friendly_follower = name;

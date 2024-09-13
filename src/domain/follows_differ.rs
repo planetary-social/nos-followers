@@ -26,7 +26,7 @@ where
 {
     repo: Arc<T>,
     nostr_client: Arc<U>,
-    follow_change_sender: Sender<FollowChange>,
+    follow_change_sender: Sender<Box<FollowChange>>,
 }
 
 #[async_trait]
@@ -115,7 +115,7 @@ where
     pub fn new(
         repo: Arc<T>,
         nostr_client: Arc<U>,
-        follow_change_sender: Sender<FollowChange>,
+        follow_change_sender: Sender<Box<FollowChange>>,
     ) -> Self {
         Self {
             repo,
@@ -225,7 +225,7 @@ where
     }
 
     fn send_follow_change(&self, follow_change: FollowChange) -> Result<()> {
-        self.follow_change_sender.send(follow_change)?;
+        self.follow_change_sender.send(Box::new(follow_change))?;
         Ok(())
     }
 }
@@ -395,6 +395,7 @@ mod tests {
     use super::*;
     use crate::domain::contact_list_follow::ContactListFollow;
     use crate::repo::RepoError;
+    use assertables::*;
     use chrono::{Duration, Utc};
     use nostr_sdk::PublicKey;
     use std::borrow::Cow;
@@ -955,13 +956,15 @@ mod tests {
         assert!(!has_nos_agent(&event_with_no_tag));
     }
 
-    async fn assert_follow_changes(contact_events: Vec<Event>, mut expected: Vec<FollowChange>) {
+    async fn assert_follow_changes(contact_events: Vec<Event>, expected: Vec<FollowChange>) {
         let follow_changes = get_follow_changes_from_contact_events(contact_events)
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|fc| *fc)
+            .collect::<Vec<FollowChange>>();
 
-        expected.sort(); // Sort the expected follow changes
-        assert_eq!(follow_changes, expected);
+        assert_bag_eq!(follow_changes, expected);
     }
 
     fn create_contact_event(
@@ -1000,7 +1003,7 @@ mod tests {
 
     async fn get_follow_changes_from_contact_events(
         contact_events: Vec<Event>,
-    ) -> Result<Vec<FollowChange>> {
+    ) -> Result<Vec<Box<FollowChange>>> {
         let (follow_change_sender, _) = channel(100);
         let repo = Arc::new(MockRepo::default());
         let follows_differ = FollowsDiffer::new(
@@ -1010,7 +1013,7 @@ mod tests {
         );
 
         let mut follow_change_receiver = follow_change_sender.subscribe();
-        let follow_changes: Arc<Mutex<Vec<FollowChange>>> = Arc::new(Mutex::new(Vec::new()));
+        let follow_changes: Arc<Mutex<Vec<Box<FollowChange>>>> = Arc::new(Mutex::new(Vec::new()));
         let shared_follow_changes = follow_changes.clone();
         let follow_change_task = tokio::spawn(async move {
             loop {

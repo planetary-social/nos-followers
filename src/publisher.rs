@@ -33,7 +33,7 @@ pub trait PublishEvents {
 /// them to Google PubSub after certain time is elapsed or a size threshold is
 /// hit.
 pub struct Publisher {
-    sender: mpsc::Sender<FollowChange>,
+    sender: mpsc::Sender<Box<FollowChange>>,
 }
 
 impl Publisher {
@@ -43,7 +43,7 @@ impl Publisher {
         flush_period_seconds: NonZeroUsize,
         min_seconds_between_messages: NonZeroUsize,
     ) -> Result<Self, PublisherError> {
-        let (publication_sender, mut publication_receiver) = mpsc::channel::<FollowChange>(1);
+        let (publication_sender, mut publication_receiver) = mpsc::channel::<Box<FollowChange>>(1);
 
         let mut buffer = NotificationFactory::new(min_seconds_between_messages);
         tokio::spawn(async move {
@@ -104,8 +104,8 @@ impl Publisher {
 
     pub async fn queue_publication(
         &self,
-        follow_change: FollowChange,
-    ) -> Result<(), SendError<FollowChange>> {
+        follow_change: Box<FollowChange>,
+    ) -> Result<(), SendError<Box<FollowChange>>> {
         self.sender.send(follow_change).await
     }
 }
@@ -176,38 +176,50 @@ mod tests {
         let followee2_pubkey = Keys::generate().public_key();
 
         publisher
-            .queue_publication(FollowChange::new_followed(
-                seconds_to_datetime(1),
-                follower_pubkey,
-                followee1_pubkey,
-            ))
+            .queue_publication(
+                FollowChange::new_followed(
+                    seconds_to_datetime(1),
+                    follower_pubkey,
+                    followee1_pubkey,
+                )
+                .into(),
+            )
             .await
             .unwrap();
 
         publisher
-            .queue_publication(FollowChange::new_unfollowed(
-                seconds_to_datetime(1),
-                follower_pubkey,
-                followee2_pubkey,
-            ))
+            .queue_publication(
+                FollowChange::new_unfollowed(
+                    seconds_to_datetime(1),
+                    follower_pubkey,
+                    followee2_pubkey,
+                )
+                .into(),
+            )
             .await
             .unwrap();
 
         publisher
-            .queue_publication(FollowChange::new_followed(
-                seconds_to_datetime(2),
-                follower_pubkey,
-                followee2_pubkey,
-            ))
+            .queue_publication(
+                FollowChange::new_followed(
+                    seconds_to_datetime(2),
+                    follower_pubkey,
+                    followee2_pubkey,
+                )
+                .into(),
+            )
             .await
             .unwrap();
 
         publisher
-            .queue_publication(FollowChange::new_unfollowed(
-                seconds_to_datetime(3),
-                follower_pubkey,
-                followee2_pubkey,
-            ))
+            .queue_publication(
+                FollowChange::new_unfollowed(
+                    seconds_to_datetime(3),
+                    follower_pubkey,
+                    followee2_pubkey,
+                )
+                .into(),
+            )
             .await
             .unwrap();
 
@@ -216,10 +228,12 @@ mod tests {
         let events = published_events.lock().await;
         assert_bag_eq!(
             events.clone(),
-            [NotificationMessage::from(FollowChange::new_followed(
-                seconds_to_datetime(1),
-                follower_pubkey,
-                followee1_pubkey
+            [NotificationMessage::from(Box::new(
+                FollowChange::new_followed(
+                    seconds_to_datetime(1),
+                    follower_pubkey,
+                    followee1_pubkey
+                )
             ))]
         );
     }
@@ -250,20 +264,26 @@ mod tests {
         let followee2_pubkey = Keys::generate().public_key();
 
         publisher
-            .queue_publication(FollowChange::new_followed(
-                seconds_to_datetime(2),
-                follower_pubkey,
-                followee1_pubkey,
-            ))
+            .queue_publication(
+                FollowChange::new_followed(
+                    seconds_to_datetime(2),
+                    follower_pubkey,
+                    followee1_pubkey,
+                )
+                .into(),
+            )
             .await
             .unwrap();
 
         publisher
-            .queue_publication(FollowChange::new_unfollowed(
-                seconds_to_datetime(1),
-                follower_pubkey,
-                followee2_pubkey,
-            ))
+            .queue_publication(
+                FollowChange::new_unfollowed(
+                    seconds_to_datetime(1),
+                    follower_pubkey,
+                    followee2_pubkey,
+                )
+                .into(),
+            )
             .await
             .unwrap();
 
@@ -272,10 +292,12 @@ mod tests {
         let events = published_events.lock().await;
         assert_bag_eq!(
             events.clone(),
-            [NotificationMessage::from(FollowChange::new_followed(
-                seconds_to_datetime(2),
-                follower_pubkey,
-                followee1_pubkey,
+            [NotificationMessage::from(Box::new(
+                FollowChange::new_followed(
+                    seconds_to_datetime(2),
+                    follower_pubkey,
+                    followee1_pubkey,
+                )
             )),],
         );
     }
@@ -306,11 +328,11 @@ mod tests {
 
         // Queue up follow changes
         publisher
-            .queue_publication(FollowChange::new_followed(
+            .queue_publication(Box::new(FollowChange::new_followed(
                 seconds_to_datetime(1),
                 follower_pubkey,
                 followee_pubkey,
-            ))
+            )))
             .await
             .unwrap();
 

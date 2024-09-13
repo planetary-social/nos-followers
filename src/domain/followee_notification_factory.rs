@@ -1,4 +1,4 @@
-use super::{ChangeType, FollowChange, NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
+use super::{FollowChange, NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
 use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
 use std::fmt::Debug;
@@ -9,7 +9,7 @@ type Follower = PublicKey;
 type Followee = PublicKey;
 
 pub struct FolloweeNotificationFactory {
-    pub follow_changes: OrderMap<Follower, FollowChange>,
+    pub follow_changes: OrderMap<Follower, Box<FollowChange>>,
     pub followee: Option<Followee>,
     min_time_between_messages: Duration,
     emptied_at: Option<Instant>,
@@ -25,7 +25,7 @@ impl FolloweeNotificationFactory {
         }
     }
 
-    pub fn insert(&mut self, follow_change: FollowChange) {
+    pub fn insert(&mut self, follow_change: Box<FollowChange>) {
         match &self.followee {
             Some(followee) => {
                 assert_eq!(
@@ -71,17 +71,14 @@ impl FolloweeNotificationFactory {
         self.follow_changes.is_empty() && self.should_flush()
     }
 
-    pub fn no_followers(&self) -> bool {
-        !self
-            .follow_changes
-            .iter()
-            .any(|(_, v)| matches!(v.change_type, ChangeType::Followed))
+    pub fn no_notifiables(&self) -> bool {
+        !self.follow_changes.iter().any(|(_, v)| v.is_notifiable())
     }
 
     // Only followers are accumulated into messages, unfollowers are not, but
     // all of them are drained
     pub fn flush(&mut self) -> Vec<NotificationMessage> {
-        if self.no_followers() {
+        if self.no_notifiables() {
             return vec![];
         }
 
@@ -92,8 +89,8 @@ impl FolloweeNotificationFactory {
                 .follow_changes
                 .drain(..)
                 .map(|(_, v)| v)
-                .filter(|v| matches!(v.change_type, ChangeType::Followed))
-                .collect::<Vec<FollowChange>>()
+                .filter(|v| v.is_notifiable())
+                .collect::<Vec<Box<FollowChange>>>()
                 .chunks(MAX_FOLLOWERS_PER_BATCH)
                 .map(|batch| batch.to_vec().into())
                 .collect();

@@ -33,7 +33,7 @@ impl NotificationFactory {
         }
     }
 
-    pub fn insert(&mut self, follow_change: FollowChange) {
+    pub fn insert(&mut self, follow_change: Box<FollowChange>) {
         let followee_info = self
             .followee_maps
             .entry(follow_change.followee)
@@ -159,10 +159,10 @@ mod tests {
         let followee = Keys::generate().public_key();
 
         let change1 = create_follow_change(follower, followee, seconds_to_datetime(1));
-        notification_factory.insert(change1);
+        notification_factory.insert(change1.into());
 
         let change2 = create_follow_change(follower, followee, seconds_to_datetime(1));
-        notification_factory.insert(change2.clone());
+        notification_factory.insert(change2.into());
 
         // When they share the same time, the last change added should be kept
         let messages = notification_factory.flush();
@@ -179,10 +179,10 @@ mod tests {
         let followee = Keys::generate().public_key();
 
         let newer_change = create_follow_change(follower, followee, seconds_to_datetime(2));
-        notification_factory.insert(newer_change.clone());
+        notification_factory.insert(newer_change.into());
 
         let older_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
-        notification_factory.insert(older_change);
+        notification_factory.insert(older_change.into());
 
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 1);
@@ -200,16 +200,16 @@ mod tests {
         let change1 = create_follow_change(follower, followee1, seconds_to_datetime(2));
         let change2 = create_follow_change(follower, followee2, seconds_to_datetime(1));
 
-        notification_factory.insert(change1.clone());
-        notification_factory.insert(change2.clone());
+        notification_factory.insert(change1.clone().into());
+        notification_factory.insert(change2.clone().into());
 
         let mut messages = notification_factory.flush();
         // Both changes should be kept since they have different followees
         assert_eq!(
             messages.sort(),
             [
-                NotificationMessage::from(change1.clone()),
-                NotificationMessage::from(change2.clone())
+                NotificationMessage::from(Box::new(change1)),
+                NotificationMessage::from(Box::new(change2))
             ]
             .sort()
         );
@@ -225,8 +225,8 @@ mod tests {
         let follow_change = create_follow_change(follower, followee, seconds_to_datetime(1));
         let unfollow_change = create_unfollow_change(follower, followee, seconds_to_datetime(2));
 
-        notification_factory.insert(follow_change.clone());
-        notification_factory.insert(unfollow_change.clone());
+        notification_factory.insert(follow_change.into());
+        notification_factory.insert(unfollow_change.into());
 
         // The unfollow should cancel the follow
         assert_eq!(notification_factory.flush(), []);
@@ -241,8 +241,8 @@ mod tests {
         let unfollow_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
         let follow_change = create_follow_change(follower, followee, seconds_to_datetime(2));
 
-        notification_factory.insert(unfollow_change.clone());
-        notification_factory.insert(follow_change.clone());
+        notification_factory.insert(unfollow_change.into());
+        notification_factory.insert(follow_change.into());
 
         // The follow should cancel the unfollow
         assert_eq!(notification_factory.flush(), []);
@@ -458,7 +458,7 @@ mod tests {
         follower: PublicKey,
     ) -> FollowChange {
         let change = create_follow_change(follower, followee, seconds_to_datetime(1));
-        notification_factory.insert(change.clone());
+        notification_factory.insert(change.clone().into());
         change
     }
 
@@ -470,23 +470,13 @@ mod tests {
         insert_follower(notification_factory, followee, follower)
     }
 
-    fn insert_unfollower(
-        notification_factory: &mut NotificationFactory,
-        followee: PublicKey,
-        follower: PublicKey,
-    ) -> FollowChange {
-        let change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
-        notification_factory.insert(change.clone());
-        change
-    }
-
     fn insert_new_unfollower<'a>(
         notification_factory: &mut NotificationFactory,
         followee: PublicKey,
     ) -> FollowChange {
         let follower = Keys::generate().public_key();
         let change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
-        notification_factory.insert(change.clone());
+        notification_factory.insert(change.clone().into());
         change
     }
 
@@ -513,7 +503,8 @@ mod tests {
         let mut expected_batches = Vec::new();
 
         for (_, changes) in expected {
-            let batch: NotificationMessage = (*changes).to_vec().into();
+            let batch: NotificationMessage =
+                (*changes).to_vec().into_iter().map(|fc| fc.into()).into();
             expected_batches.push(batch);
         }
 

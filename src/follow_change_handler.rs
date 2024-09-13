@@ -52,8 +52,8 @@ where
 }
 
 #[async_trait]
-impl<T: GetEventsOf> WorkerTask<FollowChange> for FollowChangeHandler<T> {
-    async fn call(&self, mut follow_change: FollowChange) -> Result<(), Box<dyn Error>> {
+impl<T: GetEventsOf> WorkerTask<Box<FollowChange>> for FollowChangeHandler<T> {
+    async fn call(&self, mut follow_change: Box<FollowChange>) -> Result<(), Box<dyn Error>> {
         // Fetch friendly IDs for the pubkeys or fallback to the DB if it takes
         // more than timeout_secs. Whatever is found through the network is
         // cached.

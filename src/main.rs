@@ -97,7 +97,7 @@ async fn start(settings: Settings) -> Result<()> {
     info!("Initializing workers for follower list diff calculation");
     let shared_nostr_client = Arc::new(create_client());
     let (follow_change_sender, _) =
-        broadcast::channel::<FollowChange>(settings.follow_change_channel_size.get());
+        broadcast::channel::<Box<FollowChange>>(settings.follow_change_channel_size.get());
     let follows_differ_worker = FollowsDiffer::new(
         repo.clone(),
         shared_nostr_client.clone(),
