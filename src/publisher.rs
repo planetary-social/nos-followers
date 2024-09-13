@@ -66,7 +66,7 @@ impl Publisher {
                         if !buffer.is_empty() {
                             debug!("Time based threshold of {} seconds reached, publishing buffer", flush_period_seconds);
 
-                            if let Err(e) = client.publish_events(buffer.drain_into_messages()).await {
+                            if let Err(e) = client.publish_events(buffer.flush()).await {
                                 match &e {
                                     // We've seen this happen sporadically, we don't neet to kill the look in this situation
                                     PublisherError::PublishError => {
@@ -216,20 +216,11 @@ mod tests {
         let events = published_events.lock().await;
         assert_bag_eq!(
             events.clone(),
-            [
-                NotificationMessage::from(FollowChange::new_followed(
-                    seconds_to_datetime(1),
-                    follower_pubkey,
-                    followee1_pubkey
-                )),
-                // The second follow change for the same followee should have collapsed
-                // to a single change. We only keep the last one
-                NotificationMessage::from(FollowChange::new_unfollowed(
-                    seconds_to_datetime(2),
-                    follower_pubkey,
-                    followee2_pubkey
-                ))
-            ]
+            [NotificationMessage::from(FollowChange::new_followed(
+                seconds_to_datetime(1),
+                follower_pubkey,
+                followee1_pubkey
+            ))]
         );
     }
 
@@ -281,18 +272,11 @@ mod tests {
         let events = published_events.lock().await;
         assert_bag_eq!(
             events.clone(),
-            [
-                NotificationMessage::from(FollowChange::new_followed(
-                    seconds_to_datetime(2),
-                    follower_pubkey,
-                    followee1_pubkey,
-                )),
-                NotificationMessage::from(FollowChange::new_unfollowed(
-                    seconds_to_datetime(1),
-                    follower_pubkey,
-                    followee2_pubkey,
-                ))
-            ],
+            [NotificationMessage::from(FollowChange::new_followed(
+                seconds_to_datetime(2),
+                follower_pubkey,
+                followee1_pubkey,
+            )),],
         );
     }
 

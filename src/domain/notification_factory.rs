@@ -48,18 +48,18 @@ impl NotificationFactory {
     /// objects, which essentially map to push notifications. We don't send more
     /// often than min_time_between_messages unless pending changes don't fit in
     /// a single batched message.
-    pub fn drain_into_messages(&mut self) -> Vec<NotificationMessage> {
+    pub fn flush(&mut self) -> Vec<NotificationMessage> {
         let initial_follow_changes_len = self.follow_changes_len();
         let initial_followees_len = self.followees_len();
 
         let messages = self
             .followee_maps
             .iter_mut()
-            .flat_map(|(_, followee_info)| followee_info.flush())
+            .flat_map(|(_, followee_factory)| followee_factory.flush())
             .collect::<Vec<_>>();
 
         self.followee_maps
-            .retain(|_, followee_info| !followee_info.should_delete());
+            .retain(|_, followee_factory| !followee_factory.should_delete());
 
         let follow_changes_len = self.follow_changes_len();
         record_metrics(&messages, follow_changes_len);
@@ -166,7 +166,7 @@ mod tests {
         notification_factory.insert(change2.clone());
 
         // When they share the same time, the last change added should be kept
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_message_eq(message, &followee, [follower], &[]);
@@ -185,7 +185,7 @@ mod tests {
         let older_change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
         notification_factory.insert(older_change);
 
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
         assert_eq!(messages.len(), 1);
         assert_message_eq(&messages[0], &followee, [follower], &[]);
     }
@@ -204,7 +204,7 @@ mod tests {
         notification_factory.insert(change1.clone());
         notification_factory.insert(change2.clone());
 
-        let mut messages = notification_factory.drain_into_messages();
+        let mut messages = notification_factory.flush();
         // Both changes should be kept since they have different followees
         assert_eq!(
             messages.sort(),
@@ -230,7 +230,7 @@ mod tests {
         notification_factory.insert(unfollow_change.clone());
 
         // The unfollow should cancel the follow
-        assert_eq!(notification_factory.drain_into_messages(), []);
+        assert_eq!(notification_factory.flush(), []);
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod tests {
         notification_factory.insert(follow_change.clone());
 
         // The follow should cancel the unfollow
-        assert_eq!(notification_factory.drain_into_messages(), []);
+        assert_eq!(notification_factory.flush(), []);
     }
 
     #[test]
@@ -257,11 +257,11 @@ mod tests {
 
         let followee = Keys::generate().public_key();
 
-        let change1 = insert_change(&mut notification_factory, followee);
-        let change2 = insert_change(&mut notification_factory, followee);
-        let change3 = insert_change(&mut notification_factory, followee);
+        let change1 = insert_new_follower(&mut notification_factory, followee);
+        let change2 = insert_new_follower(&mut notification_factory, followee);
+        let change3 = insert_new_follower(&mut notification_factory, followee);
 
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
 
         assert_batches_eq(&messages, &[(followee, &[change1, change2, change3])]);
         assert_eq!(notification_factory.follow_changes_len(), 0);
@@ -276,18 +276,18 @@ mod tests {
 
         let followee = Keys::generate().public_key();
 
-        let change1 = insert_change(&mut notification_factory, followee);
+        let change1 = insert_new_follower(&mut notification_factory, followee);
 
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
         assert_batches_eq(&messages, &[(followee, &[change1])]);
 
-        let change2 = insert_change(&mut notification_factory, followee);
-        let change3 = insert_change(&mut notification_factory, followee);
+        let change2 = insert_new_follower(&mut notification_factory, followee);
+        let change3 = insert_new_follower(&mut notification_factory, followee);
 
         advance(Duration::from_secs(1)).await;
 
         // We hit the limit so the rest of the messages are retained
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
         assert_batches_eq(&messages, &[]);
         assert_eq!(notification_factory.follow_changes_len(), 2);
 
@@ -296,7 +296,7 @@ mod tests {
             min_seconds_between_messages.get() as u64 * 60,
         ))
         .await;
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
         assert_batches_eq(&messages, &[(followee, &[change2, change3])]);
     }
 
@@ -309,19 +309,19 @@ mod tests {
         let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
 
         let followee = Keys::generate().public_key();
-        insert_change(&mut notification_factory, followee);
-        let messages = notification_factory.drain_into_messages();
+        insert_new_follower(&mut notification_factory, followee);
+        let messages = notification_factory.flush();
         advance(Duration::from_secs(1)).await;
         // Sent and hit the rate limit
         assert_eq!(messages.len(), 1,);
         assert!(messages[0].is_single());
 
         repeat(()).take(MAX_FOLLOWERS_TRIPLED).for_each(|_| {
-            insert_change(&mut notification_factory, followee);
+            insert_new_follower(&mut notification_factory, followee);
         });
 
         // All inserted MAX_FOLLOWERS_TRIPLED changes wait for next available flush time
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
         assert_eq!(messages.len(), 0);
         assert_eq!(
             notification_factory.follow_changes_len(),
@@ -335,14 +335,14 @@ mod tests {
         .await;
 
         // .. we insert another change
-        insert_change(&mut notification_factory, followee);
+        insert_new_follower(&mut notification_factory, followee);
 
         assert_eq!(
             notification_factory.follow_changes_len(),
             MAX_FOLLOWERS_TRIPLED + 1,
         );
 
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
 
         // But it will be included in the next batch anyways, regardless of the rate limit
         assert_eq!(messages.len(), 4);
@@ -352,12 +352,12 @@ mod tests {
         assert_eq!(messages[3].len(), 1);
 
         // And another change arrives
-        insert_change(&mut notification_factory, followee);
+        insert_new_follower(&mut notification_factory, followee);
 
         // And another one for a different followee
-        insert_change(&mut notification_factory, Keys::generate().public_key());
+        insert_new_follower(&mut notification_factory, Keys::generate().public_key());
 
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
         // The new one is flushed, the old one is retained
         assert_eq!(messages.len(), 1);
         assert_eq!(notification_factory.follow_changes_len(), 1);
@@ -366,7 +366,7 @@ mod tests {
             min_seconds_between_messages.get() as u64 * 60 + 1,
         ))
         .await;
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
 
         // Now all are flushed
         assert_eq!(messages.len(), 1);
@@ -381,7 +381,7 @@ mod tests {
             min_seconds_between_messages.get() as u64 * 60 + 1,
         ))
         .await;
-        let messages = notification_factory.drain_into_messages();
+        let messages = notification_factory.flush();
 
         // Now all is cleared
         assert_eq!(notification_factory.follow_changes_len(), 0);
@@ -400,39 +400,93 @@ mod tests {
         assert_eq!(notification_factory.follow_changes_len(), 0);
         assert_eq!(notification_factory.followees_len(), 0);
 
-        insert_change(&mut notification_factory, followee1);
-        insert_change(&mut notification_factory, followee2);
-        insert_change(&mut notification_factory, followee2);
+        insert_new_follower(&mut notification_factory, followee1);
+        insert_new_follower(&mut notification_factory, followee2);
+        insert_new_follower(&mut notification_factory, followee2);
 
         assert!(!notification_factory.is_empty());
         assert_eq!(notification_factory.follow_changes_len(), 3);
         assert_eq!(notification_factory.followees_len(), 2);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_unfollows_are_not_sent() {
+        let min_seconds_between_messages = nonzero!(60usize);
+        let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
+
+        let followee = Keys::generate().public_key();
+
+        insert_new_follower(&mut notification_factory, followee.clone());
+
+        advance(Duration::from_secs(
+            min_seconds_between_messages.get() as u64 * 60 + 1,
+        ))
+        .await;
+
+        let messages = notification_factory.flush();
+        assert_eq!(messages.len(), 1);
+
+        insert_new_unfollower(&mut notification_factory, followee);
+
+        advance(Duration::from_secs(
+            min_seconds_between_messages.get() as u64 * 60 + 1,
+        ))
+        .await;
+
+        let messages = notification_factory.flush();
+        assert_eq!(messages.len(), 0);
+    }
+
     #[test]
-    fn test_drain_clears_map() {
+    fn test_flush_clears_map() {
         let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
-        let change1 = create_follow_change(follower, followee, seconds_to_datetime(2));
-        notification_factory.insert(change1);
+        insert_follower(&mut notification_factory, followee, follower);
+        insert_follower(&mut notification_factory, followee, follower);
 
-        let change2 = create_follow_change(follower, followee, seconds_to_datetime(1));
-        notification_factory.insert(change2);
+        let messages = notification_factory.flush();
 
-        let changes = notification_factory.drain_into_messages();
-        assert_eq!(changes.len(), 1);
-        assert_message_eq(&changes[0], &followee, [follower], &[])
+        assert_eq!(messages.len(), 1);
+        assert_message_eq(&messages[0], &followee, [follower], &[])
     }
 
-    fn insert_change(
+    fn insert_follower(
+        notification_factory: &mut NotificationFactory,
+        followee: PublicKey,
+        follower: PublicKey,
+    ) -> FollowChange {
+        let change = create_follow_change(follower, followee, seconds_to_datetime(1));
+        notification_factory.insert(change.clone());
+        change
+    }
+
+    fn insert_new_follower(
         notification_factory: &mut NotificationFactory,
         followee: PublicKey,
     ) -> FollowChange {
         let follower = Keys::generate().public_key();
-        let change = create_follow_change(follower, followee, seconds_to_datetime(1));
+        insert_follower(notification_factory, followee, follower)
+    }
+
+    fn insert_unfollower(
+        notification_factory: &mut NotificationFactory,
+        followee: PublicKey,
+        follower: PublicKey,
+    ) -> FollowChange {
+        let change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
+        notification_factory.insert(change.clone());
+        change
+    }
+
+    fn insert_new_unfollower<'a>(
+        notification_factory: &mut NotificationFactory,
+        followee: PublicKey,
+    ) -> FollowChange {
+        let follower = Keys::generate().public_key();
+        let change = create_unfollow_change(follower, followee, seconds_to_datetime(1));
         notification_factory.insert(change.clone());
         change
     }

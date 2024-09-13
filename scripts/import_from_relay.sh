@@ -1,9 +1,15 @@
 #!/bin/bash
+#
 
-# Requires nak and moreutils (pee)
+# Requires nak
 
 if [ -z "$1" ]; then
-  echo "Usage: $0 <relay_url> [seconds_to_wait]"
+  echo "A tool to paginate events and store them for future restarts from the last position it could read."
+  echo "It includes a filter to detect spam and can exponentially skip events if stuck at a certain timestamp."
+  echo "Usage:"
+  echo "  To send to followers via TCP port: $0 <relay_url> [seconds_to_wait] | nc localhost 3001"
+  echo "  Or send to a specific relay:       $0 <relay_url> [seconds_to_wait] | nak event -qq relay.nos.social"
+
   exit 1
 fi
 
@@ -62,22 +68,18 @@ while true; do
     until_option=""
   fi
 
-  echo "Iteration starting at: $current_date"
+  echo "Iteration starting" >&2
 
-  nak req -k 3 $until_option --paginate --paginate-interval ${wait_seconds}s "$relay_url" \
-    | filter_events \
-    | tee >(record_created_at) \
-    | nc localhost 3001
+  nak req -k 3 $until_option --paginate --paginate-interval ${wait_seconds}s "$relay_url" | filter_events | tee >(record_created_at) >&1
 
 
   previous_date="$current_date"
   current_date=$(cat "$created_at_file")
 
   if [ "$current_date" == "$previous_date" ] && [ "$last_p_value" == "$previous_p_value" ]; then
-    echo "Reducing time by $decrease_secs seconds"
+    echo "Reducing time by $decrease_secs seconds" >&2
 
     current_date=$((current_date - decrease_secs))
-    echo "$current_date" > "$created_at_file"
     decrease_secs=$((decrease_secs * 2))
   else
     decrease_secs=2
