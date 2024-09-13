@@ -17,8 +17,6 @@ pub const MAX_FOLLOWERS_PER_BATCH: usize = 58;
 pub struct NotificationMessage {
     #[serde(serialize_with = "serialize_as_vec_of_npubs")]
     follows: OrderSet<PublicKey>,
-    #[serde(serialize_with = "serialize_as_vec_of_npubs")]
-    unfollows: OrderSet<PublicKey>,
     #[serde(serialize_with = "serialize_as_npub")]
     followee: PublicKey,
     friendly_follower: Option<FriendlyId>,
@@ -28,7 +26,6 @@ impl NotificationMessage {
     pub fn new(followee: PublicKey) -> Self {
         Self {
             follows: OrderSet::new(),
-            unfollows: OrderSet::new(),
             friendly_follower: None,
             followee,
         }
@@ -36,10 +33,6 @@ impl NotificationMessage {
 
     pub fn follows(&self) -> &OrderSet<PublicKey> {
         &self.follows
-    }
-
-    pub fn unfollows(&self) -> &OrderSet<PublicKey> {
-        &self.unfollows
     }
 
     pub fn followee(&self) -> &PublicKey {
@@ -57,7 +50,8 @@ impl NotificationMessage {
         if follow_change.change_type == ChangeType::Followed {
             self.follows.insert(follow_change.follower);
         } else {
-            self.unfollows.insert(follow_change.follower);
+            //TODO typed instead of conditional
+            panic!("Only followed changes are allowed");
         }
 
         if self.len() == 1 {
@@ -74,7 +68,7 @@ impl NotificationMessage {
     }
 
     pub fn len(&self) -> usize {
-        self.follows.len() + self.unfollows.len()
+        self.follows.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -124,14 +118,6 @@ impl Debug for NotificationMessage {
                 "follows",
                 &self
                     .follows
-                    .iter()
-                    .map(|pk| pk.to_hex().chars().take(10).collect::<String>())
-                    .collect::<Vec<String>>(),
-            )
-            .field(
-                "unfollows",
-                &self
-                    .unfollows
                     .iter()
                     .map(|pk| pk.to_hex().chars().take(10).collect::<String>())
                     .collect::<Vec<String>>(),
@@ -190,7 +176,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
             format!(
-                r#"{{"follows":["{}"],"unfollows":[],"followee":"{}","friendlyFollower":"Alice"}}"#,
+                r#"{{"follows":["{}"],"followee":"{}","friendlyFollower":"Alice"}}"#,
                 follower1.to_bech32().unwrap(), // Follow
                 followee1.to_bech32().unwrap(),
             )
@@ -211,7 +197,6 @@ mod tests {
         let follower2_follow = FollowChange::new_followed(Utc::now(), follower2, followee1);
         let follower2_follow2 = FollowChange::new_followed(Utc::now(), follower2, followee1);
         let follower3_follow = FollowChange::new_followed(Utc::now(), follower3, followee1);
-        let follower4_unfollow = FollowChange::new_unfollowed(Utc::now(), follower4, followee1);
         let wrong_followee_change = FollowChange::new_followed(Utc::now(), follower4, followee2);
 
         let mut message = NotificationMessage::new(followee1);
@@ -220,7 +205,6 @@ mod tests {
         message.add(follower2_follow);
         message.add(follower2_follow2);
         message.add(follower3_follow);
-        message.add(follower4_unfollow);
 
         // TODO: This panics on github CI, but not locally. Investigate.
         #[cfg(not(feature = "ci"))]
@@ -234,11 +218,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&message).unwrap(),
             format!(
-                r#"{{"follows":["{}","{}","{}"],"unfollows":["{}"],"followee":"{}","friendlyFollower":null}}"#,
+                r#"{{"follows":["{}","{}","{}"],"followee":"{}","friendlyFollower":null}}"#,
                 follower1.to_bech32().unwrap(), // Follow
                 follower2.to_bech32().unwrap(), // Follow
                 follower3.to_bech32().unwrap(), // Follow
-                follower4.to_bech32().unwrap(), // Unfollow
                 followee1.to_bech32().unwrap(),
             )
         );

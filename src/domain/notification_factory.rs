@@ -127,7 +127,6 @@ fn record_metrics(messages: &[NotificationMessage], retained_follow_changes: usi
         }
 
         metrics::followers_per_message().record(message.follows().len() as f64);
-        metrics::unfollowers_per_message().record(message.unfollows().len() as f64);
     }
 
     metrics::individual_follow_messages().increment(individual_follow_changes as u64);
@@ -169,7 +168,7 @@ mod tests {
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
-        assert_message_eq(message, &followee, [follower], &[]);
+        assert_message_eq(message, &followee, [follower]);
     }
 
     #[test]
@@ -187,7 +186,7 @@ mod tests {
 
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 1);
-        assert_message_eq(&messages[0], &followee, [follower], &[]);
+        assert_message_eq(&messages[0], &followee, [follower]);
     }
 
     #[test]
@@ -450,7 +449,7 @@ mod tests {
         let messages = notification_factory.flush();
 
         assert_eq!(messages.len(), 1);
-        assert_message_eq(&messages[0], &followee, [follower], &[])
+        assert_message_eq(&messages[0], &followee, [follower])
     }
 
     fn insert_follower(
@@ -495,15 +494,12 @@ mod tests {
         message: &NotificationMessage,
         followee: &PublicKey,
         follows: impl AsRef<[PublicKey]>,
-        unfollows: impl AsRef<[PublicKey]>,
     ) {
         assert_eq!(message.followee(), followee);
 
         let follows_vec: Vec<PublicKey> = message.follows().iter().cloned().collect();
-        let unfollows_vec: Vec<PublicKey> = message.unfollows().iter().cloned().collect();
 
         assert_bag_eq!(follows_vec, follows.as_ref());
-        assert_bag_eq!(unfollows_vec, unfollows.as_ref());
     }
 
     fn seconds_to_datetime(seconds: usize) -> DateTime<Utc> {
