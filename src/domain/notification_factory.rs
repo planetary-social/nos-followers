@@ -36,7 +36,7 @@ impl NotificationFactory {
     pub fn insert(&mut self, follow_change: Box<FollowChange>) {
         let followee_info = self
             .followee_maps
-            .entry(follow_change.followee)
+            .entry(*follow_change.followee())
             .or_insert_with_key(|_| {
                 FolloweeNotificationFactory::new(self.min_time_between_messages)
             });

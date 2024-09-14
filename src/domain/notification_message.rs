@@ -1,4 +1,4 @@
-use super::{ChangeType, FollowChange};
+use super::FollowChange;
 use crate::account_info::FriendlyId;
 use nostr_sdk::prelude::*;
 use ordermap::OrderSet;
@@ -40,7 +40,10 @@ impl NotificationMessage {
     }
 
     pub fn add(&mut self, follow_change: Box<FollowChange>) {
-        assert!(self.followee == follow_change.followee, "Followee mismatch");
+        assert!(
+            self.followee == *follow_change.followee(),
+            "Followee mismatch"
+        );
 
         assert!(
             self.len() < MAX_FOLLOWERS_PER_BATCH,
@@ -48,16 +51,15 @@ impl NotificationMessage {
             MAX_FOLLOWERS_PER_BATCH
         );
 
-        assert_eq!(
-            follow_change.change_type,
-            ChangeType::Followed,
+        assert!(
+            follow_change.is_notifiable(),
             "Only followed changes can be messaged"
         );
 
-        self.follows.insert(follow_change.follower);
+        self.follows.insert(*follow_change.follower());
 
         if self.len() == 1 {
-            self.friendly_follower = Some(follow_change.friendly_follower);
+            self.friendly_follower = Some(follow_change.friendly_follower().clone());
         } else {
             self.friendly_follower = None;
         }
@@ -135,7 +137,7 @@ impl Debug for NotificationMessage {
 
 impl From<Box<FollowChange>> for NotificationMessage {
     fn from(change: Box<FollowChange>) -> Self {
-        let mut message = NotificationMessage::new(change.followee);
+        let mut message = NotificationMessage::new(*change.followee());
         message.add(change);
         message
     }

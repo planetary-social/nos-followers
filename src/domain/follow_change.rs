@@ -13,13 +13,14 @@ pub enum ChangeType {
 /// A change in the follow relationship between two users.
 #[derive(Clone, PartialOrd, Ord)]
 pub struct FollowChange {
-    pub change_type: ChangeType,
-    pub followed_at: DateTime<Utc>,
-    pub follower: PublicKey,
-    pub friendly_follower: FriendlyId,
-    pub followee: PublicKey,
-    pub friendly_followee: FriendlyId,
+    change_type: ChangeType,
+    followed_at: DateTime<Utc>,
+    follower: PublicKey,
+    friendly_follower: FriendlyId,
+    followee: PublicKey,
+    friendly_followee: FriendlyId,
 }
+
 impl PartialEq for FollowChange {
     fn eq(&self, other: &Self) -> bool {
         self.change_type == other.change_type
@@ -58,8 +59,46 @@ impl FollowChange {
         }
     }
 
+    pub fn follower(&self) -> &PublicKey {
+        &self.follower
+    }
+
+    pub fn followee(&self) -> &PublicKey {
+        &self.followee
+    }
+
+    pub fn friendly_follower(&self) -> &FriendlyId {
+        &self.friendly_follower
+    }
+
+    pub fn set_friendly_follower(&mut self, name: FriendlyId) {
+        self.friendly_follower = name;
+    }
+
+    pub fn friendly_followee(&self) -> &FriendlyId {
+        &self.friendly_followee
+    }
+
+    pub fn set_friendly_followee(&mut self, name: FriendlyId) {
+        self.friendly_followee = name;
+    }
+
     pub fn is_notifiable(&self) -> bool {
         matches!(self.change_type, ChangeType::Followed)
+    }
+
+    pub fn is_older_than(&self, other: &Self) -> bool {
+        assert!(self.follower == other.follower);
+        assert!(self.followee == other.followee);
+
+        self.followed_at < other.followed_at
+    }
+
+    pub fn is_reverse_of(&self, other: &Self) -> bool {
+        assert!(self.follower == other.follower);
+        assert!(self.followee == other.followee);
+
+        self.change_type != other.change_type
     }
 
     #[cfg(test)]

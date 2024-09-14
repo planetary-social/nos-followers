@@ -29,29 +29,30 @@ impl FolloweeNotificationFactory {
         match &self.followee {
             Some(followee) => {
                 assert_eq!(
-                    followee, &follow_change.followee,
+                    followee,
+                    follow_change.followee(),
                     "Followee mismatch in add_follower_change"
                 );
             }
             None => {
-                self.followee = Some(follow_change.followee);
+                self.followee = Some(*follow_change.followee());
             }
         }
 
-        let follower = follow_change.follower;
+        let follower = follow_change.follower();
 
-        if let Some(existing_change) = self.follow_changes.get(&follower) {
-            if follow_change.followed_at < existing_change.followed_at {
+        if let Some(existing_change) = self.follow_changes.get(follower) {
+            if !existing_change.is_older_than(&follow_change) {
                 return;
             }
 
-            if follow_change.change_type != existing_change.change_type {
-                self.follow_changes.remove(&follower);
+            if existing_change.is_reverse_of(&follow_change) {
+                self.follow_changes.remove(follower);
                 return;
             }
         }
 
-        self.follow_changes.insert(follower, follow_change);
+        self.follow_changes.insert(*follower, follow_change);
     }
 
     // This is basically a sliding window log rate limiter

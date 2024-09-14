@@ -61,10 +61,6 @@ pub fn followers_per_message() -> Histogram {
     metrics::histogram!("followers_per_message")
 }
 
-pub fn unfollowers_per_message() -> Histogram {
-    metrics::histogram!("unfollowers_per_message")
-}
-
 pub fn retained_follow_changes() -> Gauge {
     metrics::gauge!("retained_follow_changes")
 }
@@ -112,10 +108,6 @@ pub fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
     describe_histogram!(
         "followers_per_message",
         "Number of followers per aggregated message"
-    );
-    describe_histogram!(
-        "unfollowers_per_message",
-        "Number of unfollowers per aggregated message"
     );
     describe_gauge!(
         "retained_follow_changes",

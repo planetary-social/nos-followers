@@ -66,13 +66,13 @@ impl<T: GetEventsOf> WorkerTask<Box<FollowChange>> for FollowChangeHandler<T> {
             result = get_friendly_ids_from_db(&self.repo, &follow_change, self.timeout_secs) => result
         );
 
-        follow_change.friendly_follower = friendly_follower;
-        follow_change.friendly_followee = friendly_followee;
-
         debug!(
             "Fetched friendly IDs for follow change from {} to {}, queueing for publication",
-            follow_change.friendly_follower, follow_change.friendly_followee
+            friendly_follower, friendly_followee
         );
+
+        follow_change.set_friendly_follower(friendly_follower);
+        follow_change.set_friendly_followee(friendly_followee);
 
         self.publisher.queue_publication(follow_change).await?;
         Ok(())
@@ -86,8 +86,8 @@ async fn fetch_friendly_ids<T: GetEventsOf>(
     follow_change: &FollowChange,
 ) -> (FriendlyId, FriendlyId) {
     let (friendly_follower, friendly_followee) = tokio::join!(
-        refresh_friendly_id(repo, &nostr_client, &follow_change.follower),
-        refresh_friendly_id(repo, &nostr_client, &follow_change.followee),
+        refresh_friendly_id(repo, &nostr_client, follow_change.follower()),
+        refresh_friendly_id(repo, &nostr_client, follow_change.followee()),
     );
 
     (friendly_follower, friendly_followee)
@@ -104,24 +104,24 @@ async fn get_friendly_ids_from_db(
     sleep(std::time::Duration::from_secs(timeout_secs)).await;
 
     let (friendly_follower, friendly_followee) = tokio::join!(
-        repo.get_friendly_id(&follow_change.follower),
-        repo.get_friendly_id(&follow_change.followee)
+        repo.get_friendly_id(follow_change.follower()),
+        repo.get_friendly_id(follow_change.followee())
     );
 
     (
         friendly_follower.ok().flatten().unwrap_or(
             follow_change
-                .follower
+                .follower()
                 .to_bech32()
                 .map(FriendlyId::Npub)
-                .unwrap_or(FriendlyId::PublicKey(follow_change.follower.to_hex())),
+                .unwrap_or(FriendlyId::PublicKey(follow_change.follower().to_hex())),
         ),
         friendly_followee.ok().flatten().unwrap_or(
             follow_change
-                .followee
+                .followee()
                 .to_bech32()
                 .map(FriendlyId::Npub)
-                .unwrap_or(FriendlyId::PublicKey(follow_change.followee.to_hex())),
+                .unwrap_or(FriendlyId::PublicKey(follow_change.followee().to_hex())),
         ),
     )
 }
