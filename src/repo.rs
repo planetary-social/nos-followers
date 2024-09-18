@@ -306,9 +306,8 @@ impl RepoTrait for Repo {
                 RETURN $graph_name AS graphName
             }
             WITH graphName
-            MATCH (n:User)
+            OPTIONAL MATCH (n:User)-[r:FOLLOWS]->(m:User)
             WHERE n.followee_count > 1 AND n.follower_count > 0
-            OPTIONAL MATCH (n)-[r:FOLLOWS]->(m:User)
             WHERE m.followee_count > 1 AND m.follower_count > 0
             WITH gds.graph.project(
                 graphName,
