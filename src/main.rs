@@ -7,7 +7,7 @@ use nos_followers::{
     http_server::HttpServer,
     migrations::apply_migrations,
     relay_subscriber::{create_client, start_nostr_subscription},
-    repo::Repo,
+    repo::{Repo, RepoTrait},
     scheduler::start_scheduler,
     tcp_importer::start_tcp_importer,
     worker_pool::WorkerPool,
@@ -95,6 +95,8 @@ async fn start(settings: Settings) -> Result<()> {
         .context("Failed applying migrations")?;
     let repo = Arc::new(Repo::new(graph));
 
+    repo.log_neo4j_details().await?;
+
     info!("Initializing workers for follower list diff calculation");
     let shared_nostr_client = Arc::new(create_client());
     let (follow_change_sender, _) =
@@ -176,6 +178,7 @@ async fn start(settings: Settings) -> Result<()> {
     HttpServer::start(
         task_tracker.clone(),
         settings.http_port,
+        repo.clone(),
         cancellation_token.clone(),
     )?;
 

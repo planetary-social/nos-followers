@@ -19,12 +19,12 @@ where
     T: RepoTrait + 'static,
 {
     let mut sched = JobScheduler::new().await?;
-
     let cron_expression = settings.pagerank_cron_expression.as_str();
-
     let repo_clone = Arc::clone(&repo);
+
     let job = Job::new_async(cron_expression, move |_uuid, _l| {
         let repo_inner = Arc::clone(&repo_clone);
+
         Box::pin(async move {
             info!("Starting scheduled PageRank update...");
 
@@ -35,6 +35,11 @@ where
                 .map(jitter);
 
             let result = Retry::spawn(retry_strategy, || async {
+                if let Err(e) = repo_inner.update_memory_graph().await {
+                    error!("Memory graph update failed: {:?}", e);
+                    return Err(e);
+                }
+
                 if let Err(e) = repo_inner.update_pagerank().await {
                     error!("Failed to update PageRank: {:?}", e);
                     return Err(e);

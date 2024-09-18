@@ -29,6 +29,34 @@ services:
     restart: always
     attach: true
 
+  # May not be used locally but it's a good example on how to run it from production with:
+  # docker compose --profile pagerank-profile run pagerank
+  pagerank:
+    build:
+      context: .
+      target: final
+    environment:
+      - APP__followers__neo4j_uri=db:7687
+      - APP__followers__neo4j_user=neo4j
+      - APP__followers__neo4j_password=mydevpassword
+      - APP__ENVIRONMENT=development
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcloud/application_default_credentials.json
+      - RUST_LOG=nos_followers=debug
+      - RUST_BACKTRACE=1
+    volumes:
+      - ./config:/app/config
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git/db
+      - build-cache:/app/target
+      - ${HOME}/.config/gcloud/application_default_credentials.json:/app/gcloud/application_default_credentials.json
+    entrypoint: ["/bin/pagerank"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    profiles:
+      - pagerank-profile
+
   relay:
     image: ghcr.io/planetary-social/nosrelay:latest
     ports:
@@ -47,6 +75,8 @@ services:
       - NEO4J_apoc_import_file_use__neo4j__config=true
       - NEO4J_PLUGINS=["apoc", "graph-data-science"]
       - NEO4J_dbms_logs_debug_level=DEBUG
+      - NEO4J_dbms_logs_query_enabled=VERBOSE
+      - NEO4J_dbms_logs_query_threshold=0
     volumes:
       - db-data:/data
       - db-logs:/logs

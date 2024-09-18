@@ -1,21 +1,34 @@
 mod router;
+use crate::repo::Repo;
+use crate::repo::RepoTrait;
 use anyhow::{Context, Result};
 use axum::Router;
 use router::create_router;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, info};
+
+pub struct AppState<T>
+where
+    T: RepoTrait,
+{
+    pub repo: Arc<T>,
+}
 
 pub struct HttpServer;
 impl HttpServer {
     pub fn start(
         task_tracker: TaskTracker,
         http_port: u16,
+        repo: Arc<Repo>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        let router = create_router()?;
+        let state = Arc::new(AppState { repo }); // Create the shared state
+        let router = create_router(state)?; // Pass the state to the router
+
         start_http_server(task_tracker, http_port, router, cancellation_token);
 
         Ok(())

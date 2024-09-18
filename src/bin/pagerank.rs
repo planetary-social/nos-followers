@@ -28,6 +28,13 @@ async fn main() -> Result<()> {
     .context("Failed to connect to Neo4j")?;
 
     let repo = Arc::new(Repo::new(graph));
+    repo.log_neo4j_details().await?;
+
+    info!("Update memory graph");
+    if let Err(e) = repo.update_memory_graph().await {
+        error!("Memory graph update failed: {:?}", e);
+        return Err(e).context("Memory graph update encountered an error");
+    }
 
     info!("Executing PageRank update");
     if let Err(e) = repo.update_pagerank().await {

@@ -4,7 +4,9 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use core::panic;
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
+use serde::Serialize;
 use thiserror::Error;
+use tracing::{error, info};
 
 pub struct Repo {
     graph: Graph,
@@ -72,10 +74,31 @@ pub trait RepoTrait: Sync + Send {
         async { panic!("Not implemented") }
     }
 
+    /// Refreshes the in-memory graph for users with more than one followee and at least one follower.
+    fn update_memory_graph(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
+
     /// Filters users, calculates pagerank, sets the value to each node, and drops the temporary graph.
     fn update_pagerank(
         &self,
     ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
+
+    fn log_neo4j_details(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
+
+    fn get_recommendations(
+        &self,
+        _pubkey: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<Vec<Recommendation>, RepoError>> + std::marker::Send
+    {
         async { panic!("Not implemented") }
     }
 }
@@ -288,53 +311,90 @@ impl RepoTrait for Repo {
         Ok(follows)
     }
 
-    /// Filters users, calculates pagerank, sets the value to each node, and drops the temporary graph.
-    /// We only calculate PageRank for users with more than one followee and at least one follower.
-    async fn update_pagerank(&self) -> Result<(), RepoError> {
+    async fn update_memory_graph(&self) -> Result<(), RepoError> {
         let graph_name = "filteredGraph";
 
         let statements = r#"
-            CALL {
-                CALL gds.graph.exists($graph_name)
-                YIELD exists
-                WITH exists
-                WHERE exists
-                CALL gds.graph.drop($graph_name)
-                YIELD graphName
-                RETURN graphName
-                UNION ALL
-                RETURN $graph_name AS graphName
+        CALL {
+            CALL gds.graph.exists($graph_name)
+            YIELD exists
+            WITH exists
+            WHERE exists
+            CALL gds.graph.drop($graph_name)
+            YIELD graphName
+            RETURN graphName
+            UNION ALL
+            RETURN $graph_name AS graphName
+        }
+        WITH graphName
+        MATCH (n:User)
+        WHERE n.followee_count > 1 AND n.follower_count > 0
+        OPTIONAL MATCH (n)-[r:FOLLOWS]->(m:User)
+        WHERE m.followee_count > 1 AND m.follower_count > 0
+        WITH gds.graph.project(
+            graphName,
+            n,
+            m,
+            {
+                relationshipType: 'FOLLOWS',
+                relationshipProperties: {}
             }
-            WITH graphName
-            OPTIONAL MATCH (n:User)-[r:FOLLOWS]->(m:User)
-            WHERE n.followee_count > 1 AND n.follower_count > 0
-            AND m.followee_count > 1 AND m.follower_count > 0
-            WITH gds.graph.project(
-                graphName,
-                n,
-                m,
-                {
-                    relationshipType: 'FOLLOWS',
-                    relationshipProperties: {}
-                }
-            ) AS graphProjection, graphName
-            CALL gds.pageRank.write(
-                graphName,
-                {
-                    writeProperty: 'pagerank',
-                    maxIterations: 20,
-                    dampingFactor: 0.85
-                }
-            )
-            YIELD nodePropertiesWritten
-            WITH graphName
-            CALL gds.graph.drop(graphName)
-            YIELD graphName AS droppedGraphName
-            RETURN droppedGraphName AS graphName;
-        "#;
+        ) AS graphProjection
+        CALL gds.graph.list() YIELD graphName, nodeCount, relationshipCount
+        WHERE graphName = $graph_name
+        RETURN graphName, nodeCount, relationshipCount;
+    "#;
 
-        // Combined Cypher query to drop, create, run PageRank, and drop again
-        let query = query(statements).param("graph_name", graph_name);
+        let q = query(statements).param("graph_name", graph_name);
+
+        let mut graph_list = self.graph.execute(q).await.map_err(RepoError::General)?;
+
+        loop {
+            match graph_list.next().await {
+                Ok(Some(record)) => {
+                    let graph_name: String = record.get("graphName").unwrap_or_default();
+                    let node_count: i64 = record.get("nodeCount").unwrap_or(0);
+                    let relationship_count: i64 = record.get("relationshipCount").unwrap_or(0);
+
+                    info!(
+                        "Graph '{}' created with {} nodes and {} relationships",
+                        graph_name, node_count, relationship_count
+                    );
+                }
+                Ok(None) => {
+                    info!("No more graph records found.");
+                    break;
+                }
+                Err(e) => {
+                    error!("Error retrieving graph list: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Memory graph updated and verified successfully.");
+        Ok(())
+    }
+
+    /// Executes the PageRank algorithm on the in-memory graph that was previously created.
+    /// It assumes the graph is already projected in memory.
+    async fn update_pagerank(&self) -> Result<(), RepoError> {
+        let graph_name = "filteredGraph";
+
+        let pagerank_statement = r#"
+        CALL gds.pageRank.write(
+            $graph_name,
+            {
+                writeProperty: 'pagerank',
+                maxIterations: 20,
+                dampingFactor: 0.85
+            }
+        )
+        YIELD nodePropertiesWritten
+        RETURN nodePropertiesWritten;
+    "#;
+
+        let query = query(pagerank_statement).param("graph_name", graph_name);
 
         self.graph
             .run(query)
@@ -342,6 +402,114 @@ impl RepoTrait for Repo {
             .map_err(RepoError::ExecutePageRank)?;
 
         Ok(())
+    }
+
+    async fn log_neo4j_details(&self) -> Result<(), RepoError> {
+        let current_db_query = query("CALL dbms.showCurrentUser()");
+        let server_info_query = query("CALL dbms.components()");
+        let databases_query = query("SHOW DATABASES");
+
+        let mut current_db_result = self
+            .graph
+            .execute(current_db_query)
+            .await
+            .map_err(RepoError::General)?;
+
+        if let Ok(Some(record)) = current_db_result.next().await {
+            let username: String = record.get("username").unwrap_or_default();
+            let roles: Vec<String> = record.get("roles").unwrap_or_default();
+            info!("Current Neo4j user: {}, roles: {:?}", username, roles);
+        }
+
+        let mut server_info_result = self
+            .graph
+            .execute(server_info_query)
+            .await
+            .map_err(RepoError::General)?;
+
+        while let Ok(Some(record)) = server_info_result.next().await {
+            let name: String = record.get("name").unwrap_or_default();
+            let version: String = record.get("versions").unwrap_or_default();
+            info!("Neo4j Component: {}, Version: {}", name, version);
+        }
+
+        let mut databases_result = self
+            .graph
+            .execute(databases_query)
+            .await
+            .map_err(RepoError::General)?;
+
+        while let Ok(Some(record)) = databases_result.next().await {
+            let db_name: String = record.get("name").unwrap_or_default();
+            let current_status: String = record.get("currentStatus").unwrap_or_default();
+            info!("Database: {}, Status: {}", db_name, current_status);
+        }
+
+        Ok(())
+    }
+    async fn get_recommendations(
+        &self,
+        pubkey: &PublicKey,
+    ) -> Result<Vec<Recommendation>, RepoError> {
+        let statement = r#"
+            // Step 1: Get valid target nodes
+            MATCH (source:User {pubkey: $pubkey_val})
+            MATCH (target:User)
+            WHERE target.pagerank >= 0.2
+            AND NOT EXISTS {
+                MATCH (source)-[:FOLLOWS]->(target)
+            }
+            WITH source, collect(id(target)) AS targetNodeIds
+
+            // Step 2: Run the similarity algorithm using the filtered target nodes
+            CALL gds.nodeSimilarity.filtered.stream('filteredGraph', {
+                sourceNodeFilter: [id(source)],
+                targetNodeFilter: targetNodeIds,
+                topK: 10,  // Top 10 similar users
+                similarityCutoff: 0.1  // Only include nodes with similarity >= 0.1
+            })
+            YIELD node1, node2, similarity
+            WITH gds.util.asNode(node2) AS targetUser, similarity
+            RETURN targetUser.pubkey AS target_pubkey,
+                   targetUser.friendly_id AS friendly_id,
+                   similarity,
+                   targetUser.pagerank AS pagerank
+            ORDER BY similarity DESC, pagerank DESC;
+        "#;
+
+        let query = query(statement).param("pubkey_val", pubkey.to_hex());
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::GetRecommendations)?;
+
+        let mut recommendations: Vec<Recommendation> = Vec::new();
+        while let Ok(Some(row)) = records.next().await {
+            let pubkey = row.get::<String>("target_pubkey").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'target_pubkey' field")
+            })?;
+            let friendly_id = row.get::<String>("friendly_id").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'friendly_id' field")
+            })?;
+            let similarity: f64 = row.get::<f64>("similarity").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'similarity' field")
+            })?;
+            let pagerank: f64 = row.get::<f64>("pagerank").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
+            })?;
+
+            recommendations.push(Recommendation {
+                pubkey: PublicKey::from_hex(&pubkey)
+                    .map_err(RepoError::GetRecommendationsPubkey)?,
+                friendly_id,
+                similarity,
+                pagerank,
+            });
+        }
+
+        Ok(recommendations)
     }
 }
 
@@ -397,6 +565,18 @@ pub enum RepoError {
         source: neo4rs::DeError,
         context: String,
     },
+
+    #[error("Failed to update memory graph: {0}")]
+    UpdateMemoryGraph(neo4rs::Error),
+
+    #[error("General error: {0}")]
+    General(neo4rs::Error),
+
+    #[error("Failed to get recommendations: {0}")]
+    GetRecommendations(neo4rs::Error),
+
+    #[error("Failed to get recommendations pubkey: {0}")]
+    GetRecommendationsPubkey(nostr_sdk::key::Error),
 }
 
 impl RepoError {
@@ -409,4 +589,12 @@ impl RepoError {
             context: context.into(),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Recommendation {
+    pubkey: PublicKey,
+    friendly_id: String,
+    similarity: f64,
+    pagerank: f64,
 }
