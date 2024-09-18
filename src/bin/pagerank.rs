@@ -1,19 +1,15 @@
 use anyhow::{Context, Result};
+use log::{error, info};
 use neo4rs::Graph;
 use nos_followers::{
     config::{Config, Settings},
     repo::{Repo, RepoTrait},
 };
 use std::sync::Arc;
-use tracing::{error, info};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     info!("PageRank updater started");
 
@@ -40,5 +36,7 @@ async fn main() -> Result<()> {
     }
 
     info!("PageRank update completed successfully");
+
+    log::logger().flush();
     Ok(())
 }
