@@ -10,7 +10,7 @@ use tokio::sync::{
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 pub struct WorkerPool {}
 
 // A channel based worker pool that distributes work to a pool of workers.
@@ -132,7 +132,7 @@ fn create_worker_task<Item, Worker>(
         loop {
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
-                    info!("{}: Cancellation token is cancelled, stopping worker", worker_name);
+                    debug!("{}: Cancellation token is cancelled, stopping worker", worker_name);
                     break;
                 }
 

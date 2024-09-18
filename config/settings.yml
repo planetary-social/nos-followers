@@ -16,3 +16,5 @@ followers:
   flush_period_seconds: 60
   # 30 minutes, so no more than 2 messages per hour
   min_seconds_between_messages: 1800
+  # Daily at midnight
+  pagerank_cron_expression: "0 0 0 * * *"

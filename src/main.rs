@@ -8,6 +8,7 @@ use nos_followers::{
     migrations::apply_migrations,
     relay_subscriber::{create_client, start_nostr_subscription},
     repo::Repo,
+    scheduler::start_scheduler,
     tcp_importer::start_tcp_importer,
     worker_pool::WorkerPool,
 };
@@ -147,7 +148,7 @@ async fn start(settings: Settings) -> Result<()> {
     start_nostr_subscription(
         task_tracker.clone(),
         shared_nostr_client,
-        [settings.relay].into(),
+        [settings.relay.clone()].into(),
         filters,
         event_sender.clone(),
         cancellation_token.clone(),
@@ -161,6 +162,16 @@ async fn start(settings: Settings) -> Result<()> {
         cancellation_token.clone(),
     )
     .await?;
+
+    info!("Starting scheduler");
+    start_scheduler(
+        task_tracker.clone(),
+        repo.clone(),
+        cancellation_token.clone(),
+        &settings,
+    )
+    .await
+    .context("Failed starting the scheduler")?;
 
     HttpServer::start(
         task_tracker.clone(),

@@ -22,6 +22,7 @@ pub struct Settings {
     pub min_seconds_between_messages: NonZeroUsize,
     pub tcp_importer_port: u16,
     pub http_port: u16,
+    pub pagerank_cron_expression: String,
 }
 
 impl Configurable for Settings {

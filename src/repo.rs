@@ -1,8 +1,7 @@
-use core::panic;
-
 use crate::account_info::FriendlyId;
 use crate::domain::ContactListFollow;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use core::panic;
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
 use thiserror::Error;
@@ -18,7 +17,7 @@ impl Repo {
 }
 
 // Default trait raises not implemented just to ease testing
-pub trait RepoTrait {
+pub trait RepoTrait: Sync + Send {
     /// Set the last contact list date seen for a user if it's newer than the stored value. Returns the previous value
     fn maybe_update_last_contact_list_at(
         &self,
@@ -70,6 +69,13 @@ pub trait RepoTrait {
         _follower: &PublicKey,
     ) -> impl std::future::Future<Output = Result<Vec<ContactListFollow>, RepoError>> + std::marker::Send
     {
+        async { panic!("Not implemented") }
+    }
+
+    /// Filters users, calculates pagerank, sets the value to each node, and drops the temporary graph.
+    fn update_pagerank(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
         async { panic!("Not implemented") }
     }
 }
@@ -281,6 +287,61 @@ impl RepoTrait for Repo {
 
         Ok(follows)
     }
+
+    /// Filters users, calculates pagerank, sets the value to each node, and drops the temporary graph.
+    /// We only calculate PageRank for users with more than one followee and at least one follower.
+    async fn update_pagerank(&self) -> Result<(), RepoError> {
+        let graph_name = "filteredGraph";
+
+        let statements = r#"
+            CALL {
+                CALL gds.graph.exists($graph_name)
+                YIELD exists
+                WITH exists
+                WHERE exists
+                CALL gds.graph.drop($graph_name)
+                YIELD graphName
+                RETURN graphName
+                UNION ALL
+                RETURN $graph_name AS graphName
+            }
+            WITH graphName
+            MATCH (n:User)
+            WHERE n.followee_count > 1 AND n.follower_count > 0
+            WITH gds.graph.project(
+                graphName,
+                n,
+                n,
+                {
+                    relationshipType: 'FOLLOWS',
+                    relationshipProperties: {}
+                }
+            ) AS graphProjection, graphName
+            CALL gds.pageRank.write(
+                graphName,
+                {
+                    writeProperty: 'pagerank',
+                    maxIterations: 20,
+                    dampingFactor: 0.85
+                }
+            )
+            YIELD nodePropertiesWritten
+            WITH graphName
+            CALL gds.graph.drop(graphName)
+            YIELD graphName AS droppedGraphName
+            RETURN droppedGraphName AS graphName;
+        "#;
+
+        // Combined Cypher query to drop, create, run PageRank, and drop again
+        let query = query(&statements).param("graph_name", graph_name);
+
+        self.graph
+            .run(query)
+            .await
+            .map_err(RepoError::ExecutePageRank)?;
+
+        Ok(())
+    }
 }
 
 /// A function to read as DateTime<Utc> a value stored either as LocalDatetime or DateTime<Utc>
@@ -297,26 +358,46 @@ fn parse_datetime(row: &neo4rs::Row, field: &str) -> Result<Option<DateTime<Utc>
 
 #[derive(Error, Debug)]
 pub enum RepoError {
-    #[error("Failed to set first contact list date: {0}")]
+    #[error("Failed to set last contact list date: {0}")]
     MaybeSetLastContactListAt(neo4rs::Error),
+
     #[error("Failed to add friendly_id: {0}")]
     SetFriendlyId(neo4rs::Error),
+
     #[error("Failed to upsert follow: {0}")]
     UpsertFollow(neo4rs::Error),
+
     #[error("Failed to delete follow: {0}")]
     DeleteFollow(neo4rs::Error),
+
     #[error("Failed to get follows: {0}")]
     GetFollows(neo4rs::Error),
+
     #[error("Failed to get follows: {0}")]
     GetFollowsPubkey(nostr_sdk::key::Error),
+
     #[error("Failed to get friendly_id: {0}")]
     GetFriendlyId(neo4rs::Error),
-    #[error("Failed to deserialize: {source} ({context})")]
+
+    #[error("Failed to create in-memory graph for PageRank: {0}")]
+    CreateGraph(neo4rs::Error),
+
+    #[error("Failed to execute PageRank: {0}")]
+    ExecutePageRank(neo4rs::Error),
+
+    #[error("Failed to drop in-memory graph: {0}")]
+    DropGraph(neo4rs::Error),
+
+    #[error("Failed to drop existing in-memory graph: {0}")]
+    DropExistingGraph(neo4rs::Error),
+
+    #[error("Deserialization failed: {source} ({context})")]
     Deserialization {
         source: neo4rs::DeError,
         context: String,
     },
 }
+
 impl RepoError {
     pub fn deserialization_with_context<S: Into<String>>(
         source: neo4rs::DeError,

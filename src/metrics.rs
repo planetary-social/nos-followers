@@ -65,6 +65,10 @@ pub fn retained_follow_changes() -> Gauge {
     metrics::gauge!("retained_follow_changes")
 }
 
+pub fn pagerank_seconds() -> Gauge {
+    metrics::gauge!("pagerank_seconds")
+}
+
 pub fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
     describe_counter!(
         "pubsub_messages",
@@ -113,6 +117,7 @@ pub fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
         "retained_follow_changes",
         "Number of retained follow changes"
     );
+    describe_gauge!("pagerank_seconds", "Seconds it takes to calculate pagerank");
 
     let prometheus_builder = PrometheusBuilder::new();
     let prometheus_handle = prometheus_builder.install_recorder()?;

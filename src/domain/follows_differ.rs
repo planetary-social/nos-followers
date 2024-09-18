@@ -21,7 +21,7 @@ struct FollowsDiff {
 
 pub struct FollowsDiffer<T, U>
 where
-    T: RepoTrait + Sync + Send,
+    T: RepoTrait,
     U: GetEventsOf + Sync + Send,
 {
     repo: Arc<T>,
@@ -32,7 +32,7 @@ where
 #[async_trait]
 impl<T, U> WorkerTask<Box<Event>> for FollowsDiffer<T, U>
 where
-    T: RepoTrait + Sync + Send,
+    T: RepoTrait,
     U: GetEventsOf + Sync + Send,
 {
     async fn call(&self, event: Box<Event>) -> Result<()> {
