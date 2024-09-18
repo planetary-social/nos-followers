@@ -18,6 +18,10 @@ pub async fn start_scheduler<T>(
 where
     T: RepoTrait + 'static,
 {
+    // For the moment ensure we always trigger one update on startup
+    refresh_pagerank(repo.clone()).await;
+
+    // And then once every day
     let mut sched = JobScheduler::new().await?;
     let cron_expression = settings.pagerank_cron_expression.as_str();
     let repo_clone = Arc::clone(&repo);
@@ -28,38 +32,7 @@ where
         Box::pin(async move {
             info!("Starting scheduled PageRank update...");
 
-            let start_time = Instant::now();
-
-            let retry_strategy = ExponentialBackoff::from_millis(100)
-                .max_delay(Duration::from_secs(10))
-                .map(jitter);
-
-            let result = Retry::spawn(retry_strategy, || async {
-                if let Err(e) = repo_inner.update_memory_graph().await {
-                    error!("Memory graph update failed: {:?}", e);
-                    return Err(e);
-                }
-
-                if let Err(e) = repo_inner.update_pagerank().await {
-                    error!("Failed to update PageRank: {:?}", e);
-                    return Err(e);
-                }
-
-                Ok(())
-            })
-            .await;
-
-            let elapsed = start_time.elapsed();
-
-            match result {
-                Ok(_) => info!("PageRank updated successfully in {:?}", elapsed),
-                Err(e) => error!(
-                    "Failed to update PageRank after retries in {:?}: {:?}",
-                    elapsed, e
-                ),
-            }
-
-            metrics::pagerank_seconds().set(elapsed.as_secs_f64());
+            refresh_pagerank(repo_inner).await;
         })
     })?;
 
@@ -78,4 +51,42 @@ where
     });
 
     Ok(())
+}
+
+async fn refresh_pagerank<T>(repo_inner: Arc<T>)
+where
+    T: RepoTrait + 'static,
+{
+    let start_time = Instant::now();
+
+    let retry_strategy = ExponentialBackoff::from_millis(100)
+        .max_delay(Duration::from_secs(10))
+        .map(jitter);
+
+    let result = Retry::spawn(retry_strategy, || async {
+        if let Err(e) = repo_inner.update_memory_graph().await {
+            error!("Memory graph update failed: {:?}", e);
+            return Err(e);
+        }
+
+        if let Err(e) = repo_inner.update_pagerank().await {
+            error!("Failed to update PageRank: {:?}", e);
+            return Err(e);
+        }
+
+        Ok(())
+    })
+    .await;
+
+    let elapsed = start_time.elapsed();
+
+    match result {
+        Ok(_) => info!("PageRank updated successfully in {:?}", elapsed),
+        Err(e) => error!(
+            "Failed to update PageRank after retries in {:?}: {:?}",
+            elapsed, e
+        ),
+    }
+
+    metrics::pagerank_seconds().set(elapsed.as_secs_f64());
 }

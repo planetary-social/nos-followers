@@ -15,6 +15,7 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tower_http::LatencyUnit;
 use tower_http::{timeout::TimeoutLayer, trace::DefaultOnFailure};
 use tracing::Level;
+use tracing::{error, info};
 
 pub fn create_router<T>(state: Arc<AppState<T>>) -> Result<Router>
 where
@@ -52,11 +53,20 @@ where
     T: RepoTrait,
 {
     let public_key = PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey)?;
+    if let Some(cached_recommendation_result) = state.recommendation_cache.get(&pubkey).await {
+        return Ok(Json(cached_recommendation_result));
+    }
+
     let recommendations = state
         .repo
         .get_recommendations(&public_key)
         .await
         .map_err(ApiError::from)?;
+
+    state
+        .recommendation_cache
+        .insert(pubkey, recommendations.clone())
+        .await;
 
     Ok(Json(recommendations))
 }
@@ -68,21 +78,38 @@ async fn maybe_spammer<T>(
 where
     T: RepoTrait,
 {
-    let Ok(public_key) = PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey)
-    else {
-        return Json(false);
+    let public_key = match PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey) {
+        Ok(public_key) => public_key,
+        Err(e) => {
+            error!("Invalid public key: {}", e);
+            return Json(true);
+        }
     };
 
-    let Ok(pagerank) = state
+    if let Some(cached_spammer_result) = state.spammer_cache.get(&pubkey).await {
+        return Json(cached_spammer_result);
+    }
+
+    match state
         .repo
         .get_pagerank(&public_key)
         .await
         .map_err(ApiError::from)
-    else {
-        return Json(false);
-    };
-
-    Json(pagerank > 0.5)
+    {
+        Ok(pagerank) => {
+            info!("Pagerank for {}: {}", public_key.to_hex(), pagerank);
+            let is_spammer = pagerank < 0.2;
+            state.spammer_cache.insert(pubkey, is_spammer).await;
+            Json(is_spammer)
+            // TODO don't return if it's too low, instead use other manual
+            // checks, nos user, nip05, check network, more hints, and only then
+            // give up
+        }
+        Err(e) => {
+            error!("Invalid public key: {}", e);
+            Json(true)
+        }
+    }
 }
 
 async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {
@@ -122,6 +149,7 @@ impl IntoResponse for ApiError {
             ),
             ApiError::AxumError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Axum error".to_string()),
         };
+        error!("Api error: {}", body);
         (status, body).into_response()
     }
 }

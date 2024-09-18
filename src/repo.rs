@@ -462,7 +462,7 @@ impl RepoTrait for Repo {
             // Step 1: Get valid target nodes
             MATCH (source:User {pubkey: $pubkey_val})
             MATCH (target:User)
-            WHERE target.pagerank >= 0.1
+            WHERE target.pagerank >= 0.3
             AND NOT EXISTS {
                 MATCH (source)-[:FOLLOWS]->(target)
             }
@@ -472,8 +472,8 @@ impl RepoTrait for Repo {
             CALL gds.nodeSimilarity.filtered.stream('filteredGraph', {
                 sourceNodeFilter: [id(source)],
                 targetNodeFilter: targetNodeIds,
-                topK: 10,  // Top 10 similar users
-                similarityCutoff: 0.05  // Only include nodes with similarity >= 0.1
+                topK: 10,
+                similarityCutoff: 0.1
             })
             YIELD node1, node2, similarity
             WITH gds.util.asNode(node2) AS targetUser, similarity
