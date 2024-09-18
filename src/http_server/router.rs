@@ -52,33 +52,37 @@ where
     T: RepoTrait,
 {
     let public_key = PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey)?;
-    cached_get_recommendations(state.repo.clone(), public_key)
+    let recommendations = state
+        .repo
+        .get_recommendations(&public_key)
         .await
-        .map_err(ApiError::from)
-}
+        .map_err(ApiError::from)?;
 
-async fn cached_get_recommendations<T>(
-    repo: Arc<T>,
-    public_key: PublicKey,
-) -> Result<Json<Vec<Recommendation>>, RepoError>
-where
-    T: RepoTrait,
-{
-    let recommendations = repo.get_recommendations(&public_key).await?;
     Ok(Json(recommendations))
 }
 
 async fn maybe_spammer<T>(
     State(state): State<Arc<AppState<T>>>, // Extract shared state with generic RepoTrait
     axum::extract::Path(pubkey): axum::extract::Path<String>, // Extract pubkey from the path
-) -> Result<Json<bool>, ApiError>
+) -> Json<bool>
 where
     T: RepoTrait,
 {
-    let public_key = PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey)?;
-    let pagerank = state.repo.get_pagerank(&public_key).await?;
+    let Ok(public_key) = PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey)
+    else {
+        return Json(false);
+    };
 
-    Ok(Json(pagerank < 0.2))
+    let Ok(pagerank) = state
+        .repo
+        .get_pagerank(&public_key)
+        .await
+        .map_err(ApiError::from)
+    else {
+        return Json(false);
+    };
+
+    Json(pagerank > 0.5)
 }
 
 async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {

@@ -21,6 +21,7 @@ gcloud-sdk = { version = "0.25.6", features = ["google-pubsub-v1"] }
 log = "0.4.22"
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
+moka = { version = "0.12.8", features = ["future"] }
 neo4rs = "0.8.0"
 nonzero_ext = "0.3.0"
 nostr-sdk = "0.33.0"

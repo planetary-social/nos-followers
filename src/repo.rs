@@ -462,7 +462,7 @@ impl RepoTrait for Repo {
             // Step 1: Get valid target nodes
             MATCH (source:User {pubkey: $pubkey_val})
             MATCH (target:User)
-            WHERE target.pagerank >= 0.2
+            WHERE target.pagerank >= 0.1
             AND NOT EXISTS {
                 MATCH (source)-[:FOLLOWS]->(target)
             }
@@ -473,7 +473,7 @@ impl RepoTrait for Repo {
                 sourceNodeFilter: [id(source)],
                 targetNodeFilter: targetNodeIds,
                 topK: 10,  // Top 10 similar users
-                similarityCutoff: 0.1  // Only include nodes with similarity >= 0.1
+                similarityCutoff: 0.05  // Only include nodes with similarity >= 0.1
             })
             YIELD node1, node2, similarity
             WITH gds.util.asNode(node2) AS targetUser, similarity
@@ -629,7 +629,7 @@ impl RepoError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct Recommendation {
     pubkey: PublicKey,
     friendly_id: String,

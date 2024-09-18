@@ -1,8 +1,8 @@
 mod router;
-use crate::repo::Repo;
-use crate::repo::RepoTrait;
+use crate::repo::{Recommendation, Repo, RepoTrait};
 use anyhow::{Context, Result};
 use axum::Router;
+use moka::future::Cache;
 use router::create_router;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,6 +16,32 @@ where
     T: RepoTrait,
 {
     pub repo: Arc<T>,
+    pub recommendation_cache: Cache<String, Vec<Recommendation>>,
+    pub spammer_cache: Cache<String, bool>,
+}
+
+// Initialize AppState with caches
+impl<T> AppState<T>
+where
+    T: RepoTrait + 'static,
+{
+    pub fn new(repo: Arc<T>) -> Self {
+        let recommendation_cache = Cache::builder()
+            .time_to_live(Duration::from_secs(86400)) // 1 day
+            .max_capacity(4000)
+            .build();
+
+        let spammer_cache = Cache::builder()
+            .time_to_live(Duration::from_secs(86400)) // 1 day
+            .max_capacity(4000)
+            .build();
+
+        Self {
+            repo,
+            recommendation_cache,
+            spammer_cache,
+        }
+    }
 }
 
 pub struct HttpServer;
@@ -26,7 +52,7 @@ impl HttpServer {
         repo: Arc<Repo>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        let state = Arc::new(AppState { repo }); // Create the shared state
+        let state = Arc::new(AppState::new(repo)); // Create the shared state
         let router = create_router(state)?; // Pass the state to the router
 
         start_http_server(task_tracker, http_port, router, cancellation_token);
