@@ -38,8 +38,9 @@ where
             "/recommendations/:pubkey",
             get(get_recommendations_handler::<T>),
         ) // Make handler generic
+        .route("/maybe_spammer/:pubkey", get(maybe_spammer::<T>)) // Make handler generic
         .layer(tracing_layer)
-        .layer(TimeoutLayer::new(Duration::from_secs(1)))
+        .layer(TimeoutLayer::new(Duration::from_secs(5)))
         .with_state(state)) // Attach state to the router
 }
 
@@ -65,6 +66,19 @@ where
 {
     let recommendations = repo.get_recommendations(&public_key).await?;
     Ok(Json(recommendations))
+}
+
+async fn maybe_spammer<T>(
+    State(state): State<Arc<AppState<T>>>, // Extract shared state with generic RepoTrait
+    axum::extract::Path(pubkey): axum::extract::Path<String>, // Extract pubkey from the path
+) -> Result<Json<bool>, ApiError>
+where
+    T: RepoTrait,
+{
+    let public_key = PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey)?;
+    let pagerank = state.repo.get_pagerank(&public_key).await?;
+
+    Ok(Json(pagerank < 0.2))
 }
 
 async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {

@@ -101,6 +101,13 @@ pub trait RepoTrait: Sync + Send {
     {
         async { panic!("Not implemented") }
     }
+
+    fn get_pagerank(
+        &self,
+        _public_key: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<f64, RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
 }
 
 impl RepoTrait for Repo {
@@ -511,6 +518,34 @@ impl RepoTrait for Repo {
 
         Ok(recommendations)
     }
+
+    async fn get_pagerank(&self, public_key: &PublicKey) -> Result<f64, RepoError> {
+        let statement = r#"
+        MATCH (user:User {pubkey: $pubkey_val})
+        RETURN user.pagerank AS pagerank
+        "#;
+
+        let query = query(statement).param("pubkey_val", public_key.to_hex());
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::GetPageRank)?;
+
+        match records.next().await {
+            Ok(Some(row)) => {
+                let pagerank = row.get::<f64>("pagerank").map_err(|e| {
+                    RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
+                })?;
+                Ok(pagerank)
+            }
+            Ok(None) => Err(RepoError::General(neo4rs::Error::DeserializationError(
+                neo4rs::DeError::PropertyMissingButRequired,
+            ))),
+            Err(e) => Err(RepoError::General(e)),
+        }
+    }
 }
 
 /// A function to read as DateTime<Utc> a value stored either as LocalDatetime or DateTime<Utc>
@@ -577,6 +612,9 @@ pub enum RepoError {
 
     #[error("Failed to get recommendations pubkey: {0}")]
     GetRecommendationsPubkey(nostr_sdk::key::Error),
+
+    #[error("Failed to get pagerank: {0}")]
+    GetPageRank(neo4rs::Error),
 }
 
 impl RepoError {
