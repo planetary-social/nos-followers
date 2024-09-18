@@ -10,21 +10,18 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     info!("PageRank updater started");
 
-    // Load configuration
     let config = Config::new("config").context("Loading configuration failed")?;
     let settings = config
         .get::<Settings>()
         .context("Retrieving settings from configuration failed")?;
 
-    // Connect to Neo4j
     info!("Connecting to Neo4j at {}", settings.neo4j_uri);
     let graph = Graph::new(
         &settings.neo4j_uri,
@@ -34,10 +31,8 @@ async fn main() -> Result<()> {
     .await
     .context("Failed to connect to Neo4j")?;
 
-    // Initialize Repo
     let repo = Arc::new(Repo::new(graph));
 
-    // Execute PageRank
     info!("Executing PageRank update");
     if let Err(e) = repo.update_pagerank().await {
         error!("PageRank update failed: {:?}", e);
