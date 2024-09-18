@@ -201,7 +201,7 @@ mod tests {
         let follower2_follow = FollowChange::new_followed(Utc::now(), follower2, followee1);
         let follower2_follow2 = FollowChange::new_followed(Utc::now(), follower2, followee1);
         let follower3_follow = FollowChange::new_followed(Utc::now(), follower3, followee1);
-        let wrong_followee_change = FollowChange::new_followed(Utc::now(), follower4, followee2);
+        let _wrong_followee_change = FollowChange::new_followed(Utc::now(), follower4, followee2);
 
         let mut message = NotificationMessage::new(followee1);
 
@@ -214,7 +214,7 @@ mod tests {
         #[cfg(not(feature = "ci"))]
         {
             let result = std::panic::catch_unwind(|| {
-                NotificationMessage::new(followee1).add(wrong_followee_change.into())
+                NotificationMessage::new(followee1).add(_wrong_followee_change.into())
             });
             assert!(result.is_err());
         }

@@ -308,7 +308,7 @@ impl RepoTrait for Repo {
             WITH graphName
             OPTIONAL MATCH (n:User)-[r:FOLLOWS]->(m:User)
             WHERE n.followee_count > 1 AND n.follower_count > 0
-            WHERE m.followee_count > 1 AND m.follower_count > 0
+            AND m.followee_count > 1 AND m.follower_count > 0
             WITH gds.graph.project(
                 graphName,
                 n,
@@ -334,7 +334,7 @@ impl RepoTrait for Repo {
         "#;
 
         // Combined Cypher query to drop, create, run PageRank, and drop again
-        let query = query(&statements).param("graph_name", graph_name);
+        let query = query(statements).param("graph_name", graph_name);
 
         self.graph
             .run(query)

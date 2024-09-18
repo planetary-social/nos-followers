@@ -261,8 +261,11 @@ mod tests {
         let public_key =
             PublicKey::from_hex("89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5")
                 .unwrap();
-        let mut metadata = Metadata::default();
-        metadata.display_name = Some("Alice".to_string());
+
+        let metadata = Metadata {
+            display_name: Some("Alice".to_string()),
+            ..Default::default()
+        };
 
         let friendly_id =
             verified_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
@@ -275,8 +278,11 @@ mod tests {
         let public_key =
             PublicKey::from_hex("89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5")
                 .unwrap();
-        let mut metadata = Metadata::default();
-        metadata.name = Some("Alice".to_string());
+
+        let metadata = Metadata {
+            display_name: Some("Alice".to_string()),
+            ..Default::default()
+        };
 
         let friendly_id =
             verified_friendly_id(Some(metadata), &public_key, PanicNip05Verifier).await;
@@ -289,10 +295,13 @@ mod tests {
         let public_key =
             PublicKey::from_hex("89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5")
                 .unwrap();
-        let mut metadata = Metadata::default();
-        metadata.display_name = Some("Alice".to_string());
-        metadata.name = Some("Alice".to_string());
-        metadata.nip05 = Some("alice@nos.social".to_string());
+
+        let metadata = Metadata {
+            display_name: Some("Alice".to_string()),
+            name: Some("Alice".to_string()),
+            nip05: Some("alice@nos.social".to_string()),
+            ..Default::default()
+        };
 
         let friendly_id =
             verified_friendly_id(Some(metadata), &public_key, TrueNip05Verifier).await;
@@ -308,10 +317,12 @@ mod tests {
         let public_key =
             PublicKey::from_hex("89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5")
                 .unwrap();
-        let mut metadata = Metadata::default();
-        metadata.display_name = Some("AliceDisplayName".to_string());
-        metadata.name = Some("AliceName".to_string());
-        metadata.nip05 = Some("alice@nos.social".to_string());
+        let metadata = Metadata {
+            display_name: Some("AliceDisplayName".to_string()),
+            name: Some("AliceName".to_string()),
+            nip05: Some("alice@nos.social".to_string()),
+            ..Default::default()
+        };
 
         let friendly_id =
             verified_friendly_id(Some(metadata), &public_key, FalseNip05Verifier).await;

@@ -147,9 +147,8 @@ mod tests {
     use std::time::Duration;
     use tokio::time::advance;
 
-    static NOW: LazyLock<DateTime<Utc>> = LazyLock::new(|| {
-        DateTime::<Utc>::from_timestamp(Utc::now().timestamp() as i64, 0).unwrap()
-    });
+    static NOW: LazyLock<DateTime<Utc>> =
+        LazyLock::new(|| DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0).unwrap());
 
     #[test]
     fn test_insert_follow_change() {
@@ -203,15 +202,14 @@ mod tests {
         notification_factory.insert(change1.clone().into());
         notification_factory.insert(change2.clone().into());
 
-        let mut messages = notification_factory.flush();
+        let messages = notification_factory.flush();
         // Both changes should be kept since they have different followees
-        assert_eq!(
-            messages.sort(),
+        assert_bag_eq!(
+            messages,
             [
-                NotificationMessage::from(Box::new(change1)),
-                NotificationMessage::from(Box::new(change2))
+                NotificationMessage::from(Box::new(change1.clone())),
+                NotificationMessage::from(Box::new(change2.clone()))
             ]
-            .sort()
         );
     }
 
@@ -415,7 +413,7 @@ mod tests {
 
         let followee = Keys::generate().public_key();
 
-        insert_new_follower(&mut notification_factory, followee.clone());
+        insert_new_follower(&mut notification_factory, followee);
 
         advance(Duration::from_secs(
             min_seconds_between_messages.get() as u64 * 60 + 1,
@@ -470,7 +468,7 @@ mod tests {
         insert_follower(notification_factory, followee, follower)
     }
 
-    fn insert_new_unfollower<'a>(
+    fn insert_new_unfollower(
         notification_factory: &mut NotificationFactory,
         followee: PublicKey,
     ) -> FollowChange {
@@ -503,8 +501,7 @@ mod tests {
         let mut expected_batches = Vec::new();
 
         for (_, changes) in expected {
-            let batch: NotificationMessage =
-                (*changes).to_vec().into_iter().map(|fc| fc.into()).into();
+            let batch: NotificationMessage = (*changes).iter().cloned().map(|fc| fc.into()).into();
             expected_batches.push(batch);
         }
 

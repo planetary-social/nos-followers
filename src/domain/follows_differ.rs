@@ -406,9 +406,8 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::time::sleep;
 
-    static NOW: LazyLock<DateTime<Utc>> = LazyLock::new(|| {
-        DateTime::<Utc>::from_timestamp(Utc::now().timestamp() as i64, 0).unwrap()
-    });
+    static NOW: LazyLock<DateTime<Utc>> =
+        LazyLock::new(|| DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0).unwrap());
 
     #[derive(Default)]
 
@@ -424,8 +423,11 @@ mod tests {
             Ok(vec![])
         }
     }
+
+    type TestHashMap =
+        Arc<Mutex<HashMap<PublicKey, (Vec<ContactListFollow>, Option<DateTime<Utc>>)>>>;
     struct MockRepo {
-        follows: Arc<Mutex<HashMap<PublicKey, (Vec<ContactListFollow>, Option<DateTime<Utc>>)>>>,
+        follows: TestHashMap,
     }
 
     impl Default for MockRepo {
