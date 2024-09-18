@@ -280,7 +280,7 @@ mod tests {
                 .unwrap();
 
         let metadata = Metadata {
-            display_name: Some("Alice".to_string()),
+            name: Some("Alice".to_string()),
             ..Default::default()
         };
 
