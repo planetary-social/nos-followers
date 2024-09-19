@@ -47,9 +47,7 @@ pub async fn cached_maybe_spammer<T>(
 where
     T: RepoTrait,
 {
-    println!("cached_maybe_spammer");
     let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
-    println!("cached_maybe_spammer2");
 
     if let Some(cached_spammer_result) = state.spammer_cache.get(&pubkey).await {
         return Ok(Json(cached_spammer_result));
@@ -66,7 +64,6 @@ async fn maybe_spammer<T>(repo: &Arc<T>, public_key: PublicKey) -> Result<bool, 
 where
     T: RepoTrait,
 {
-    info!("Checking if {} is a spammer", public_key.to_hex());
     let pagerank = repo
         .get_pagerank(&public_key)
         .await
