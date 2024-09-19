@@ -1,17 +1,21 @@
 use super::router::ApiError;
+use super::trust_policy::is_trusted;
 use super::AppState;
+use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{Recommendation, RepoTrait};
 use axum::{extract::State, http::HeaderMap, response::Html, response::IntoResponse, Json};
+use chrono::Utc;
 use nostr_sdk::PublicKey;
 use std::sync::Arc;
 use tracing::info;
 
-pub async fn cached_get_recommendations<T>(
-    State(state): State<Arc<AppState<T>>>,
+pub async fn cached_get_recommendations<T, U>(
+    State(state): State<Arc<AppState<T, U>>>,
     axum::extract::Path(pubkey): axum::extract::Path<String>,
 ) -> Result<Json<Vec<Recommendation>>, ApiError>
 where
     T: RepoTrait,
+    U: GetEventsOf,
 {
     let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
     if let Some(cached_recommendation_result) = state.recommendation_cache.get(&pubkey).await {
@@ -40,41 +44,53 @@ where
         .map_err(ApiError::from)
 }
 
-pub async fn cached_maybe_spammer<T>(
-    State(state): State<Arc<AppState<T>>>, // Extract shared state with generic RepoTrait
-    axum::extract::Path(pubkey): axum::extract::Path<String>, // Extract pubkey from the path
+pub async fn cached_check_if_trusted<T, U>(
+    State(state): State<Arc<AppState<T, U>>>,
+    axum::extract::Path(pubkey): axum::extract::Path<String>,
 ) -> Result<Json<bool>, ApiError>
 where
     T: RepoTrait,
+    U: GetEventsOf,
 {
     let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
 
-    if let Some(cached_spammer_result) = state.spammer_cache.get(&pubkey).await {
+    if let Some(cached_spammer_result) = state.trust_cache.get(&pubkey).await {
         return Ok(Json(cached_spammer_result));
     }
 
-    let is_spammer = maybe_spammer(&state.repo, public_key).await?;
+    let trusted = check_if_trusted(&state.repo, &public_key).await?;
 
-    state.spammer_cache.insert(pubkey, is_spammer).await;
+    state.trust_cache.insert(pubkey, trusted).await;
 
-    Ok(Json(is_spammer))
+    Ok(Json(trusted))
 }
 
-async fn maybe_spammer<T>(repo: &Arc<T>, public_key: PublicKey) -> Result<bool, ApiError>
+/// This needs to be fast even if not cached, relay filters may rely on this
+async fn check_if_trusted<T>(repo: &Arc<T>, public_key: &PublicKey) -> Result<bool, ApiError>
 where
     T: RepoTrait,
 {
-    let pagerank = repo
-        .get_pagerank(&public_key)
-        .await
-        .map_err(|_| ApiError::NotFound)?;
+    let Some(account_info) = repo.get_account_info(public_key).await? else {
+        return Err(ApiError::NotFound);
+    };
 
-    info!("Pagerank for {}: {}", public_key.to_hex(), pagerank);
+    info!("Checking if account is trusted: {}", account_info);
 
-    Ok(pagerank < 0.2)
-    // TODO don't return if it's too low, instead use other manual
-    // checks, nos user, nip05, check network, more hints, and only then
-    // give up
+    let followed_by_enough_people = account_info.follower_count.is_some_and(|c| c > 1);
+    let following_enough_people = account_info.followee_count.is_some_and(|c| c > 1);
+    let has_good_enough_followers = account_info.pagerank.is_some_and(|pr| pr > 0.2);
+    let oldest_event_seen_at = account_info.created_at.unwrap_or(Utc::now());
+    let latest_contact_list_at = account_info.last_contact_list_at.unwrap_or(Utc::now());
+    let is_nos_user = false;
+
+    Ok(is_trusted(
+        has_good_enough_followers,
+        followed_by_enough_people,
+        following_enough_people,
+        oldest_event_seen_at,
+        latest_contact_list_at,
+        is_nos_user,
+    ))
 }
 
 pub async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {

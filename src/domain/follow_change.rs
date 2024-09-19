@@ -1,4 +1,4 @@
-use crate::account_info::FriendlyId;
+use crate::domain::FriendlyId;
 use crate::metrics;
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
@@ -101,9 +101,11 @@ impl FollowChange {
         self.change_type != other.change_type
     }
 
-    #[cfg(test)]
-    pub fn with_friendly_follower(mut self, name: FriendlyId) -> Self {
-        self.friendly_follower = name;
+    pub fn with_friendly_follower(mut self, name: Option<FriendlyId>) -> Self {
+        if let Some(name) = name {
+            self.friendly_follower = name;
+        }
+
         self
     }
 }

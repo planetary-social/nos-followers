@@ -1,5 +1,5 @@
 use super::FollowChange;
-use crate::account_info::FriendlyId;
+use crate::domain::FriendlyId;
 use nostr_sdk::prelude::*;
 use ordermap::OrderSet;
 use serde::ser::SerializeSeq;
@@ -171,7 +171,7 @@ mod tests {
         let follower1 = Keys::generate().public_key();
 
         let follower1_follow = FollowChange::new_followed(Utc::now(), follower1, followee1)
-            .with_friendly_follower(FriendlyId::Name("Alice".to_string()));
+            .with_friendly_follower(Some(FriendlyId::Name("Alice".to_string())));
 
         let mut message = NotificationMessage::new(followee1);
 
@@ -197,7 +197,7 @@ mod tests {
         let follower4 = Keys::generate().public_key();
 
         let follower1_follow = FollowChange::new_followed(Utc::now(), follower1, followee1)
-            .with_friendly_follower(FriendlyId::Name("Alice".to_string()));
+            .with_friendly_follower(Some(FriendlyId::Name("Alice".to_string())));
         let follower2_follow = FollowChange::new_followed(Utc::now(), follower2, followee1);
         let follower2_follow2 = FollowChange::new_followed(Utc::now(), follower2, followee1);
         let follower3_follow = FollowChange::new_followed(Utc::now(), follower3, followee1);

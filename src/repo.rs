@@ -1,5 +1,4 @@
-use crate::account_info::FriendlyId;
-use crate::domain::ContactListFollow;
+use crate::domain::{AccountInfo, ContactListFollow, FriendlyId};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use core::panic;
 use neo4rs::{query, Graph};
@@ -20,13 +19,12 @@ impl Repo {
 
 // Default trait raises not implemented just to ease testing
 pub trait RepoTrait: Sync + Send {
-    /// Set the last contact list date seen for a user if it's newer than the stored value. Returns the previous value
-    fn maybe_update_last_contact_list_at(
+    /// Set the last contact list date seen for a user if it's newer than the stored value
+    fn update_last_contact_list_at(
         &self,
         _public_key: &PublicKey,
         _at: &DateTime<Utc>,
-    ) -> impl std::future::Future<Output = Result<Option<DateTime<Utc>>, RepoError>> + std::marker::Send
-    {
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
         async { panic!("Not implemented") }
     }
 
@@ -102,53 +100,41 @@ pub trait RepoTrait: Sync + Send {
         async { panic!("Not implemented") }
     }
 
-    fn get_pagerank(
+    fn get_account_info(
         &self,
         _public_key: &PublicKey,
-    ) -> impl std::future::Future<Output = Result<f64, RepoError>> + std::marker::Send {
+    ) -> impl std::future::Future<Output = Result<Option<AccountInfo>, RepoError>> + std::marker::Send
+    {
         async { panic!("Not implemented") }
     }
 }
 
 impl RepoTrait for Repo {
     /// Set the last contact list date seen for a user if it's newer than the stored value.
-    /// Returns `Some(previous_value)` if there was a previous value, or `None` if there was no previous value.
-    async fn maybe_update_last_contact_list_at(
+    async fn update_last_contact_list_at(
         &self,
         public_key: &PublicKey,
         at: &DateTime<Utc>,
-    ) -> Result<Option<DateTime<Utc>>, RepoError> {
+    ) -> Result<(), RepoError> {
         let statement = r#"
             MERGE (user:User {pubkey: $pubkey_val})
-            WITH user, user.last_contact_list_at AS previous_value
             SET user.last_contact_list_at = CASE
-                WHEN previous_value IS NULL OR previous_value < $last_contact_list_at
+                WHEN user.last_contact_list_at IS NULL OR user.last_contact_list_at < $last_contact_list_at
                 THEN $last_contact_list_at
-                ELSE previous_value
+                ELSE user.last_contact_list_at
             END
-            RETURN previous_value
             "#;
 
         let query = query(statement)
             .param("pubkey_val", public_key.to_hex())
             .param("last_contact_list_at", (at.naive_utc(), "Etc/UTC"));
 
-        let mut records = self
-            .graph
-            .execute(query)
+        self.graph
+            .run(query)
             .await
             .map_err(RepoError::MaybeSetLastContactListAt)?;
 
-        if let Some(row) = records
-            .next()
-            .await
-            .map_err(RepoError::MaybeSetLastContactListAt)?
-        {
-            let previous_value = parse_datetime(&row, "previous_value")?;
-            Ok(previous_value)
-        } else {
-            Ok(None)
-        }
+        Ok(())
     }
 
     async fn get_friendly_id(
@@ -519,10 +505,17 @@ impl RepoTrait for Repo {
         Ok(recommendations)
     }
 
-    async fn get_pagerank(&self, public_key: &PublicKey) -> Result<f64, RepoError> {
+    async fn get_account_info(
+        &self,
+        public_key: &PublicKey,
+    ) -> Result<Option<AccountInfo>, RepoError> {
         let statement = r#"
         MATCH (user:User {pubkey: $pubkey_val})
-        RETURN user.pagerank AS pagerank
+        RETURN user.pagerank AS pagerank,
+               user.follower_count AS follower_count,
+               user.followee_count AS followee_count,
+               user.last_contact_list_at AS last_contact_list_at,
+               user.friendly_id AS friendly_id
         "#;
 
         let query = query(statement).param("pubkey_val", public_key.to_hex());
@@ -535,14 +528,46 @@ impl RepoTrait for Repo {
 
         match records.next().await {
             Ok(Some(row)) => {
-                let pagerank = row.get::<f64>("pagerank").map_err(|e| {
+                let pagerank = row.get::<Option<f64>>("pagerank").map_err(|e| {
                     RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
                 })?;
-                Ok(pagerank)
+
+                let follower_count = row.get::<Option<u64>>("follower_count").map_err(|e| {
+                    RepoError::deserialization_with_context(
+                        e,
+                        "deserializing 'follower_count' field",
+                    )
+                })?;
+
+                let followee_count = row.get::<Option<u64>>("followee_count").map_err(|e| {
+                    RepoError::deserialization_with_context(
+                        e,
+                        "deserializing 'followee_count' field",
+                    )
+                })?;
+
+                let last_contact_list_at = parse_datetime(&row, "last_contact_list_at")?;
+
+                let friendly_id = row
+                    .get::<Option<String>>("friendly_id")
+                    .map_err(|e| {
+                        RepoError::deserialization_with_context(
+                            e,
+                            "deserializing 'friendly_id' field",
+                        )
+                    })?
+                    .map(FriendlyId::DB);
+
+                let account_info = AccountInfo::new(public_key.clone())
+                    .with_pagerank(pagerank)
+                    .with_followee_count(followee_count)
+                    .with_follower_count(follower_count)
+                    .with_last_contact_list_at(last_contact_list_at)
+                    .with_friendly_id(friendly_id);
+
+                Ok(Some(account_info))
             }
-            Ok(None) => Err(RepoError::General(neo4rs::Error::DeserializationError(
-                neo4rs::DeError::PropertyMissingButRequired,
-            ))),
+            Ok(None) => Ok(None),
             Err(e) => Err(RepoError::General(e)),
         }
     }

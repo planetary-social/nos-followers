@@ -1,13 +1,14 @@
 use super::AppState;
 use crate::config::Settings;
 use crate::http_server::handlers::{
-    cached_get_recommendations, cached_maybe_spammer, serve_root_page,
+    cached_check_if_trusted, cached_get_recommendations, serve_root_page,
 };
 use crate::metrics::setup_metrics;
+use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{RepoError, RepoTrait};
 use axum::{body::Body, http::StatusCode, response::IntoResponse, routing::get, Router};
 use hyper::http::{header, HeaderValue, Method, Request};
-use std::{sync::Arc, time::Duration}; // Use `hyper::http` instead of `http`
+use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
@@ -15,22 +16,33 @@ use tower_governor::{
 use tower_http::{
     cors::{Any, CorsLayer},
     timeout::TimeoutLayer,
-    trace::{DefaultMakeSpan, TraceLayer},
+    trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer},
+    LatencyUnit,
 };
 use tracing::{error, Level};
 
-pub fn create_router<T>(state: Arc<AppState<T>>, settings: &Settings) -> Result<Router, ApiError>
+pub fn create_router<T, U>(
+    state: Arc<AppState<T, U>>,
+    settings: &Settings,
+) -> Result<Router, ApiError>
 where
     T: RepoTrait + 'static,
+    U: GetEventsOf + 'static,
 {
-    let tracing_layer =
-        TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::new().level(Level::INFO));
+    let tracing_layer = TraceLayer::new_for_http()
+        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .on_response(
+            DefaultOnResponse::new()
+                .level(Level::INFO)
+                .latency_unit(LatencyUnit::Millis),
+        )
+        .on_failure(DefaultOnFailure::new().level(Level::ERROR));
 
     let metrics_handle = setup_metrics().map_err(|e| ApiError::InternalServerError(e.into()))?;
     let rate_limit_config = GovernorConfigBuilder::default()
         .key_extractor(SmartIpKeyExtractor)
-        .per_second(25)
-        .burst_size(35)
+        .per_second(1000) // Let's start big, we reduce it after metrics
+        .burst_size(2000)
         .use_headers()
         .finish()
         .unwrap();
@@ -58,9 +70,9 @@ where
             Router::new()
                 .route(
                     "/recommendations/:pubkey",
-                    get(cached_get_recommendations::<T>),
+                    get(cached_get_recommendations::<T, U>),
                 )
-                .route("/maybe_spammer/:pubkey", get(cached_maybe_spammer::<T>))
+                .route("/trusted/:pubkey", get(cached_check_if_trusted::<T, U>))
                 .layer(TimeoutLayer::new(Duration::from_secs(5)))
                 .layer(GovernorLayer {
                     config: Arc::new(rate_limit_config),

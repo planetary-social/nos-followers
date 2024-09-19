@@ -1,4 +1,3 @@
-pub mod account_info;
 pub mod config;
 pub mod domain;
 pub mod follow_change_handler;

@@ -28,10 +28,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("nos_followers=info")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     ring::default_provider()
@@ -152,7 +149,7 @@ async fn start(settings: Settings) -> Result<()> {
 
     start_nostr_subscription(
         task_tracker.clone(),
-        shared_nostr_client,
+        shared_nostr_client.clone(),
         [settings.relay.clone()].into(),
         filters,
         event_sender.clone(),
@@ -182,7 +179,8 @@ async fn start(settings: Settings) -> Result<()> {
     HttpServer::start(
         task_tracker.clone(),
         &settings,
-        repo.clone(),
+        repo,
+        shared_nostr_client,
         cancellation_token.clone(),
     )?;
 

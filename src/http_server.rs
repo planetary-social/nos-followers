@@ -1,9 +1,11 @@
 mod handlers;
 mod router;
+mod trust_policy;
 
 use crate::{
     config::Settings,
-    repo::{Recommendation, Repo, RepoTrait},
+    relay_subscriber::GetEventsOf,
+    repo::{Recommendation, RepoTrait},
 };
 use anyhow::{Context, Result};
 use axum::Router;
@@ -16,47 +18,56 @@ use tokio::time::timeout;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, info};
 
-pub struct AppState<T>
+pub struct AppState<T, U>
 where
     T: RepoTrait,
+    U: GetEventsOf,
 {
     pub repo: Arc<T>,
+    pub nostr_client: Arc<U>,
     pub recommendation_cache: Cache<String, Vec<Recommendation>>,
-    pub spammer_cache: Cache<String, bool>,
+    pub trust_cache: Cache<String, bool>,
 }
 
-impl<T> AppState<T>
+impl<T, U> AppState<T, U>
 where
     T: RepoTrait + 'static,
+    U: GetEventsOf + 'static,
 {
-    pub fn new(repo: Arc<T>) -> Self {
+    pub fn new(repo: Arc<T>, nostr_client: Arc<U>) -> Self {
         let recommendation_cache = Cache::builder()
             .time_to_live(Duration::from_secs(86400)) // 1 day
             .max_capacity(4000)
             .build();
 
-        let spammer_cache = Cache::builder()
+        let trust_cache = Cache::builder()
             .time_to_live(Duration::from_secs(86400)) // 1 day
             .max_capacity(4000)
             .build();
 
         Self {
             repo,
+            nostr_client,
             recommendation_cache,
-            spammer_cache,
+            trust_cache,
         }
     }
 }
 
 pub struct HttpServer;
 impl HttpServer {
-    pub fn start(
+    pub fn start<T, U>(
         task_tracker: TaskTracker,
         settings: &Settings,
-        repo: Arc<Repo>,
+        repo: Arc<T>,
+        nostr_client: Arc<U>,
         cancellation_token: CancellationToken,
-    ) -> Result<()> {
-        let state = Arc::new(AppState::new(repo));
+    ) -> Result<()>
+    where
+        T: RepoTrait + 'static,
+        U: GetEventsOf + 'static,
+    {
+        let state = Arc::new(AppState::new(repo, nostr_client));
         let router = create_router(state, settings)?;
 
         start_http_server(task_tracker, settings.http_port, router, cancellation_token);

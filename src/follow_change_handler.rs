@@ -1,6 +1,6 @@
-use crate::account_info::{refresh_friendly_id, FriendlyId};
 use crate::config::Settings;
 use crate::domain::FollowChange;
+use crate::domain::{refresh_friendly_id, FriendlyId};
 use crate::google_pubsub_client::GooglePubSubClient;
 use crate::publisher::{Publisher, PublisherError};
 use crate::relay_subscriber::GetEventsOf;
@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
 /// Fetches friendly ids and then sends follow change to google pubsub
 pub struct FollowChangeHandler<T: GetEventsOf> {
     repo: Arc<Repo>,
@@ -54,24 +55,22 @@ where
 #[async_trait]
 impl<T: GetEventsOf> WorkerTask<Box<FollowChange>> for FollowChangeHandler<T> {
     async fn call(&self, mut follow_change: Box<FollowChange>) -> Result<(), Box<dyn Error>> {
-        // Fetch friendly IDs for the pubkeys or fallback to the DB if it takes
+        // Fetch friendly IDs for the followee pubkey or fallback to the DB if it takes
         // more than timeout_secs. Whatever is found through the network is
-        // cached.
-        let (friendly_follower, friendly_followee) = tokio::select!(
-            result = fetch_friendly_ids(
-                &self.repo,
-                self.nostr_client.clone(),
-                &follow_change
-            ) => result,
-            result = get_friendly_ids_from_db(&self.repo, &follow_change, self.timeout_secs) => result
+        // cached. The follower friendly id was already fetched by the differ.
+        let friendly_followee = tokio::select!(
+            result = refresh_friendly_id(&self.repo, &self.nostr_client, follow_change.followee()) => result,
+            result = get_friendly_id_from_db(&self.repo, follow_change.followee(), self.timeout_secs) => result
         );
 
         debug!(
             "Fetched friendly IDs for follow change from {} to {}, queueing for publication",
-            friendly_follower, friendly_followee
+            follow_change.friendly_follower(),
+            friendly_followee
         );
 
-        follow_change.set_friendly_follower(friendly_follower);
+        // Save both now
+        follow_change.set_friendly_follower(follow_change.friendly_follower().clone());
         follow_change.set_friendly_followee(friendly_followee);
 
         self.publisher.queue_publication(follow_change).await?;
@@ -79,49 +78,22 @@ impl<T: GetEventsOf> WorkerTask<Box<FollowChange>> for FollowChangeHandler<T> {
     }
 }
 
-/// Get pubkey info from Nostr metadata or nip05 servers
-async fn fetch_friendly_ids<T: GetEventsOf>(
-    repo: &Arc<Repo>,
-    nostr_client: Arc<T>,
-    follow_change: &FollowChange,
-) -> (FriendlyId, FriendlyId) {
-    let (friendly_follower, friendly_followee) = tokio::join!(
-        refresh_friendly_id(repo, &nostr_client, follow_change.follower()),
-        refresh_friendly_id(repo, &nostr_client, follow_change.followee()),
-    );
-
-    (friendly_follower, friendly_followee)
-}
-
 /// Waits some seconds (to give some time for the pubkey info to be found from
 /// nostr metadata or nip05 servers) and then just fetches whatever is found in
 /// the DB
-async fn get_friendly_ids_from_db(
+async fn get_friendly_id_from_db(
     repo: &Arc<Repo>,
-    follow_change: &FollowChange,
+    public_key: &PublicKey,
     timeout_secs: u64,
-) -> (FriendlyId, FriendlyId) {
+) -> FriendlyId {
     sleep(std::time::Duration::from_secs(timeout_secs)).await;
 
-    let (friendly_follower, friendly_followee) = tokio::join!(
-        repo.get_friendly_id(follow_change.follower()),
-        repo.get_friendly_id(follow_change.followee())
-    );
+    let friendly_followee = repo.get_friendly_id(public_key).await;
 
-    (
-        friendly_follower.ok().flatten().unwrap_or(
-            follow_change
-                .follower()
-                .to_bech32()
-                .map(FriendlyId::Npub)
-                .unwrap_or(FriendlyId::PublicKey(follow_change.follower().to_hex())),
-        ),
-        friendly_followee.ok().flatten().unwrap_or(
-            follow_change
-                .followee()
-                .to_bech32()
-                .map(FriendlyId::Npub)
-                .unwrap_or(FriendlyId::PublicKey(follow_change.followee().to_hex())),
-        ),
+    friendly_followee.ok().flatten().unwrap_or(
+        public_key
+            .to_bech32()
+            .map(FriendlyId::Npub)
+            .unwrap_or(FriendlyId::PublicKey(public_key.to_hex())),
     )
 }

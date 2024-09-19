@@ -1,4 +1,4 @@
-use crate::account_info::{fetch_account_info, AccountInfo};
+use crate::domain::AccountInfo;
 use crate::metrics;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
@@ -58,22 +58,33 @@ where
         let follower = event.pubkey;
 
         let event_created_at = convert_timestamp(event.created_at.as_u64())?;
-        let maybe_last_seen_contact_list = self
-            .repo
-            .maybe_update_last_contact_list_at(&follower, &event_created_at)
-            .await?;
+        let maybe_account_info = self.repo.get_account_info(&follower).await?;
+        let mut account_info =
+            maybe_account_info.unwrap_or_else(|| AccountInfo::new(follower.clone()));
 
         // Check if the event is older than the latest stored update and skip if so
-        if let Some(last_seen_contact_list) = maybe_last_seen_contact_list {
-            if event.created_at <= (last_seen_contact_list.timestamp() as u64).into() {
+        if let Some(last_contact_list_at) = account_info.last_contact_list_at {
+            if event_created_at < last_contact_list_at {
                 debug!(
                     "Skipping follow list for {} as it's older than the last update",
                     follower.to_bech32().unwrap_or_default()
                 );
+
                 metrics::already_seen_contact_lists().increment(1);
                 return Ok(());
             }
         }
+
+        account_info.last_contact_list_at = Some(event_created_at);
+        self.repo
+            .update_last_contact_list_at(&follower, &event_created_at)
+            .await?;
+
+        // Grab profile nostr event and update what we know
+        // TODO: This should be done in a separate worker
+        account_info
+            .refresh_metadata(&self.nostr_client, true)
+            .await;
 
         // Get the stored follows and the latest update time from the database
         let mut follows_diff = self.initialize_follows_diff(&follower).await?;
@@ -83,12 +94,7 @@ where
 
         // Process the follows_diff and apply changes
         let (followed_counter, unfollowed_counter, unchanged) = self
-            .process_follows_diff(
-                follows_diff,
-                &follower,
-                event_created_at,
-                maybe_last_seen_contact_list,
-            )
+            .process_follows_diff(follows_diff, &follower, event_created_at, &account_info)
             .await?;
 
         if let Some(log_line) = log_line(
@@ -96,7 +102,7 @@ where
             followed_counter,
             unfollowed_counter,
             unchanged,
-            maybe_last_seen_contact_list,
+            account_info,
             &event,
         ) {
             info!("{}", log_line);
@@ -163,19 +169,14 @@ where
         follows_diff: HashMap<PublicKey, FollowsDiff>,
         follower: &PublicKey,
         event_created_at: DateTime<Utc>,
-        maybe_last_seen_contact_list_at: Option<DateTime<Utc>>,
+        account_info: &AccountInfo,
     ) -> Result<(usize, usize, usize)> {
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
 
-        let send_notifications = should_send_notifications(
-            &self.nostr_client,
-            maybe_last_seen_contact_list_at,
-            follower,
-            event_created_at,
-        )
-        .await?;
+        let send_notifications =
+            should_send_notifications(&account_info, follower, event_created_at).await?;
 
         for (followee, diff) in follows_diff {
             match diff.stored_follow {
@@ -189,7 +190,8 @@ where
 
                         if send_notifications {
                             let follow_change =
-                                FollowChange::new_unfollowed(event_created_at, *follower, followee);
+                                FollowChange::new_unfollowed(event_created_at, *follower, followee)
+                                    .with_friendly_follower(account_info.friendly_id.clone());
                             self.send_follow_change(follow_change)?;
                         }
                         unfollowed_counter += 1;
@@ -207,7 +209,8 @@ where
 
                         if send_notifications {
                             let follow_change =
-                                FollowChange::new_followed(event_created_at, *follower, followee);
+                                FollowChange::new_followed(event_created_at, *follower, followee)
+                                    .with_friendly_follower(account_info.friendly_id.clone());
                             self.send_follow_change(follow_change)?;
                         }
                         followed_counter += 1;
@@ -235,9 +238,8 @@ const ONE_WEEK_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7);
 const ONE_MONTH_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7 * 4);
 
 /// Heuristics to decide if we should send notifications for a contact list or just update the DB.
-async fn should_send_notifications<T: GetEventsOf>(
-    nostr_client: &Arc<T>,
-    maybe_last_seen_contact_list: Option<DateTime<Utc>>,
+async fn should_send_notifications(
+    account_info: &AccountInfo,
     follower: &PublicKey,
     event_created_at: DateTime<Utc>,
 ) -> Result<bool> {
@@ -251,9 +253,9 @@ async fn should_send_notifications<T: GetEventsOf>(
         return Ok(false);
     }
 
-    if maybe_last_seen_contact_list.is_none() {
+    if account_info.last_contact_list_at.is_none() {
         // This is the first time we see a contact list from this follower.
-        let AccountInfo { created_at, .. } = fetch_account_info(nostr_client, follower).await;
+        let created_at = account_info.created_at;
 
         // Not really the creation date, but the last time the profile was updated
         let Some(follower_created_at) = created_at else {
@@ -317,7 +319,7 @@ fn log_line(
     followed_counter: usize,
     unfollowed_counter: usize,
     unchanged: usize,
-    maybe_last_seen_contact_list: Option<DateTime<Utc>>,
+    account_info: AccountInfo,
     event: &Event,
 ) -> Option<String> {
     if unchanged > 0 && followed_counter == 0 && unfollowed_counter == 0 {
@@ -325,23 +327,23 @@ fn log_line(
         debug!(
             "No changes for {}. Last seen contact list: {:?}",
             follower.to_bech32().unwrap_or_default(),
-            maybe_last_seen_contact_list
+            account_info.last_contact_list_at,
         );
         return None;
     }
 
     let human_event_created_at = event.created_at.to_human_datetime();
 
-    let last_seen_contact_list = if let Some(last_seen_contact_list) = maybe_last_seen_contact_list
-    {
-        last_seen_contact_list.to_rfc3339()
-    } else {
-        "new".to_string()
-    };
+    let last_seen_contact_list =
+        if let Some(last_seen_contact_list) = account_info.last_contact_list_at {
+            last_seen_contact_list.to_rfc3339()
+        } else {
+            "new".to_string()
+        };
 
     let timestamp_diff = format!("[{}->{}]", last_seen_contact_list, human_event_created_at);
 
-    if maybe_last_seen_contact_list.is_none() {
+    if account_info.last_contact_list_at.is_none() {
         return Some(format!(
             "Npub {}: date {}, {} followed, new follows list",
             follower.to_bech32().unwrap_or_default(),
@@ -439,11 +441,11 @@ mod tests {
     }
 
     impl RepoTrait for MockRepo {
-        async fn maybe_update_last_contact_list_at(
+        async fn update_last_contact_list_at(
             &self,
             public_key: &PublicKey,
             at: &DateTime<Utc>,
-        ) -> Result<Option<DateTime<Utc>>, RepoError> {
+        ) -> Result<(), RepoError> {
             let mut follows = self.follows.lock().await;
             let entry = follows.entry(*public_key).or_default();
             let previous_value = entry.1;
@@ -452,7 +454,7 @@ mod tests {
                 entry.1 = Some(*at);
             }
 
-            Ok(previous_value)
+            Ok(())
         }
 
         async fn upsert_follow(&self, follow: &ContactListFollow) -> Result<(), RepoError> {
@@ -481,6 +483,25 @@ mod tests {
         ) -> Result<Vec<ContactListFollow>, RepoError> {
             let follows = self.follows.lock().await;
             Ok(follows.get(follower).cloned().unwrap_or_default().0)
+        }
+
+        async fn get_account_info(
+            &self,
+            follower: &PublicKey,
+        ) -> Result<Option<AccountInfo>, RepoError> {
+            let follows = self.follows.lock().await;
+            Ok(follows
+                .get(follower)
+                .cloned()
+                .map(|(_follows, last)| AccountInfo {
+                    public_key: *follower,
+                    last_contact_list_at: last,
+                    friendly_id: None,
+                    created_at: None,
+                    follower_count: None,
+                    followee_count: None,
+                    pagerank: None,
+                }))
         }
     }
 

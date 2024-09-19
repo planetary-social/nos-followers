@@ -15,3 +15,6 @@ pub use notification_message::{NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
 
 pub mod followee_notification_factory;
 pub use followee_notification_factory::FolloweeNotificationFactory;
+
+pub mod account_info;
+pub use account_info::{refresh_friendly_id, AccountInfo, FriendlyId};
