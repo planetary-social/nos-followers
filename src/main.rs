@@ -178,9 +178,10 @@ async fn start(settings: Settings) -> Result<()> {
     .await
     .context("Failed starting the scheduler")?;
 
+    info!("Starting HTTP server at port {}", settings.http_port);
     HttpServer::start(
         task_tracker.clone(),
-        settings.http_port,
+        &settings,
         repo.clone(),
         cancellation_token.clone(),
     )?;

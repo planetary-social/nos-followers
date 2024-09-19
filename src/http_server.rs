@@ -1,5 +1,10 @@
+mod handlers;
 mod router;
-use crate::repo::{Recommendation, Repo, RepoTrait};
+
+use crate::{
+    config::Settings,
+    repo::{Recommendation, Repo, RepoTrait},
+};
 use anyhow::{Context, Result};
 use axum::Router;
 use moka::future::Cache;
@@ -47,14 +52,14 @@ pub struct HttpServer;
 impl HttpServer {
     pub fn start(
         task_tracker: TaskTracker,
-        http_port: u16,
+        settings: &Settings,
         repo: Arc<Repo>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
         let state = Arc::new(AppState::new(repo));
-        let router = create_router(state)?;
+        let router = create_router(state, settings)?;
 
-        start_http_server(task_tracker, http_port, router, cancellation_token);
+        start_http_server(task_tracker, settings.http_port, router, cancellation_token);
 
         Ok(())
     }
@@ -76,10 +81,13 @@ fn start_http_server(
 
         let token_clone = cancellation_token.clone();
         let server_future = tokio::spawn(async {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown_hook(token_clone))
-                .await
-                .context("Failed to start HTTP server")
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_hook(token_clone))
+            .await
+            .context("Failed to start HTTP server")
         });
 
         await_shutdown(cancellation_token, server_future).await;

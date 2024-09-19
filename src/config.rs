@@ -23,6 +23,7 @@ pub struct Settings {
     pub tcp_importer_port: u16,
     pub http_port: u16,
     pub pagerank_cron_expression: String,
+    pub http_cache_seconds: u32,
 }
 
 impl Configurable for Settings {

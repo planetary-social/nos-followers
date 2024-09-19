@@ -1,5 +1,5 @@
 use metrics::{describe_counter, describe_gauge, describe_histogram, Counter, Gauge, Histogram};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
 
 pub fn pubsub_messages() -> Counter {
     metrics::counter!("pubsub_messages")
@@ -69,7 +69,7 @@ pub fn pagerank_seconds() -> Gauge {
     metrics::gauge!("pagerank_seconds")
 }
 
-pub fn setup_metrics() -> Result<PrometheusHandle, anyhow::Error> {
+pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
     describe_counter!(
         "pubsub_messages",
         "Number of messages published to Google Pub/Sub"

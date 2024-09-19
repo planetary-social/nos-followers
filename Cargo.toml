@@ -18,6 +18,7 @@ config_rs = { version = "0.14", package = "config", features = ["yaml"] }
 env_logger = "0.11.5"
 futures = "0.3.30"
 gcloud-sdk = { version = "0.25.6", features = ["google-pubsub-v1"] }
+hyper = "1.4.1"
 log = "0.4.22"
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
@@ -35,7 +36,9 @@ tokio = { version = "1.40.0", features = ["full", "test-util"] }
 tokio-cron-scheduler = "0.11.0"
 tokio-retry = "0.3.0"
 tokio-util = { version = "0.7.11", features = ["rt"] }
-tower-http = { version = "0.5.2", features = ["timeout", "trace"] }
+tower = "0.5.1"
+tower-http = { version = "0.5.2", features = ["cors", "timeout", "trace"] }
+tower_governor = "0.4.2"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "tracing-log"] }
 

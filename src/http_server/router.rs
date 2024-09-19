@@ -1,134 +1,91 @@
 use super::AppState;
+use crate::config::Settings;
+use crate::http_server::handlers::{
+    cached_get_recommendations, cached_maybe_spammer, serve_root_page,
+};
 use crate::metrics::setup_metrics;
-use crate::repo::{Recommendation, RepoError, RepoTrait};
-use anyhow::Result;
-use axum::{
-    extract::State, http::HeaderMap, http::StatusCode, response::Html, response::IntoResponse,
-    routing::get, Json, Router,
-};
-use nostr_sdk::PublicKey;
-use std::{sync::Arc, time::Duration};
+use crate::repo::{RepoError, RepoTrait};
+use axum::{body::Body, http::StatusCode, response::IntoResponse, routing::get, Router};
+use hyper::http::{header, HeaderValue, Method, Request};
+use std::{sync::Arc, time::Duration}; // Use `hyper::http` instead of `http`
 use thiserror::Error;
-use tower_http::{
-    timeout::TimeoutLayer,
-    trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer},
-    LatencyUnit,
+use tower_governor::{
+    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
 };
-use tracing::{error, info, Level};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    timeout::TimeoutLayer,
+    trace::{DefaultMakeSpan, TraceLayer},
+};
+use tracing::{error, Level};
 
-pub fn create_router<T>(state: Arc<AppState<T>>) -> Result<Router>
+pub fn create_router<T>(state: Arc<AppState<T>>, settings: &Settings) -> Result<Router, ApiError>
 where
-    T: RepoTrait + 'static, // 'static is needed because the router needs to be static
+    T: RepoTrait + 'static,
 {
-    let tracing_layer = TraceLayer::new_for_http()
-        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-        .on_response(
-            DefaultOnResponse::new()
-                .level(Level::INFO)
-                .latency_unit(LatencyUnit::Millis),
-        )
-        .on_failure(DefaultOnFailure::new().level(Level::ERROR));
+    let tracing_layer =
+        TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::new().level(Level::INFO));
 
-    let metrics_handle = setup_metrics()?;
+    let metrics_handle = setup_metrics().map_err(|e| ApiError::InternalServerError(e.into()))?;
+    let rate_limit_config = GovernorConfigBuilder::default()
+        .key_extractor(SmartIpKeyExtractor)
+        .per_second(25)
+        .burst_size(35)
+        .use_headers()
+        .finish()
+        .unwrap();
+
+    let cors = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::PUT,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(Any)
+        .allow_origin(Any)
+        .max_age(Duration::from_secs(86400));
+
+    let cache_duration = settings.http_cache_seconds;
 
     Ok(Router::new()
         .route("/", get(serve_root_page))
         .route("/metrics", get(|| async move { metrics_handle.render() }))
-        .route(
-            "/recommendations/:pubkey",
-            get(cached_get_recommendations::<T>),
+        .nest(
+            "/api/v1",
+            Router::new()
+                .route(
+                    "/recommendations/:pubkey",
+                    get(cached_get_recommendations::<T>),
+                )
+                .route("/maybe_spammer/:pubkey", get(cached_maybe_spammer::<T>))
+                .layer(TimeoutLayer::new(Duration::from_secs(5)))
+                .layer(GovernorLayer {
+                    config: Arc::new(rate_limit_config),
+                })
+                .layer(cors)
+                .route_layer(axum::middleware::from_fn(move |req, next| {
+                    add_cache_header(req, next, cache_duration)
+                }))
+                .with_state(state),
         )
-        .route("/maybe_spammer/:pubkey", get(cached_maybe_spammer::<T>))
-        .layer(tracing_layer)
-        .layer(TimeoutLayer::new(Duration::from_secs(5)))
-        .with_state(state))
+        .layer(tracing_layer))
 }
 
-async fn cached_get_recommendations<T>(
-    State(state): State<Arc<AppState<T>>>,
-    axum::extract::Path(pubkey): axum::extract::Path<String>,
-) -> Result<Json<Vec<Recommendation>>, ApiError>
-where
-    T: RepoTrait,
-{
-    let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
-    if let Some(cached_recommendation_result) = state.recommendation_cache.get(&pubkey).await {
-        return Ok(Json(cached_recommendation_result));
-    }
+async fn add_cache_header(
+    req: Request<Body>,
+    next: axum::middleware::Next,
+    cache_duration: u32,
+) -> impl IntoResponse {
+    let mut response = next.run(req).await;
 
-    let recommendations = get_recommendations(&state.repo, public_key).await?;
-
-    state
-        .recommendation_cache
-        .insert(pubkey, recommendations.clone())
-        .await;
-
-    Ok(Json(recommendations))
-}
-
-async fn get_recommendations<T>(
-    repo: &Arc<T>,
-    public_key: PublicKey,
-) -> Result<Vec<Recommendation>, ApiError>
-where
-    T: RepoTrait,
-{
-    repo.get_recommendations(&public_key)
-        .await
-        .map_err(ApiError::from)
-}
-
-async fn cached_maybe_spammer<T>(
-    State(state): State<Arc<AppState<T>>>, // Extract shared state with generic RepoTrait
-    axum::extract::Path(pubkey): axum::extract::Path<String>, // Extract pubkey from the path
-) -> Result<Json<bool>, ApiError>
-where
-    T: RepoTrait,
-{
-    let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
-
-    if let Some(cached_spammer_result) = state.spammer_cache.get(&pubkey).await {
-        return Ok(Json(cached_spammer_result));
-    }
-
-    let is_spammer = maybe_spammer(&state.repo, public_key).await?;
-
-    state.spammer_cache.insert(pubkey, is_spammer).await;
-
-    Ok(Json(is_spammer))
-}
-
-async fn maybe_spammer<T>(repo: &Arc<T>, public_key: PublicKey) -> Result<bool, ApiError>
-where
-    T: RepoTrait,
-{
-    info!("Checking if {} is a spammer", public_key.to_hex());
-    let pagerank = repo
-        .get_pagerank(&public_key)
-        .await
-        .map_err(|_| ApiError::NotFound)?;
-
-    info!("Pagerank for {}: {}", public_key.to_hex(), pagerank);
-
-    Ok(pagerank < 0.2)
-    // TODO don't return if it's too low, instead use other manual
-    // checks, nos user, nip05, check network, more hints, and only then
-    // give up
-}
-
-async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {
-    let body = r#"
-        <html>
-            <head>
-                <title>Nos Followers Server</title>
-            </head>
-            <body>
-                <h1>Healthy</h1>
-            </body>
-        </html>
-    "#;
-
-    Html(body)
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_str(&format!("public, max-age={}", cache_duration)).unwrap(),
+    );
+    response
 }
 
 #[derive(Error, Debug)]
@@ -141,6 +98,8 @@ pub enum ApiError {
     RepoError(#[from] RepoError),
     #[error(transparent)]
     AxumError(#[from] axum::Error),
+    #[error("Internal server errorre")]
+    InternalServerError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 impl IntoResponse for ApiError {
@@ -150,6 +109,9 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::RepoError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             ApiError::AxumError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Axum error".to_string()),
+            ApiError::InternalServerError(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+            }
         };
 
         error!("Api error: {}", self);
