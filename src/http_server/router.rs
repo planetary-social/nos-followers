@@ -2,20 +2,19 @@ use super::AppState;
 use crate::metrics::setup_metrics;
 use crate::repo::{Recommendation, RepoError, RepoTrait};
 use anyhow::Result;
-use axum::Json;
 use axum::{
     extract::State, http::HeaderMap, http::StatusCode, response::Html, response::IntoResponse,
-    routing::get, Router,
+    routing::get, Json, Router,
 };
 use nostr_sdk::PublicKey;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use thiserror::Error;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tower_http::LatencyUnit;
-use tower_http::{timeout::TimeoutLayer, trace::DefaultOnFailure};
-use tracing::Level;
-use tracing::{error, info};
+use tower_http::{
+    timeout::TimeoutLayer,
+    trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer},
+    LatencyUnit,
+};
+use tracing::{error, info, Level};
 
 pub fn create_router<T>(state: Arc<AppState<T>>) -> Result<Router>
 where
@@ -37,31 +36,27 @@ where
         .route("/metrics", get(|| async move { metrics_handle.render() }))
         .route(
             "/recommendations/:pubkey",
-            get(get_recommendations_handler::<T>),
-        ) // Make handler generic
-        .route("/maybe_spammer/:pubkey", get(maybe_spammer::<T>)) // Make handler generic
+            get(cached_get_recommendations::<T>),
+        )
+        .route("/maybe_spammer/:pubkey", get(cached_maybe_spammer::<T>))
         .layer(tracing_layer)
         .layer(TimeoutLayer::new(Duration::from_secs(5)))
-        .with_state(state)) // Attach state to the router
+        .with_state(state))
 }
 
-async fn get_recommendations_handler<T>(
-    State(state): State<Arc<AppState<T>>>, // Extract shared state with generic RepoTrait
-    axum::extract::Path(pubkey): axum::extract::Path<String>, // Extract pubkey from the path
+async fn cached_get_recommendations<T>(
+    State(state): State<Arc<AppState<T>>>,
+    axum::extract::Path(pubkey): axum::extract::Path<String>,
 ) -> Result<Json<Vec<Recommendation>>, ApiError>
 where
     T: RepoTrait,
 {
-    let public_key = PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey)?;
+    let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
     if let Some(cached_recommendation_result) = state.recommendation_cache.get(&pubkey).await {
         return Ok(Json(cached_recommendation_result));
     }
 
-    let recommendations = state
-        .repo
-        .get_recommendations(&public_key)
-        .await
-        .map_err(ApiError::from)?;
+    let recommendations = get_recommendations(&state.repo, public_key).await?;
 
     state
         .recommendation_cache
@@ -71,45 +66,54 @@ where
     Ok(Json(recommendations))
 }
 
-async fn maybe_spammer<T>(
-    State(state): State<Arc<AppState<T>>>, // Extract shared state with generic RepoTrait
-    axum::extract::Path(pubkey): axum::extract::Path<String>, // Extract pubkey from the path
-) -> Json<bool>
+async fn get_recommendations<T>(
+    repo: &Arc<T>,
+    public_key: PublicKey,
+) -> Result<Vec<Recommendation>, ApiError>
 where
     T: RepoTrait,
 {
-    let public_key = match PublicKey::from_hex(&pubkey).map_err(|_| ApiError::InvalidPublicKey) {
-        Ok(public_key) => public_key,
-        Err(e) => {
-            error!("Invalid public key: {}", e);
-            return Json(true);
-        }
-    };
-
-    if let Some(cached_spammer_result) = state.spammer_cache.get(&pubkey).await {
-        return Json(cached_spammer_result);
-    }
-
-    match state
-        .repo
-        .get_pagerank(&public_key)
+    repo.get_recommendations(&public_key)
         .await
         .map_err(ApiError::from)
-    {
-        Ok(pagerank) => {
-            info!("Pagerank for {}: {}", public_key.to_hex(), pagerank);
-            let is_spammer = pagerank < 0.2;
-            state.spammer_cache.insert(pubkey, is_spammer).await;
-            Json(is_spammer)
-            // TODO don't return if it's too low, instead use other manual
-            // checks, nos user, nip05, check network, more hints, and only then
-            // give up
-        }
-        Err(e) => {
-            error!("Invalid public key: {}", e);
-            Json(true)
-        }
+}
+
+async fn cached_maybe_spammer<T>(
+    State(state): State<Arc<AppState<T>>>, // Extract shared state with generic RepoTrait
+    axum::extract::Path(pubkey): axum::extract::Path<String>, // Extract pubkey from the path
+) -> Result<Json<bool>, ApiError>
+where
+    T: RepoTrait,
+{
+    let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
+
+    if let Some(cached_spammer_result) = state.spammer_cache.get(&pubkey).await {
+        return Ok(Json(cached_spammer_result));
     }
+
+    let is_spammer = maybe_spammer(&state.repo, public_key).await?;
+
+    state.spammer_cache.insert(pubkey, is_spammer).await;
+
+    Ok(Json(is_spammer))
+}
+
+async fn maybe_spammer<T>(repo: &Arc<T>, public_key: PublicKey) -> Result<bool, ApiError>
+where
+    T: RepoTrait,
+{
+    info!("Checking if {} is a spammer", public_key.to_hex());
+    let pagerank = repo
+        .get_pagerank(&public_key)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
+
+    info!("Pagerank for {}: {}", public_key.to_hex(), pagerank);
+
+    Ok(pagerank < 0.2)
+    // TODO don't return if it's too low, instead use other manual
+    // checks, nos user, nip05, check network, more hints, and only then
+    // give up
 }
 
 async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {
@@ -130,7 +134,9 @@ async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {
 #[derive(Error, Debug)]
 pub enum ApiError {
     #[error("Invalid public key")]
-    InvalidPublicKey,
+    InvalidPublicKey(#[from] nostr_sdk::nostr::key::Error),
+    #[error("Not found, try later")]
+    NotFound,
     #[error(transparent)]
     RepoError(#[from] RepoError),
     #[error(transparent)]
@@ -139,17 +145,14 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, body) = match self {
-            ApiError::InvalidPublicKey => {
-                (StatusCode::BAD_REQUEST, "Invalid public key".to_string())
-            }
-            ApiError::RepoError(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Repository error".to_string(),
-            ),
+        let (status, body) = match &self {
+            ApiError::InvalidPublicKey(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
+            ApiError::RepoError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             ApiError::AxumError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Axum error".to_string()),
         };
-        error!("Api error: {}", body);
+
+        error!("Api error: {}", self);
         (status, body).into_response()
     }
 }

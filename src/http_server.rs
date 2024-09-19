@@ -20,7 +20,6 @@ where
     pub spammer_cache: Cache<String, bool>,
 }
 
-// Initialize AppState with caches
 impl<T> AppState<T>
 where
     T: RepoTrait + 'static,
@@ -52,8 +51,8 @@ impl HttpServer {
         repo: Arc<Repo>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
-        let state = Arc::new(AppState::new(repo)); // Create the shared state
-        let router = create_router(state)?; // Pass the state to the router
+        let state = Arc::new(AppState::new(repo));
+        let router = create_router(state)?;
 
         start_http_server(task_tracker, http_port, router, cancellation_token);
 
@@ -74,6 +73,7 @@ fn start_http_server(
             cancellation_token.cancel();
             return;
         };
+
         let token_clone = cancellation_token.clone();
         let server_future = tokio::spawn(async {
             axum::serve(listener, router)
