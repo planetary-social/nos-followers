@@ -44,7 +44,7 @@ impl Publisher {
         min_seconds_between_messages: NonZeroUsize,
     ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) =
-            mpsc::channel::<Box<FollowChange>>(2000);
+            mpsc::channel::<Box<FollowChange>>(20000);
 
         let mut buffer = NotificationFactory::new(min_seconds_between_messages);
         tokio::spawn(async move {
