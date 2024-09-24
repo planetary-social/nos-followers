@@ -13,6 +13,6 @@ followers:
   google_project_id: "pub-verse-app"
   google_topic: "follow-changes"
   flush_period_seconds: 60 # how often to flush the buffer to generate messages
-  min_seconds_between_messages: 1800 # 30 minutes, so no more than 2 messages per hour
+  min_seconds_between_messages: 43200 # Half a day, so 2 messages per day
   pagerank_cron_expression: "0 0 0 * * *" # Daily at midnight
   http_cache_seconds: 86400 # 24 hours
