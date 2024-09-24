@@ -59,8 +59,7 @@ where
 
         let event_created_at = convert_timestamp(event.created_at.as_u64())?;
         let maybe_account_info = self.repo.get_account_info(&follower).await?;
-        let mut account_info =
-            maybe_account_info.unwrap_or_else(|| AccountInfo::new(follower.clone()));
+        let mut account_info = maybe_account_info.unwrap_or_else(|| AccountInfo::new(follower));
 
         // Check if the event is older than the latest stored update and skip if so
         if let Some(last_contact_list_at) = account_info.last_contact_list_at {
@@ -176,7 +175,7 @@ where
         let mut unchanged = 0;
 
         let send_notifications =
-            should_send_notifications(&account_info, follower, event_created_at).await?;
+            should_send_notifications(account_info, follower, event_created_at).await?;
 
         for (followee, diff) in follows_diff {
             match diff.stored_follow {

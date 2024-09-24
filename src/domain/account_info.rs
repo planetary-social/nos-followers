@@ -258,7 +258,7 @@ pub async fn refresh_friendly_id<T: GetEventsOf>(
     nostr_client: &Arc<T>,
     public_key: &PublicKey,
 ) -> FriendlyId {
-    let mut account_info = AccountInfo::new(public_key.clone());
+    let mut account_info = AccountInfo::new(*public_key);
     account_info.refresh_metadata(nostr_client, true).await;
 
     let friendly_id = account_info
@@ -308,7 +308,7 @@ async fn get_verified_friendly_id(
         return metadata.get_friendly_id(public_key);
     };
 
-    if !nip05_verifier.verify_nip05(public_key, &nip05_value).await {
+    if !nip05_verifier.verify_nip05(public_key, nip05_value).await {
         // Verification failed
         return metadata.get_friendly_id(public_key);
     }
@@ -357,7 +357,7 @@ mod tests {
             None => &Keys::generate(),
         };
 
-        let profile_event = EventBuilder::metadata(&metadata).to_event(&keys).unwrap();
+        let profile_event = EventBuilder::metadata(&metadata).to_event(keys).unwrap();
         let nostr_metadata = NostrMetadata::from(profile_event);
 
         let friendly_id =

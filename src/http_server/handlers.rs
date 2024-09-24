@@ -4,7 +4,6 @@ use super::AppState;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{Recommendation, RepoTrait};
 use axum::{extract::State, http::HeaderMap, response::Html, response::IntoResponse, Json};
-use chrono::Utc;
 use nostr_sdk::PublicKey;
 use std::sync::Arc;
 use tracing::info;
@@ -70,27 +69,20 @@ async fn check_if_trusted<T>(repo: &Arc<T>, public_key: &PublicKey) -> Result<bo
 where
     T: RepoTrait,
 {
-    let Some(account_info) = repo.get_account_info(public_key).await? else {
-        return Err(ApiError::NotFound);
-    };
+    let maybe_account_info = repo.get_account_info(public_key).await?;
 
-    info!("Checking if account is trusted: {}", account_info);
+    info!(
+        "Checking if {}is trusted. Account: {:?}",
+        public_key, maybe_account_info
+    );
 
-    let followed_by_enough_people = account_info.follower_count.is_some_and(|c| c > 1);
-    let following_enough_people = account_info.followee_count.is_some_and(|c| c > 1);
-    let has_good_enough_followers = account_info.pagerank.is_some_and(|pr| pr > 0.2);
-    let oldest_event_seen_at = account_info.created_at.unwrap_or(Utc::now());
-    let latest_contact_list_at = account_info.last_contact_list_at.unwrap_or(Utc::now());
+    let found = maybe_account_info.is_some();
+    let has_good_enough_followers =
+        maybe_account_info.is_some_and(|a| a.pagerank.is_some_and(|pr| pr > 0.2));
+    // TODO: This is a placeholder, we need to implement this from a nos user registration endpoint
     let is_nos_user = false;
 
-    Ok(is_trusted(
-        has_good_enough_followers,
-        followed_by_enough_people,
-        following_enough_people,
-        oldest_event_seen_at,
-        latest_contact_list_at,
-        is_nos_user,
-    ))
+    Ok(is_trusted(found, has_good_enough_followers, is_nos_user))
 }
 
 pub async fn serve_root_page(_headers: HeaderMap) -> impl IntoResponse {

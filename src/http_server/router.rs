@@ -104,8 +104,6 @@ async fn add_cache_header(
 pub enum ApiError {
     #[error("Invalid public key")]
     InvalidPublicKey(#[from] nostr_sdk::nostr::key::Error),
-    #[error("Not found, try later")]
-    NotFound,
     #[error(transparent)]
     RepoError(#[from] RepoError),
     #[error(transparent)]
@@ -118,7 +116,6 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, body) = match &self {
             ApiError::InvalidPublicKey(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            ApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::RepoError(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             ApiError::AxumError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Axum error".to_string()),
             ApiError::InternalServerError(_) => {

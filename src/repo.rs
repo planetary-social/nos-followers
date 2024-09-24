@@ -558,7 +558,7 @@ impl RepoTrait for Repo {
                     })?
                     .map(FriendlyId::DB);
 
-                let account_info = AccountInfo::new(public_key.clone())
+                let account_info = AccountInfo::new(*public_key)
                     .with_pagerank(pagerank)
                     .with_followee_count(followee_count)
                     .with_follower_count(follower_count)
