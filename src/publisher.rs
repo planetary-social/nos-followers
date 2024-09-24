@@ -43,7 +43,8 @@ impl Publisher {
         flush_period_seconds: NonZeroUsize,
         min_seconds_between_messages: NonZeroUsize,
     ) -> Result<Self, PublisherError> {
-        let (publication_sender, mut publication_receiver) = mpsc::channel::<Box<FollowChange>>(1);
+        let (publication_sender, mut publication_receiver) =
+            mpsc::channel::<Box<FollowChange>>(2000);
 
         let mut buffer = NotificationFactory::new(min_seconds_between_messages);
         tokio::spawn(async move {
@@ -68,7 +69,7 @@ impl Publisher {
 
                             if let Err(e) = client.publish_events(buffer.flush()).await {
                                 match &e {
-                                    // We've seen this happen sporadically, we don't neet to kill the look in this situation
+                                    // We've seen this happen sporadically, we don't neet to kill the loop in this situation
                                     PublisherError::PublishError => {
                                         error!("{}", e);
                                     }
