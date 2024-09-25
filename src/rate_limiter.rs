@@ -71,8 +71,8 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{self, advance};
-    use tokio::time::{Duration, Instant};
+    use tokio::time::Duration;
+    use tokio::time::{self};
 
     #[tokio::test]
     async fn test_initial_tokens() {

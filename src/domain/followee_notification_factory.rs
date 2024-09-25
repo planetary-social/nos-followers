@@ -140,10 +140,8 @@ impl FolloweeNotificationFactory {
             if one_day_elapsed {
                 // Overcharge the rate limiter to consume tokens regardless of availability
                 self.rate_limiter.overcharge(tokens_needed);
-            } else {
-                if !self.rate_limiter.consume(tokens_needed) {
-                    return vec![];
-                }
+            } else if !self.rate_limiter.consume(tokens_needed) {
+                return vec![];
             }
 
             return messages;
