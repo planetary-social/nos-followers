@@ -9,6 +9,8 @@ use tokio::time::Instant;
 type Follower = PublicKey;
 type Followee = PublicKey;
 
+static ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+static TWELVE_HOURS: Duration = Duration::from_secs(12 * 60 * 60);
 /// Accumulates messages for a followee and flushes them in batches
 pub struct FolloweeNotificationFactory {
     pub follow_changes: OrderMap<Follower, Box<FollowChange>>,
@@ -22,7 +24,7 @@ impl FolloweeNotificationFactory {
     pub fn new(min_time_between_messages: Duration) -> Self {
         // Rate limiter for 1 message every 12 hours, bursts of 10
         let capacity = 10.0;
-        let rate_limiter = RateLimiter::new(capacity, Duration::from_secs(12 * 60 * 60));
+        let rate_limiter = RateLimiter::new(capacity, TWELVE_HOURS);
 
         Self {
             follow_changes: OrderMap::with_capacity(100),
@@ -78,7 +80,7 @@ impl FolloweeNotificationFactory {
         }
 
         let one_day_elapsed = match self.emptied_at {
-            Some(emptied_at) => now.duration_since(emptied_at) >= Duration::from_secs(24 * 60 * 60),
+            Some(emptied_at) => now.duration_since(emptied_at) >= ONE_DAY,
             None => true,
         };
 
@@ -113,15 +115,7 @@ impl FolloweeNotificationFactory {
         }
 
         if self.should_flush() {
-            let now = Instant::now();
-            let one_day_elapsed = match self.emptied_at {
-                Some(emptied_at) => {
-                    now.duration_since(emptied_at) >= Duration::from_secs(24 * 60 * 60)
-                }
-                None => true,
-            };
-
-            self.emptied_at = Some(now);
+            self.emptied_at = Some(Instant::now());
 
             let followers = self
                 .follow_changes
@@ -136,13 +130,7 @@ impl FolloweeNotificationFactory {
                 .collect();
 
             let tokens_needed = messages.len() as f64;
-
-            if one_day_elapsed {
-                // Overcharge the rate limiter to consume tokens regardless of availability
-                self.rate_limiter.overcharge(tokens_needed);
-            } else if !self.rate_limiter.consume(tokens_needed) {
-                return vec![];
-            }
+            self.rate_limiter.overcharge(tokens_needed);
 
             return messages;
         }

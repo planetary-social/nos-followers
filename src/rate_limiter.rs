@@ -1,8 +1,9 @@
 use tokio::time::{Duration, Instant};
+use tracing::debug;
 
 /// Token bucket rate limiter.
 pub struct RateLimiter {
-    burst_capacity: f64,      // Maximum number of tokens
+    capacity: f64,            // Initial capacity, credit in the bucket
     tokens: f64,              // Current number of tokens (can be negative)
     refill_rate_per_sec: f64, // Tokens added per second
     last_refill: Instant,     // Last time tokens were refilled
@@ -11,13 +12,13 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     /// Creates a new RateLimiter.
-    pub fn new(burst_capacity: f64, refill_duration: Duration) -> Self {
-        let refill_rate_per_sec = burst_capacity / refill_duration.as_secs_f64();
-        let tokens = burst_capacity;
-        let max_negative_tokens = burst_capacity * 1000.0;
+    pub fn new(initial_capacity: f64, refill_duration: Duration) -> Self {
+        let refill_rate_per_sec = refill_duration.as_secs_f64();
+        let tokens = initial_capacity;
+        let max_negative_tokens = initial_capacity * 1000.0;
 
         Self {
-            burst_capacity,
+            capacity: initial_capacity,
             tokens,
             refill_rate_per_sec,
             last_refill: Instant::now(),
@@ -31,8 +32,9 @@ impl RateLimiter {
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;
 
-        let tokens_to_add = elapsed * self.refill_rate_per_sec;
-        self.tokens = (self.tokens + tokens_to_add).min(self.burst_capacity);
+        let tokens_to_add = elapsed / self.refill_rate_per_sec;
+        debug!("Tokens to add: {}", tokens_to_add);
+        self.tokens = (self.tokens + tokens_to_add).min(self.capacity);
     }
 
     /// Checks if the specified number of tokens are available without consuming them.
@@ -127,7 +129,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_refill_tokens() {
         let capacity = 10.0;
-        let refill_duration = Duration::from_secs(10); // Short duration for testing
+        let refill_duration = Duration::from_secs(10);
         let mut rate_limiter = RateLimiter::new(capacity, refill_duration);
 
         // Consume all tokens
@@ -138,19 +140,18 @@ mod tests {
         // Advance time by half of the refill duration
         time::advance(Duration::from_secs(5)).await;
         rate_limiter.refill_tokens();
-        // Should have refilled half the tokens
-        assert_eq!(rate_limiter.tokens, 5.0);
+        assert_eq!(rate_limiter.tokens, 0.5);
 
         // Advance time to complete the refill duration
         time::advance(Duration::from_secs(5)).await;
         rate_limiter.refill_tokens();
-        assert_eq!(rate_limiter.tokens, capacity);
+        assert_eq!(rate_limiter.tokens, 1.0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_overcharge_and_refill() {
         let capacity = 10.0;
-        let refill_duration = Duration::from_secs(10); // Short duration for testing
+        let refill_duration = Duration::from_secs(10);
         let mut rate_limiter = RateLimiter::new(capacity, refill_duration);
 
         // Overcharge by 15 tokens
@@ -158,10 +159,9 @@ mod tests {
         assert_eq!(rate_limiter.tokens, -5.0);
 
         // Advance time to refill tokens
-        time::advance(Duration::from_secs(20)).await; // Wait enough to refill capacity
+        time::advance(Duration::from_secs(6 * 10)).await; // Wait enough to refill capacity
         rate_limiter.refill_tokens();
-        // Tokens should be at capacity, but deficit should be reduced
-        assert_eq!(rate_limiter.tokens, capacity);
+        assert_eq!(rate_limiter.tokens, 1.0);
     }
 
     #[tokio::test]

@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_item_batch_before_rate_limit_is_hit() {
+    fn test_first_single_item_batch() {
         let min_seconds_between_messages = nonzero!(3600usize);
 
         let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
@@ -265,8 +265,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_no_message_after_rate_limit_is_hit_but_retention_not_elapsed() {
-        // After one single follow change the rate limit will be hit
+    async fn test_no_second_message_before_min_seconds_elapse() {
+        // After one single follow change, we need to wait min period
         let min_seconds_between_messages = nonzero!(3600usize);
 
         let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
@@ -283,14 +283,14 @@ mod tests {
 
         advance(Duration::from_secs(1)).await;
 
-        // We hit the limit so the rest of the messages are retained
+        // We didn't wait min seconds
         let messages = notification_factory.flush();
         assert_batches_eq(&messages, &[]);
         assert_eq!(notification_factory.follow_changes_len(), 2);
 
         // We pass the number of minimum seconds between messages so all are sent
         advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 * 60,
+            min_seconds_between_messages.get() as u64
         ))
         .await;
         let messages = notification_factory.flush();
@@ -298,8 +298,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_batch_sizes_after_rate_limit_and_retention_period() {
-        // After one single follow change, the rate limit will be hit
+    async fn test_batch_sizes_after_min_seconds() {
+        // After one single follow change, we need to wait min period
         let min_seconds_between_messages = nonzero!(3600usize);
         const MAX_FOLLOWERS_TRIPLED: usize = 3 * MAX_FOLLOWERS_PER_BATCH;
 
@@ -309,7 +309,7 @@ mod tests {
         insert_new_follower(&mut notification_factory, followee);
         let messages = notification_factory.flush();
         advance(Duration::from_secs(1)).await;
-        // Sent and hit the rate limit
+        // One is accepted
         assert_eq!(messages.len(), 1,);
         assert!(messages[0].is_single());
 
@@ -317,7 +317,7 @@ mod tests {
             insert_new_follower(&mut notification_factory, followee);
         });
 
-        // All inserted MAX_FOLLOWERS_TRIPLED changes wait for next available flush time
+        // All inserted MAX_FOLLOWERS_TRIPLED changes wait for min period
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 0);
         assert_eq!(
@@ -327,7 +327,7 @@ mod tests {
 
         // Before the max_retention time elapses..
         advance(Duration::from_secs(
-            (min_seconds_between_messages.get() - 5) as u64 * 60,
+            (min_seconds_between_messages.get() - 5) as u64,
         ))
         .await;
 
@@ -340,8 +340,13 @@ mod tests {
         );
 
         let messages = notification_factory.flush();
+        assert_eq!(messages.len(), 0);
 
-        // But it will be included in the next batch anyways, regardless of the rate limit
+        // And we finally hit the min period
+        advance(Duration::from_secs(6u64)).await;
+        let messages = notification_factory.flush();
+
+        // But it will be included in the next batch anyways, regardless of the min period
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].len(), MAX_FOLLOWERS_PER_BATCH);
         assert_eq!(messages[1].len(), MAX_FOLLOWERS_PER_BATCH);
@@ -360,7 +365,7 @@ mod tests {
         assert_eq!(notification_factory.follow_changes_len(), 1);
 
         advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 * 60 + 1,
+            min_seconds_between_messages.get() as u64 + 1,
         ))
         .await;
         let messages = notification_factory.flush();
@@ -375,7 +380,7 @@ mod tests {
         assert_eq!(notification_factory.follow_changes_len(), 0);
 
         advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 * 60 + 1,
+            min_seconds_between_messages.get() as u64 + 1,
         ))
         .await;
         let messages = notification_factory.flush();
@@ -384,6 +389,63 @@ mod tests {
         assert_eq!(notification_factory.follow_changes_len(), 0);
         assert_eq!(notification_factory.followees_len(), 0);
         assert_eq!(messages.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_after_burst_of_10_messages_wait_12_hours() {
+        let min_seconds_between_messages = nonzero!(15 * 60usize);
+        let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
+
+        let followee = Keys::generate().public_key();
+
+        // After 10 messages
+        for _ in 0..10 {
+            insert_new_follower(&mut notification_factory, followee);
+            advance(Duration::from_secs(
+                min_seconds_between_messages.get() as u64
+            ))
+            .await;
+            let messages = notification_factory.flush();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(notification_factory.follow_changes_len(), 0);
+            assert_eq!(notification_factory.followees_len(), 1);
+        }
+
+        // We used all initial credit from the rate limiter
+        insert_new_follower(&mut notification_factory, followee);
+
+        let messages = notification_factory.flush();
+        assert_eq!(messages.len(), 0);
+        assert_eq!(notification_factory.follow_changes_len(), 1);
+        assert_eq!(notification_factory.followees_len(), 1);
+
+        // We wait 12 hours and a new token is available
+        advance(Duration::from_secs(12 * 3600)).await;
+        let messages = notification_factory.flush();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(notification_factory.follow_changes_len(), 0);
+        assert_eq!(notification_factory.followees_len(), 1);
+
+        // After 24 hours with no messages the follower entry is removed with its rated limiter
+        advance(Duration::from_secs(24 * 3600)).await;
+        let messages = notification_factory.flush();
+        assert_eq!(messages.len(), 0);
+        assert_eq!(notification_factory.follow_changes_len(), 0);
+        assert_eq!(notification_factory.followees_len(), 0);
+
+        // And again, we have the initial credit of 10 messages
+        advance(Duration::from_secs(24 * 3600)).await;
+        for _ in 0..10 {
+            insert_new_follower(&mut notification_factory, followee);
+            advance(Duration::from_secs(
+                min_seconds_between_messages.get() as u64
+            ))
+            .await;
+            let messages = notification_factory.flush();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(notification_factory.follow_changes_len(), 0);
+            assert_eq!(notification_factory.followees_len(), 1);
+        }
     }
 
     #[test]
@@ -416,7 +478,7 @@ mod tests {
         insert_new_follower(&mut notification_factory, followee);
 
         advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 * 60 + 1,
+            min_seconds_between_messages.get() as u64 + 1,
         ))
         .await;
 
@@ -426,7 +488,7 @@ mod tests {
         insert_new_unfollower(&mut notification_factory, followee);
 
         advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 * 60 + 1,
+            min_seconds_between_messages.get() as u64 + 1,
         ))
         .await;
 
