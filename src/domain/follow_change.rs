@@ -83,7 +83,7 @@ impl FollowChange {
         self.friendly_followee = name;
     }
 
-    pub fn is_notifiable(&self) -> bool {
+    pub fn is_follower(&self) -> bool {
         matches!(self.change_type, ChangeType::Followed)
     }
 

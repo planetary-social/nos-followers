@@ -6,6 +6,7 @@ pub mod http_server;
 pub mod metrics;
 pub mod migrations;
 pub mod publisher;
+pub mod rate_limiter;
 pub mod relay_subscriber;
 pub mod repo;
 pub mod scheduler;

@@ -52,7 +52,7 @@ impl NotificationMessage {
         );
 
         assert!(
-            follow_change.is_notifiable(),
+            follow_change.is_follower(),
             "Only followed changes can be messaged"
         );
 
