@@ -2,7 +2,7 @@ use config_rs::{Config as ConfigTree, ConfigError, Environment, File};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::env;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroUsize};
 use tracing::info;
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +24,7 @@ pub struct Settings {
     pub http_port: u16,
     pub pagerank_cron_expression: String,
     pub http_cache_seconds: u32,
+    pub burst: NonZeroU16,
 }
 
 impl Configurable for Settings {

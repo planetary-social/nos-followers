@@ -3,33 +3,34 @@ use crate::rate_limiter::RateLimiter;
 use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
 use std::fmt::Debug;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::time::Instant;
+use tracing::info;
 
 type Follower = PublicKey;
 type Followee = PublicKey;
 
 static ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
-static TWELVE_HOURS: Duration = Duration::from_secs(12 * 60 * 60);
 /// Accumulates messages for a followee and flushes them in batches
 pub struct FolloweeNotificationFactory {
     pub follow_changes: OrderMap<Follower, Box<FollowChange>>,
     pub followee: Option<Followee>,
-    min_time_between_messages: Duration,
     rate_limiter: RateLimiter,
     emptied_at: Option<Instant>,
 }
 
 impl FolloweeNotificationFactory {
-    pub fn new(min_time_between_messages: Duration) -> Self {
-        // Rate limiter for 1 message every 12 hours, bursts of 10
-        let capacity = 10.0;
-        let rate_limiter = RateLimiter::new(capacity, TWELVE_HOURS);
+    pub fn new(capacity: u16, min_seconds_between_messages: NonZeroUsize) -> Self {
+        // Rate limiter for 1 message every `min_seconds_between_messages`, with a
+        // burst of `capacity`.
+        let min_time_between_messages =
+            Duration::from_secs(min_seconds_between_messages.get() as u64);
+        let rate_limiter = RateLimiter::new(capacity as f64, min_time_between_messages);
 
         Self {
             follow_changes: OrderMap::with_capacity(100),
             followee: None,
-            min_time_between_messages,
             rate_limiter,
             emptied_at: None,
         }
@@ -70,15 +71,6 @@ impl FolloweeNotificationFactory {
     pub fn should_flush(&mut self) -> bool {
         let now = Instant::now();
 
-        let min_time_elapsed = match self.emptied_at {
-            Some(emptied_at) => now.duration_since(emptied_at) >= self.min_time_between_messages,
-            None => true,
-        };
-
-        if !min_time_elapsed {
-            return false;
-        }
-
         let one_day_elapsed = match self.emptied_at {
             Some(emptied_at) => now.duration_since(emptied_at) >= ONE_DAY,
             None => true,
@@ -100,7 +92,11 @@ impl FolloweeNotificationFactory {
     }
 
     pub fn should_delete(&mut self) -> bool {
-        self.follow_changes.is_empty() && self.should_flush()
+        // If it has been empty for a day, it's ok to delete
+        self.follow_changes.is_empty()
+            && self.emptied_at.map_or(true, |emptied_at| {
+                Instant::now().duration_since(emptied_at) >= ONE_DAY
+            })
     }
 
     pub fn no_followers(&self) -> bool {
@@ -130,6 +126,16 @@ impl FolloweeNotificationFactory {
                 .collect();
 
             let tokens_needed = messages.len() as f64;
+
+            // Just to sample the rate limiter
+            if tokens_needed > 1.0 {
+                info!(
+                    "Rate limiter for followee {} after flush: {}",
+                    self.followee.unwrap(),
+                    self.rate_limiter
+                );
+            }
+
             self.rate_limiter.overcharge(tokens_needed);
 
             return messages;

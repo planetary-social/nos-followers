@@ -13,6 +13,7 @@ followers:
   google_project_id: "pub-verse-app"
   google_topic: "follow-changes"
   flush_period_seconds: 60 # how often to flush the buffer to generate messages
-  min_seconds_between_messages: 900 # 15 minutes
+  min_seconds_between_messages: 21600 # 6 hours, so no more than 4 messages per day, unless there are burst tokens available
+  burst: 10 # Number of messages that get replenished after 24 hours of no messages. When available, they override min_seconds_between_messages
   pagerank_cron_expression: "0 0 0 * * *" # Daily at midnight
   http_cache_seconds: 86400 # 24 hours

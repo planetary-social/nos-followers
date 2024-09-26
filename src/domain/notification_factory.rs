@@ -5,7 +5,6 @@ use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use tokio::time::Duration;
 use tracing::info;
 
 type Followee = PublicKey;
@@ -15,21 +14,23 @@ type Followee = PublicKey;
 /// the results into `NotificationMessage` instances per followee.
 pub struct NotificationFactory {
     followee_maps: OrderMap<Followee, FolloweeNotificationFactory>,
-    min_time_between_messages: Duration,
+    burst: u16,
+    min_seconds_between_messages: NonZeroUsize,
 }
 
 impl NotificationFactory {
-    pub fn new(min_seconds_between_messages: NonZeroUsize) -> Self {
+    pub fn new(burst: u16, min_seconds_between_messages: usize) -> Self {
         info!(
             "One message in {} seconds allowed",
             min_seconds_between_messages
         );
 
+        let min_seconds_between_messages = NonZeroUsize::new(min_seconds_between_messages).unwrap();
+
         Self {
             followee_maps: OrderMap::with_capacity(1_000),
-            min_time_between_messages: Duration::from_secs(
-                min_seconds_between_messages.get() as u64
-            ),
+            burst,
+            min_seconds_between_messages,
         }
     }
 
@@ -38,7 +39,7 @@ impl NotificationFactory {
             .followee_maps
             .entry(*follow_change.followee())
             .or_insert_with_key(|_| {
-                FolloweeNotificationFactory::new(self.min_time_between_messages)
+                FolloweeNotificationFactory::new(self.burst, self.min_seconds_between_messages)
             });
 
         followee_info.insert(follow_change);
@@ -140,7 +141,6 @@ mod tests {
     use crate::domain::notification_message::MAX_FOLLOWERS_PER_BATCH;
     use assertables::*;
     use chrono::{DateTime, Utc};
-    use nonzero_ext::nonzero;
     use nostr_sdk::prelude::Keys;
     use std::iter::repeat;
     use std::sync::LazyLock;
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_insert_follow_change() {
-        let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
+        let mut notification_factory = NotificationFactory::new(10, 60);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_does_not_replace_with_older_change() {
-        let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
+        let mut notification_factory = NotificationFactory::new(10, 60);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_insert_same_follower_different_followee() {
-        let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
+        let mut notification_factory = NotificationFactory::new(10, 60);
 
         let follower = Keys::generate().public_key();
         let followee1 = Keys::generate().public_key();
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_an_unfollow_cancels_a_follow() {
-        let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
+        let mut notification_factory = NotificationFactory::new(10, 60);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_a_follow_cancels_an_unfollow() {
-        let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
+        let mut notification_factory = NotificationFactory::new(10, 60);
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();
 
@@ -248,9 +248,9 @@ mod tests {
 
     #[test]
     fn test_first_single_item_batch() {
-        let min_seconds_between_messages = nonzero!(3600usize);
+        let min_seconds_between_messages = 3600;
 
-        let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
+        let mut notification_factory = NotificationFactory::new(10, min_seconds_between_messages);
 
         let followee = Keys::generate().public_key();
 
@@ -265,11 +265,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_no_second_message_before_min_seconds_elapse() {
+    async fn test_no_more_messages_after_burst_and_before_next_token() {
         // After one single follow change, we need to wait min period
-        let min_seconds_between_messages = nonzero!(3600usize);
+        let min_seconds_between_messages = 12 * 3600; // 12 hours
 
-        let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
+        let mut notification_factory = NotificationFactory::new(1, min_seconds_between_messages);
 
         let followee = Keys::generate().public_key();
 
@@ -283,16 +283,14 @@ mod tests {
 
         advance(Duration::from_secs(1)).await;
 
-        // We didn't wait min seconds
+        // We didn't wait min seconds, and the burst is set to 1, so we need to
+        // wait a full min_seconds_between_messages period to get the message
         let messages = notification_factory.flush();
         assert_batches_eq(&messages, &[]);
         assert_eq!(notification_factory.follow_changes_len(), 2);
 
         // We pass the number of minimum seconds between messages so all are sent
-        advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64
-        ))
-        .await;
+        advance(Duration::from_secs(min_seconds_between_messages as u64 + 1)).await;
         let messages = notification_factory.flush();
         assert_batches_eq(&messages, &[(followee, &[change2, change3])]);
     }
@@ -300,10 +298,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_batch_sizes_after_min_seconds() {
         // After one single follow change, we need to wait min period
-        let min_seconds_between_messages = nonzero!(3600usize);
-        const MAX_FOLLOWERS_TRIPLED: usize = 3 * MAX_FOLLOWERS_PER_BATCH;
+        let min_seconds_between_messages = 12 * 3600; // 12 hours
+        const MAX_FOLLOWERS_TIMES_TEN: usize = 10 * MAX_FOLLOWERS_PER_BATCH;
 
-        let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
+        let mut notification_factory = NotificationFactory::new(10, min_seconds_between_messages);
 
         let followee = Keys::generate().public_key();
         insert_new_follower(&mut notification_factory, followee);
@@ -313,31 +311,25 @@ mod tests {
         assert_eq!(messages.len(), 1,);
         assert!(messages[0].is_single());
 
-        repeat(()).take(MAX_FOLLOWERS_TRIPLED).for_each(|_| {
+        repeat(()).take(MAX_FOLLOWERS_TIMES_TEN).for_each(|_| {
             insert_new_follower(&mut notification_factory, followee);
         });
 
-        // All inserted MAX_FOLLOWERS_TRIPLED changes wait for min period
+        // All inserted followers use the capacity of the rate limiter, so they are all sent
         let messages = notification_factory.flush();
-        assert_eq!(messages.len(), 0);
-        assert_eq!(
-            notification_factory.follow_changes_len(),
-            MAX_FOLLOWERS_TRIPLED,
-        );
+        assert_eq!(messages.len(), 10);
+        assert_eq!(notification_factory.follow_changes_len(), 0);
 
         // Before the max_retention time elapses..
         advance(Duration::from_secs(
-            (min_seconds_between_messages.get() - 5) as u64,
+            (min_seconds_between_messages - 1) as u64,
         ))
         .await;
 
         // .. we insert another change
         insert_new_follower(&mut notification_factory, followee);
 
-        assert_eq!(
-            notification_factory.follow_changes_len(),
-            MAX_FOLLOWERS_TRIPLED + 1,
-        );
+        assert_eq!(notification_factory.follow_changes_len(), 1);
 
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 0);
@@ -346,12 +338,9 @@ mod tests {
         advance(Duration::from_secs(6u64)).await;
         let messages = notification_factory.flush();
 
-        // But it will be included in the next batch anyways, regardless of the min period
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].len(), MAX_FOLLOWERS_PER_BATCH);
-        assert_eq!(messages[1].len(), MAX_FOLLOWERS_PER_BATCH);
-        assert_eq!(messages[2].len(), MAX_FOLLOWERS_PER_BATCH);
-        assert_eq!(messages[3].len(), 1);
+        // But it's retained, there are not tokens
+        assert_eq!(messages.len(), 0);
+        assert_eq!(notification_factory.follow_changes_len(), 1);
 
         // And another change arrives
         insert_new_follower(&mut notification_factory, followee);
@@ -362,30 +351,25 @@ mod tests {
         let messages = notification_factory.flush();
         // The new one is flushed, the old one is retained
         assert_eq!(messages.len(), 1);
-        assert_eq!(notification_factory.follow_changes_len(), 1);
+        assert_eq!(notification_factory.follow_changes_len(), 2);
 
-        advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 + 1,
-        ))
-        .await;
+        advance(Duration::from_secs(min_seconds_between_messages as u64 + 1)).await;
         let messages = notification_factory.flush();
 
         // Now all are flushed
         assert_eq!(messages.len(), 1);
         assert_eq!(notification_factory.follow_changes_len(), 0);
 
-        // But we keep the followee info for the time calculations for one more
-        // period, event if no changes are pending
-        assert_eq!(notification_factory.followees_len(), 1);
+        // But we keep the followee info for the time calculations for a day,
+        // event if no changes are pending
+        assert_eq!(notification_factory.followees_len(), 2);
         assert_eq!(notification_factory.follow_changes_len(), 0);
 
-        advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 + 1,
-        ))
-        .await;
+        advance(Duration::from_secs(24 * 60 * 60_u64 + 1)).await;
         let messages = notification_factory.flush();
 
-        // Now all is cleared
+        // Now all is cleared, no followee info is retained and next messages
+        // replenished the burst capacity
         assert_eq!(notification_factory.follow_changes_len(), 0);
         assert_eq!(notification_factory.followees_len(), 0);
         assert_eq!(messages.len(), 0);
@@ -393,18 +377,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_after_burst_of_10_messages_wait_12_hours() {
-        let min_seconds_between_messages = nonzero!(15 * 60usize);
-        let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
+        let min_seconds_between_messages = 12 * 3600; // 12 hours
+        let mut notification_factory = NotificationFactory::new(10, min_seconds_between_messages);
 
         let followee = Keys::generate().public_key();
 
         // After 10 messages
         for _ in 0..10 {
             insert_new_follower(&mut notification_factory, followee);
-            advance(Duration::from_secs(
-                min_seconds_between_messages.get() as u64
-            ))
-            .await;
             let messages = notification_factory.flush();
             assert_eq!(messages.len(), 1);
             assert_eq!(notification_factory.follow_changes_len(), 0);
@@ -437,10 +417,7 @@ mod tests {
         advance(Duration::from_secs(24 * 3600)).await;
         for _ in 0..10 {
             insert_new_follower(&mut notification_factory, followee);
-            advance(Duration::from_secs(
-                min_seconds_between_messages.get() as u64
-            ))
-            .await;
+            advance(Duration::from_secs(min_seconds_between_messages as u64)).await;
             let messages = notification_factory.flush();
             assert_eq!(messages.len(), 1);
             assert_eq!(notification_factory.follow_changes_len(), 0);
@@ -450,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_is_empty_and_len() {
-        let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
+        let mut notification_factory = NotificationFactory::new(10, 60);
 
         let followee1 = Keys::generate().public_key();
         let followee2 = Keys::generate().public_key();
@@ -470,27 +447,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_unfollows_are_not_sent() {
-        let min_seconds_between_messages = nonzero!(60usize);
-        let mut notification_factory = NotificationFactory::new(min_seconds_between_messages);
+        let min_seconds_between_messages = 60;
+        let mut notification_factory = NotificationFactory::new(10, min_seconds_between_messages);
 
         let followee = Keys::generate().public_key();
 
         insert_new_follower(&mut notification_factory, followee);
 
-        advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 + 1,
-        ))
-        .await;
+        advance(Duration::from_secs(min_seconds_between_messages as u64 + 1)).await;
 
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 1);
 
         insert_new_unfollower(&mut notification_factory, followee);
 
-        advance(Duration::from_secs(
-            min_seconds_between_messages.get() as u64 + 1,
-        ))
-        .await;
+        advance(Duration::from_secs(min_seconds_between_messages as u64 + 1)).await;
 
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 0);
@@ -498,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_flush_clears_map() {
-        let mut notification_factory = NotificationFactory::new(nonzero!(60usize));
+        let mut notification_factory = NotificationFactory::new(10, 60);
 
         let follower = Keys::generate().public_key();
         let followee = Keys::generate().public_key();

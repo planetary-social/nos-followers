@@ -17,6 +17,4 @@ while :; do
 
     nak event -k 3 -t p="$followee" --sec $(nostrkeytool --gen) ws://localhost:7777
   done
-
-  sleep 3
 done

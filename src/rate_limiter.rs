@@ -1,5 +1,5 @@
+use std::fmt::Display;
 use tokio::time::{Duration, Instant};
-use tracing::debug;
 
 /// Token bucket rate limiter.
 pub struct RateLimiter {
@@ -33,7 +33,6 @@ impl RateLimiter {
         self.last_refill = now;
 
         let tokens_to_add = elapsed / self.refill_rate_per_sec;
-        debug!("Tokens to add: {}", tokens_to_add);
         self.tokens = (self.tokens + tokens_to_add).min(self.capacity);
     }
 
@@ -67,6 +66,17 @@ impl RateLimiter {
     pub fn get_available_tokens(&mut self) -> f64 {
         self.refill_tokens();
         self.tokens
+    }
+}
+
+impl Display for RateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let last_refill_seconds_ago = Instant::now().duration_since(self.last_refill).as_secs();
+        write!(
+            f,
+            "RateLimiter {{ capacity: {}, tokens: {}, last_refill: {:?} secs ago}}",
+            self.capacity, self.tokens, last_refill_seconds_ago
+        )
     }
 }
 

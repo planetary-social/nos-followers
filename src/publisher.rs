@@ -2,6 +2,7 @@ use crate::domain::FollowChange;
 use crate::domain::NotificationFactory;
 use crate::domain::NotificationMessage;
 use futures::Future;
+use std::num::NonZeroU16;
 use std::num::NonZeroUsize;
 use thiserror::Error;
 use tokio::select;
@@ -42,11 +43,12 @@ impl Publisher {
         mut client: impl PublishEvents + Send + Sync + 'static,
         flush_period_seconds: NonZeroUsize,
         min_seconds_between_messages: NonZeroUsize,
+        burst: NonZeroU16,
     ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) =
             mpsc::channel::<Box<FollowChange>>(20000);
 
-        let mut buffer = NotificationFactory::new(min_seconds_between_messages);
+        let mut buffer = NotificationFactory::new(burst.get(), min_seconds_between_messages.get());
         tokio::spawn(async move {
             info!("Publishing messages every {} seconds", flush_period_seconds);
 
@@ -162,12 +164,14 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let flush_period_seconds = nonzero!(1usize);
         let min_seconds_between_messages = nonzero!(60usize);
+        let burst = nonzero!(10u16);
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             flush_period_seconds,
             min_seconds_between_messages,
+            burst,
         )
         .await
         .unwrap();
@@ -250,12 +254,14 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let flush_period_seconds = nonzero!(1usize);
         let min_seconds_between_messages = nonzero!(60usize);
+        let burst = nonzero!(10u16);
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             flush_period_seconds,
             min_seconds_between_messages,
+            burst,
         )
         .await
         .unwrap();
@@ -314,12 +320,14 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let flush_period_seconds = nonzero!(1usize);
         let min_seconds_between_messages = nonzero!(60usize);
+        let burst = nonzero!(10u16);
 
         let publisher = Publisher::create(
             cancellation_token.clone(),
             mock_client,
             flush_period_seconds,
             min_seconds_between_messages,
+            burst,
         )
         .await
         .unwrap();

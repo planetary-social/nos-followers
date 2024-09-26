@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde::Serializer;
 use std::fmt::Display;
 use std::sync::Arc;
+use tokio::time::timeout;
 use tracing::{debug, error};
 
 #[derive(Debug, PartialEq, Clone, PartialOrd, Ord, Eq)]
@@ -292,9 +293,12 @@ struct Nip05Verifier;
 
 impl VerifyNip05 for Nip05Verifier {
     async fn verify_nip05(&self, public_key: &PublicKey, nip05_value: &str) -> bool {
-        nip05::verify(public_key, nip05_value, None)
-            .await
-            .unwrap_or(false)
+        timeout(
+            std::time::Duration::from_secs(2),
+            nip05::verify(public_key, nip05_value, None),
+        )
+        .await
+        .map_or(false, |inner_result| inner_result.unwrap_or(false))
     }
 }
 

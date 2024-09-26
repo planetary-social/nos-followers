@@ -40,6 +40,7 @@ where
             google_publisher_client,
             settings.flush_period_seconds,
             settings.min_seconds_between_messages,
+            settings.burst,
         )
         .await?;
 
