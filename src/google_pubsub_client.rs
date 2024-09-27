@@ -7,7 +7,7 @@ use gcloud_sdk::{
 };
 use tracing::debug;
 
-const ALLOWED_PUBKEYS: &[&str] = &[
+const _ALLOWED_PUBKEYS: &[&str] = &[
     "07ecf9838136fe430fac43fa0860dbc62a0aac0729c5a33df1192ce75e330c9f", // Bryan
     "89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5", // Daniel
     "e8ad7c13ba55ba0a04c23fc09edce74ad7a8dddc059dc2e274ff63bc2e047782", // Daphne
@@ -50,9 +50,9 @@ impl GooglePubSubClient {
 impl PublishEvents for GooglePubSubClient {
     async fn publish_events(
         &mut self,
-        follow_changes: Vec<NotificationMessage>,
+        notification_messages: Vec<NotificationMessage>,
     ) -> Result<(), PublisherError> {
-        let pubsub_messages: Result<Vec<PubsubMessage>, PublisherError> = follow_changes
+        let pubsub_messages: Result<Vec<PubsubMessage>, PublisherError> = notification_messages
             .iter()
             // .filter(|message| {
             //     // TODO: Temporary filter while developing this service

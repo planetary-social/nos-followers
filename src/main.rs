@@ -172,6 +172,7 @@ async fn start(settings: Settings) -> Result<()> {
         settings.tcp_importer_port,
         event_sender,
         cancellation_token.clone(),
+        5,
     )
     .await?;
 
