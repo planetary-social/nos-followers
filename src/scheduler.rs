@@ -18,9 +18,6 @@ pub async fn start_scheduler<T>(
 where
     T: RepoTrait + 'static,
 {
-    // For the moment ensure we always trigger one update on startup
-    refresh_pagerank(repo.clone()).await;
-
     // And then once every day
     let mut sched = JobScheduler::new().await?;
     let cron_expression = settings.pagerank_cron_expression.as_str();

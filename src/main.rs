@@ -96,9 +96,21 @@ async fn start(settings: Settings) -> Result<()> {
     let repo = Arc::new(Repo::new(graph));
 
     repo.log_neo4j_details().await?;
+    let shared_nostr_client = Arc::new(create_client());
+    let task_tracker = TaskTracker::new();
+    let cancellation_token = CancellationToken::new();
+
+    // Leave the http server at the top so the health endpoint is available quickly
+    info!("Starting HTTP server at port {}", settings.http_port);
+    HttpServer::start(
+        task_tracker.clone(),
+        &settings,
+        repo.clone(),
+        shared_nostr_client.clone(),
+        cancellation_token.clone(),
+    )?;
 
     info!("Initializing workers for follower list diff calculation");
-    let shared_nostr_client = Arc::new(create_client());
     let (follow_change_sender, _) =
         broadcast::channel::<Box<FollowChange>>(settings.follow_change_channel_size.get());
     let follows_differ_worker = FollowsDiffer::new(
@@ -107,8 +119,6 @@ async fn start(settings: Settings) -> Result<()> {
         follow_change_sender.clone(),
     );
 
-    let task_tracker = TaskTracker::new();
-    let cancellation_token = CancellationToken::new();
     let (event_sender, event_receiver) =
         broadcast::channel::<Box<Event>>(settings.event_channel_size.get());
     WorkerPool::start(
@@ -174,15 +184,6 @@ async fn start(settings: Settings) -> Result<()> {
     )
     .await
     .context("Failed starting the scheduler")?;
-
-    info!("Starting HTTP server at port {}", settings.http_port);
-    HttpServer::start(
-        task_tracker.clone(),
-        &settings,
-        repo,
-        shared_nostr_client,
-        cancellation_token.clone(),
-    )?;
 
     tokio::spawn(async move {
         if let Err(e) = cancel_on_stop_signals(cancellation_token).await {
