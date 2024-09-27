@@ -54,10 +54,10 @@ impl PublishEvents for GooglePubSubClient {
     ) -> Result<(), PublisherError> {
         let pubsub_messages: Result<Vec<PubsubMessage>, PublisherError> = follow_changes
             .iter()
-            .filter(|message| {
-                // TODO: Temporary filter while developing this service
-                ALLOWED_PUBKEYS.contains(&message.followee().to_hex().as_str())
-            })
+            // .filter(|message| {
+            //     // TODO: Temporary filter while developing this service
+            //     ALLOWED_PUBKEYS.contains(&message.followee().to_hex().as_str())
+            // })
             .map(|message| {
                 let data =
                     serde_json::to_vec(message).map_err(|_| PublisherError::SerializationError)?;
