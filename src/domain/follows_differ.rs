@@ -286,8 +286,7 @@ async fn should_send_notifications(
 /// notifications in that case, but we still want to process the contact list.
 fn probably_inactive_or_spam(event: &Event, account_info: &AccountInfo) -> bool {
     let too_new =
-        !older_than_five_minutes(account_info.created_at.unwrap_or_default().timestamp() as u64)
-            && older_than_five_minutes(event.created_at.as_u64());
+        !older_than_five_minutes(account_info.created_at.unwrap_or(Utc::now()).timestamp() as u64);
 
     if too_new
         && event.public_keys().any(|pk| {

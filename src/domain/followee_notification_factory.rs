@@ -1,6 +1,6 @@
 use super::{FollowChange, NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
 use crate::rate_limiter::RateLimiter;
-use nostr_sdk::PublicKey;
+use nostr_sdk::prelude::*;
 use ordermap::OrderMap;
 use std::fmt::Debug;
 use std::num::NonZeroUsize;
@@ -131,8 +131,12 @@ impl FolloweeNotificationFactory {
 
             if let Some(follow_change) = followers.first() {
                 info!(
-                    "Followee {}. {}",
+                    "Followee {}({}). {}",
                     follow_change.friendly_followee(),
+                    follow_change
+                        .followee()
+                        .to_bech32()
+                        .expect("Followee to_bech32"),
                     self.rate_limiter
                 );
             }
