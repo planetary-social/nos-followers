@@ -47,19 +47,18 @@ where
             return Ok(());
         }
 
-        if probably_inactive_or_spam(&event) {
-            info!(
+        let follower = event.pubkey;
+        let event_created_at = convert_timestamp(event.created_at.as_u64())?;
+        let maybe_account_info = self.repo.get_account_info(&follower).await?;
+        let mut account_info = maybe_account_info.unwrap_or_else(|| AccountInfo::new(follower));
+
+        if probably_inactive_or_spam(&event, &account_info) {
+            debug!(
                 "Skipping event from {} as it's probably spam",
                 event.pubkey.to_bech32().unwrap_or_default()
             );
             return Ok(());
         }
-
-        let follower = event.pubkey;
-
-        let event_created_at = convert_timestamp(event.created_at.as_u64())?;
-        let maybe_account_info = self.repo.get_account_info(&follower).await?;
-        let mut account_info = maybe_account_info.unwrap_or_else(|| AccountInfo::new(follower));
 
         // Check if the event is older than the latest stored update and skip if so
         if let Some(last_contact_list_at) = account_info.last_contact_list_at {
@@ -232,6 +231,7 @@ where
     }
 }
 
+const FIVE_MINUTES_DURATION: Duration = Duration::minutes(5);
 const ONE_DAY_DURATION: Duration = Duration::seconds(60 * 60 * 24);
 const ONE_WEEK_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7);
 const ONE_MONTH_DURATION: Duration = Duration::seconds(60 * 60 * 24 * 7 * 4);
@@ -284,7 +284,20 @@ async fn should_send_notifications(
 /// don't skip old lists unless they have one or fewer follows. This is because
 /// we could be running a backfill from the TCP port, so we won't send
 /// notifications in that case, but we still want to process the contact list.
-fn probably_inactive_or_spam(event: &Event) -> bool {
+fn probably_inactive_or_spam(event: &Event, account_info: &AccountInfo) -> bool {
+    let too_new =
+        !older_than_five_minutes(account_info.created_at.unwrap_or_default().timestamp() as u64)
+            && older_than_five_minutes(event.created_at.as_u64());
+
+    if too_new
+        && event.public_keys().any(|pk| {
+            // Quick harcoded filter for this spammer
+            pk.to_hex() == "4bc7982c4ee4078b2ada5340ae673f18d3b6a664b1f97e8d6799e6074cb5c39d"
+        })
+    {
+        return true;
+    }
+
     if older_than_a_month(event.created_at.as_u64()) {
         let number_of_p_tags = event
             .tags()
@@ -296,6 +309,10 @@ fn probably_inactive_or_spam(event: &Event) -> bool {
     }
 
     false
+}
+
+fn older_than_five_minutes(event_created_at_timestamp: u64) -> bool {
+    older_than(event_created_at_timestamp, FIVE_MINUTES_DURATION)
 }
 
 fn older_than_a_day(event_created_at_timestamp: u64) -> bool {
