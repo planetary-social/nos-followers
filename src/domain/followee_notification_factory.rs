@@ -126,8 +126,7 @@ impl FolloweeNotificationFactory {
                 .collect();
 
             let tokens_needed = messages.len() as f64;
-
-            self.rate_limiter.overcharge(tokens_needed);
+            self.rate_limiter.consume(tokens_needed);
 
             if let Some(follow_change) = followers.first() {
                 info!(

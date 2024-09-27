@@ -42,20 +42,23 @@ impl RateLimiter {
         self.tokens >= tokens_needed
     }
 
-    /// Attempts to consume the specified number of tokens.
+    /// Consumes the specified number of tokens.
     pub fn consume(&mut self, tokens_needed: f64) -> bool {
         self.refill_tokens();
+
         if self.tokens >= tokens_needed {
             self.tokens -= tokens_needed;
             true
         } else {
+            self.tokens = 0.0;
             false
         }
     }
 
-    /// Consumes tokens regardless of availability (can result in negative token count).
+    /// Consumes the specified number of tokens, allows deficit.
     pub fn overcharge(&mut self, tokens_needed: f64) {
         self.refill_tokens();
+
         self.tokens -= tokens_needed;
 
         if self.tokens < -self.max_negative_tokens {
@@ -116,8 +119,8 @@ mod tests {
         // Attempt to consume more tokens than available
         let result = rate_limiter.consume(15.0);
         assert!(!result);
-        // Tokens should remain unchanged since consume failed
-        assert_eq!(rate_limiter.tokens, capacity);
+        // Should have consumed all it could
+        assert_eq!(rate_limiter.tokens, 0.0);
     }
 
     #[tokio::test]

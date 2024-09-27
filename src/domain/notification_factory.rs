@@ -334,13 +334,13 @@ mod tests {
         let messages = notification_factory.flush();
         assert_eq!(messages.len(), 0);
 
-        // And we finally hit the min period
+        // And we finally hit the min period so we get one token
         advance(Duration::from_secs(6u64)).await;
         let messages = notification_factory.flush();
 
-        // But it's retained, there are not tokens
-        assert_eq!(messages.len(), 0);
-        assert_eq!(notification_factory.follow_changes_len(), 1);
+        // The token is used by the last change
+        assert_eq!(messages.len(), 1);
+        assert_eq!(notification_factory.follow_changes_len(), 0);
 
         // And another change arrives
         insert_new_follower(&mut notification_factory, followee);
@@ -351,7 +351,7 @@ mod tests {
         let messages = notification_factory.flush();
         // The new one is flushed, the old one is retained
         assert_eq!(messages.len(), 1);
-        assert_eq!(notification_factory.follow_changes_len(), 2);
+        assert_eq!(notification_factory.follow_changes_len(), 1);
 
         advance(Duration::from_secs(min_seconds_between_messages as u64 + 1)).await;
         let messages = notification_factory.flush();
