@@ -127,17 +127,15 @@ impl FolloweeNotificationFactory {
 
             let tokens_needed = messages.len() as f64;
 
-            // Just to sample the rate limiter
-            if tokens_needed > 1.0 {
+            self.rate_limiter.overcharge(tokens_needed);
+
+            if let Some(follow_change) = followers.first() {
                 info!(
-                    "Rate limiter for followee {} after flush: {}",
-                    self.followee.unwrap(),
+                    "Followee {}. {}",
+                    follow_change.friendly_followee(),
                     self.rate_limiter
                 );
             }
-
-            self.rate_limiter.overcharge(tokens_needed);
-
             return messages;
         }
 
