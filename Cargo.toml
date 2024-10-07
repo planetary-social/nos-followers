@@ -43,7 +43,7 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "tracing-log"] }
 
 [dev-dependencies]
-assertables = "8.3.0"
+assertables = "8.15.0"
 pretty_assertions = "1.2"
 
 [features]
