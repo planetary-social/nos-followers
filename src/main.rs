@@ -40,47 +40,14 @@ async fn main() -> Result<()> {
     let config = Config::new("config")?;
     let settings = config.get::<Settings>()?;
 
-    if let Err(e) = start(settings).await {
+    if let Err(e) = start_server(settings).await {
         error!("Failed to start the server: {}", e);
     }
 
     Ok(())
 }
 
-// Listen to ctrl-c, terminate and cancellation token
-async fn cancel_on_stop_signals(cancellation_token: CancellationToken) -> Result<()> {
-    #[cfg(unix)]
-    let terminate = async {
-        signal(SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = cancellation_token.cancelled() => {
-            info!("Starting graceful termination, from cancellation token");
-        },
-        _ = signal::ctrl_c() => {
-            info!("Starting graceful termination, from ctrl-c");
-        },
-        _ = terminate => {
-            info!("Starting graceful termination, from terminate signal");
-        },
-    }
-
-    cancellation_token.cancel();
-
-    info!("Waiting 3 seconds before exiting");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    Ok(())
-}
-
-async fn start(settings: Settings) -> Result<()> {
+async fn start_server(settings: Settings) -> Result<()> {
     info!("Initializing repository at {}", settings.neo4j_uri);
     let graph = Graph::new(
         &settings.neo4j_uri,
@@ -197,5 +164,38 @@ async fn start(settings: Settings) -> Result<()> {
     task_tracker.wait().await;
 
     info!("Follower server stopped");
+    Ok(())
+}
+
+// Listen to ctrl-c, terminate and cancellation token
+async fn cancel_on_stop_signals(cancellation_token: CancellationToken) -> Result<()> {
+    #[cfg(unix)]
+    let terminate = async {
+        signal(SignalKind::terminate())
+            .expect("Failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            info!("Starting graceful termination, from cancellation token");
+        },
+        _ = signal::ctrl_c() => {
+            info!("Starting graceful termination, from ctrl-c");
+        },
+        _ = terminate => {
+            info!("Starting graceful termination, from terminate signal");
+        },
+    }
+
+    cancellation_token.cancel();
+
+    info!("Waiting 3 seconds before exiting");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     Ok(())
 }

@@ -110,7 +110,6 @@ fn create_dispatcher_task<Item>(
             }
         }
 
-        cancellation_token.cancel();
         info!("{}: Worker pool finished", pool_name);
     });
 }
@@ -136,28 +135,35 @@ fn create_worker_task<Item, Worker>(
                     break;
                 }
 
-                Some(item) = worker_rx.recv() => {
-                      trace!("{}: Worker task processing item {:?}", worker_name, item);
-                      let result = timeout(Duration::from_secs(worker_timeout_secs.get() as u64), worker.call(item)).await;
+                result = worker_rx.recv() => {
+                    match result {
+                        None => {
+                            info!("{}: Worker task finished", worker_name);
+                            break;
+                        }
+                        Some(item) => {
+                            trace!("{}: Worker task processing item {:?}", worker_name, item);
+                            let result = timeout(Duration::from_secs(worker_timeout_secs.get() as u64), worker.call(item)).await;
 
-                      match result {
-                          Ok(Ok(())) => {
-                                trace!("{}: Worker task finished successfully processing item", worker_name);
-                          },
-                          Ok(Err(e)) => {
-                              metrics::worker_failures(pool_name.to_string(), worker_index).increment(1);
-                              error!("{}: Worker failed: {}", worker_name, e);
-                          },
-                          Err(_) => {
-                              metrics::worker_timeouts(pool_name.to_string(), worker_index).increment(1);
-                              error!("{}: Worker task timed out after {} seconds", worker_name, worker_timeout_secs);
-                          }
-                      }
+                            match result {
+                                Ok(Ok(())) => {
+                                        trace!("{}: Worker task finished successfully processing item", worker_name);
+                                },
+                                Ok(Err(e)) => {
+                                    metrics::worker_failures(pool_name.to_string(), worker_index).increment(1);
+                                    error!("{}: Worker failed: {}", worker_name, e);
+                                },
+                                Err(_) => {
+                                    metrics::worker_timeouts(pool_name.to_string(), worker_index).increment(1);
+                                    error!("{}: Worker task timed out after {} seconds", worker_name, worker_timeout_secs);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        cancellation_token.cancel();
         info!("{}: Worker task finished", worker_name);
     });
 }

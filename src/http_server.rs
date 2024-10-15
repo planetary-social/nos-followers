@@ -9,14 +9,14 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use axum::Router;
+use axum_server::Handle;
 use moka::future::Cache;
 use router::create_router;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{error, info};
+use tracing::info;
 
 pub struct AppState<T, U>
 where
@@ -84,40 +84,18 @@ fn start_http_server(
 ) {
     task_tracker.spawn(async move {
         let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
-        let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
-            error!("Failed to bind to address: {}", addr);
-            cancellation_token.cancel();
-            return;
-        };
-
-        let token_clone = cancellation_token.clone();
-        let server_future = tokio::spawn(async {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown_hook(token_clone))
+        let handle = Handle::new();
+        tokio::spawn(await_shutdown(cancellation_token, handle.clone()));
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .context("Failed to start HTTP server")
-        });
-
-        await_shutdown(cancellation_token, server_future).await;
     });
 }
 
-async fn await_shutdown(
-    cancellation_token: CancellationToken,
-    server_future: tokio::task::JoinHandle<Result<()>>,
-) {
+async fn await_shutdown(cancellation_token: CancellationToken, handle: Handle) {
     cancellation_token.cancelled().await;
-    info!("Shutdown signal received.");
-    match timeout(Duration::from_secs(5), server_future).await {
-        Ok(_) => info!("HTTP service exited successfully."),
-        Err(e) => info!("HTTP service exited after timeout: {}", e),
-    }
-}
-
-async fn shutdown_hook(cancellation_token: CancellationToken) {
-    cancellation_token.cancelled().await;
-    info!("Exiting the process");
+    info!("Shuting down.");
+    handle.graceful_shutdown(Some(Duration::from_secs(30)));
 }

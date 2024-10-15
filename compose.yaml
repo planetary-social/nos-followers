@@ -23,6 +23,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      relay:
+        condition: service_healthy
     ports:
       - "3000:3000"
       - "3001:3001"
@@ -59,8 +61,25 @@ services:
 
   relay:
     image: ghcr.io/planetary-social/nosrelay:latest
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RELAY_URL=ws://localhost:7777
     ports:
       - "7777:7777"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: redis-cli ping
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
 
   db:
     image: neo4j:latest
