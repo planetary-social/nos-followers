@@ -5,10 +5,6 @@ services:
       context: .
       target: final
     environment:
-      - APP__followers__relay=ws://relay:7777
-      - APP__followers__neo4j_uri=db:7687
-      - APP__followers__neo4j_user=neo4j
-      - APP__followers__neo4j_password=mydevpassword
       - APP__ENVIRONMENT=development
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcloud/application_default_credentials.json
       - RUST_LOG=nos_followers=debug
