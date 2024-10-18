@@ -146,6 +146,12 @@ pub fn start_vanish_subscriber<T: RedisClientTrait, U: RepoTrait>(
                             info!("Removed public key {} from vanish request", public_key.to_hex());
 
                             last_id = stream_id.id.clone();
+
+                            if let Err(e) = con.set(VANISH_LAST_ID_KEY, last_id.clone()).await {
+                                error!("Failed to save last id: {}", e);
+                            } else  {
+                                info!("Updating last vanish stream id processed to {}", last_id);
+                            }
                         }
                     }
                     Ok::<(), Box<dyn Error>>(())
@@ -165,7 +171,7 @@ async fn get_connection_and_last_id<T: RedisClientTrait>(
 ) -> Result<(T::Connection, String), RedisError> {
     let mut con = redis_client.get_connection().await?;
     let last_id = con
-        .get(&VANISH_LAST_ID_KEY)
+        .get(VANISH_LAST_ID_KEY)
         .await
         .unwrap_or_else(|_| "0-0".to_string());
     Ok((con, last_id))
