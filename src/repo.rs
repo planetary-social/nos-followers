@@ -18,7 +18,7 @@ impl Repo {
 }
 
 // Default trait raises not implemented just to ease testing
-pub trait RepoTrait: Sync + Send {
+pub trait RepoTrait: Sync + Send + 'static {
     /// Set the last contact list date seen for a user if it's newer than the stored value
     fn update_last_contact_list_at(
         &self,
@@ -105,6 +105,13 @@ pub trait RepoTrait: Sync + Send {
         _public_key: &PublicKey,
     ) -> impl std::future::Future<Output = Result<Option<AccountInfo>, RepoError>> + std::marker::Send
     {
+        async { panic!("Not implemented") }
+    }
+
+    fn remove_pubkey(
+        &self,
+        _public_key: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<(), RepoError>> + std::marker::Send {
         async { panic!("Not implemented") }
     }
 }
@@ -571,6 +578,43 @@ impl RepoTrait for Repo {
             Err(e) => Err(RepoError::General(e)),
         }
     }
+
+    async fn remove_pubkey(&self, public_key: &PublicKey) -> Result<(), RepoError> {
+        let statement = r#"
+            MATCH (user:User {pubkey: $pubkey_val})
+
+            // Decrement follower_count of followees
+            OPTIONAL MATCH (user)-[:FOLLOWS]->(followee:User)
+            FOREACH (f IN CASE WHEN followee IS NOT NULL THEN [followee] ELSE [] END |
+                SET f.follower_count = CASE
+                    WHEN f.follower_count > 0 THEN f.follower_count - 1
+                    ELSE 0
+                END
+            )
+
+            // Decrement followee_count of followers
+            WITH user
+            OPTIONAL MATCH (follower:User)-[:FOLLOWS]->(user)
+            FOREACH (f IN CASE WHEN follower IS NOT NULL THEN [follower] ELSE [] END |
+                SET f.followee_count = CASE
+                    WHEN f.followee_count > 0 THEN f.followee_count - 1
+                    ELSE 0
+                END
+            )
+
+            WITH user
+            DETACH DELETE user
+        "#;
+
+        let query = query(statement).param("pubkey_val", public_key.to_hex());
+
+        self.graph
+            .run(query)
+            .await
+            .map_err(RepoError::RemovePubkey)?;
+
+        Ok(())
+    }
 }
 
 /// A function to read as DateTime<Utc> a value stored either as LocalDatetime or DateTime<Utc>
@@ -640,6 +684,9 @@ pub enum RepoError {
 
     #[error("Failed to get pagerank: {0}")]
     GetPageRank(neo4rs::Error),
+
+    #[error("Failed to remove pubkey: {0}")]
+    RemovePubkey(neo4rs::Error),
 }
 
 impl RepoError {

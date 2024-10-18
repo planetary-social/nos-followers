@@ -10,6 +10,7 @@ use nos_followers::{
     repo::{Repo, RepoTrait},
     scheduler::start_scheduler,
     tcp_importer::start_tcp_importer,
+    vanish_subscriber::{start_vanish_subscriber, RedisClient},
     worker_pool::WorkerPool,
 };
 use nostr_sdk::prelude::*;
@@ -152,6 +153,18 @@ async fn start_server(settings: Settings) -> Result<()> {
     )
     .await
     .context("Failed starting the scheduler")?;
+
+    // TODO: Now that we have redis we would use it to restore pending
+    // notifications between restarts and integrate it with cached crate
+    let redis_client = RedisClient::new(&settings.redis_url);
+
+    info!("Starting vanish subscriber");
+    start_vanish_subscriber(
+        task_tracker.clone(),
+        redis_client,
+        repo.clone(),
+        cancellation_token.clone(),
+    );
 
     tokio::spawn(async move {
         if let Err(e) = cancel_on_stop_signals(cancellation_token).await {

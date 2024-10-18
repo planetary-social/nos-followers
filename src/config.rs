@@ -25,6 +25,7 @@ pub struct Settings {
     pub pagerank_cron_expression: String,
     pub http_cache_seconds: u32,
     pub burst: NonZeroU16,
+    pub redis_url: String,
 }
 
 impl Configurable for Settings {
