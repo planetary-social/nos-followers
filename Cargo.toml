@@ -9,7 +9,7 @@ name = "nos_followers"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.87"
+anyhow = "1.0.91"
 async-trait = "0.1.82"
 axum = "0.7.5"
 axum-server = "0.7.1"
