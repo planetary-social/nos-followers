@@ -149,9 +149,9 @@ checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
 
 [[package]]
 name = "assertables"
-version = "8.3.0"
+version = "9.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0de2cc69bb6ce4cc9b92d7daba4bba9a0fdc7ca46842b73003d1763bb7cf16d2"
+checksum = "a69593c7115cd7d0883fcb6d49deadf4e6c410db03814280161a6dfdc732f450"
 
 [[package]]
 name = "async-compression"
