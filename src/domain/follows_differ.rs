@@ -368,7 +368,7 @@ fn log_line(
     }
 
     // Investigate states in which there are no followees but there are unfollowed followees
-    if followed_counter == 0 && unfollowed_counter > 0 && unchanged == 0 {
+    if followed_counter == 0 && unfollowed_counter > 1 && unchanged == 0 {
         metrics::sudden_follow_drops().increment(1);
 
         if has_nos_agent(event) {
