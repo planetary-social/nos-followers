@@ -20,7 +20,7 @@ env_logger = "0.11.5"
 futures = "0.3.30"
 gcloud-sdk = { version = "0.25.6", features = ["google-pubsub-v1"] }
 hyper = "1.4.1"
-hyper-util = { version = "=0.1.6", features = ["client", "http1", "client-legacy"] }
+hyper-util = { version = "0.1.10", features = ["client", "http1", "client-legacy"] }
 log = "0.4.22"
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"

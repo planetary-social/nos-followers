@@ -1,23 +1,36 @@
 on: [push, pull_request]
 
-name: Code coverage with grcov
-env:
-    CARGO_TERM_COLOR: always
-
+name: Rust CI
 
 jobs:
-  grcov:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macOS-latest
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run tests
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all-features --features ci
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
         uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly
@@ -53,11 +66,11 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path-to-lcov: ./lcov.info
-          flag-name: run-${{ matrix.os }}
+          flag-name: run-ubuntu-latest
           parallel: true
 
-  grcov_finalize:
-    needs: grcov
+  coverage_finalize:
+    needs: coverage
     runs-on: ubuntu-latest
     steps:
       - name: Coveralls finalization
