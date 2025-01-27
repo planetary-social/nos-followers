@@ -1,5 +1,6 @@
 use super::{FollowChange, NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
 use crate::rate_limiter::RateLimiter;
+use chrono::Utc;
 use nostr_sdk::prelude::*;
 use ordermap::OrderMap;
 use std::fmt::Debug;
@@ -143,6 +144,43 @@ impl FolloweeNotificationFactory {
         }
 
         vec![]
+    }
+
+    // Force flushes changes older than the specified duration, regardless of rate limiting
+    pub fn force_flush_old_changes(&mut self, max_age: Duration) -> Vec<NotificationMessage> {
+        if self.no_followers() {
+            return vec![];
+        }
+
+        let now = Utc::now();
+        let max_age = chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::zero());
+
+        // Filter changes that are older than max_age
+        let (old_changes, remaining_changes): (Vec<_>, Vec<_>) = self
+            .follow_changes
+            .drain(..)
+            .map(|(_, v)| v)
+            .filter(|v| v.is_follower())
+            .partition(|v| {
+                let age = now.signed_duration_since(v.followed_at());
+                age > max_age
+            });
+
+        // Put back the changes that are not old enough
+        for change in remaining_changes {
+            self.follow_changes.insert(*change.follower(), change);
+        }
+
+        if old_changes.is_empty() {
+            return vec![];
+        }
+
+        self.emptied_at = Some(Instant::now());
+
+        old_changes
+            .chunks(MAX_FOLLOWERS_PER_BATCH)
+            .map(|batch| batch.to_vec().into())
+            .collect()
     }
 }
 

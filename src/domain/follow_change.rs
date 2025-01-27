@@ -108,6 +108,10 @@ impl FollowChange {
 
         self
     }
+
+    pub fn followed_at(&self) -> DateTime<Utc> {
+        self.followed_at
+    }
 }
 
 impl fmt::Display for FollowChange {
