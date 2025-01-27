@@ -1,5 +1,5 @@
 ## Followers server
-[![Coverage Status](https://coveralls.io/repos/github/planetary-social/nos-followers/badge.svg?branch=main)](https://coveralls.io/github/planetary-social/nos-followers?branch=main)
+[![codecov](https://codecov.io/gh/planetary-social/nos-followers/graph/badge.svg?token=3B19KU1247)](https://codecov.io/gh/planetary-social/nos-followers)
 
 A server that listens to Nostr [Follow List](https://github.com/nostr-protocol/nips/blob/master/02.md) events and identifies follow and unfollow actions. These events are then published to a Google Pub/Sub queue.
 
