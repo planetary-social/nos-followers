@@ -130,15 +130,17 @@ impl FolloweeNotificationFactory {
             self.rate_limiter.consume(tokens_needed);
 
             if let Some(follow_change) = followers.first() {
-                info!(
-                    "Followee {}({}). {}",
-                    follow_change.friendly_followee(),
-                    follow_change
-                        .followee()
-                        .to_bech32()
-                        .expect("Followee to_bech32"),
-                    self.rate_limiter
-                );
+                if self.rate_limiter.get_available_tokens() < 6.0 {
+                    info!(
+                        "Followee {}({}). {}",
+                        follow_change.friendly_followee(),
+                        follow_change
+                            .followee()
+                            .to_bech32()
+                            .expect("Followee to_bech32"),
+                        self.rate_limiter
+                    );
+                }
             }
             return messages;
         }
