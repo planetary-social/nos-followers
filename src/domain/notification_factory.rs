@@ -30,13 +30,20 @@ impl NotificationFactory {
 
         let min_seconds_between_messages = NonZeroUsize::new(min_seconds_between_messages).unwrap();
 
-        // Initialize TopK with the following configuration:
-        // - k (track k number of most frequent followees)
-        // - width (internal parameter controlling accuracy)
-        // - depth (internal parameter controlling accuracy)
-        // - decay (decay factor between 0 and 1 for aging out less frequent items;
+        // Initialize TopK with parameters:
+        // k=100 (track top 100 items)
+        // width=500 (internal parameter controlling accuracy)
+        // depth=3 (internal parameter controlling accuracy)
+        // decay=0.5 (decay factor between 0 and 1 for aging out less frequent items;
         //   lower values cause faster forgetting of infrequent items)
-        let top_followees = TopK::new(100, 1000, 5, 0.5);
+        let top_followees = TopK::new(100, 500, 3, 0.5);
+
+        // Initialize metrics with 0 values
+        for node in top_followees.list() {
+            if let Ok(friendly_id) = String::from_utf8(node.item.to_vec()) {
+                metrics::top_followee_count(friendly_id).set(0.0);
+            }
+        }
 
         Self {
             followee_maps: OrderMap::with_capacity(1_000),
@@ -134,8 +141,16 @@ impl NotificationFactory {
         );
 
         info!("Top 100 most followed accounts:");
+        // Set all current values to 0 first to handle decreases
         for node in self.top_followees.list() {
             if let Ok(friendly_id) = String::from_utf8(node.item.to_vec()) {
+                metrics::top_followee_count(friendly_id.clone()).set(0.0);
+            }
+        }
+        // Then set the actual values
+        for node in self.top_followees.list() {
+            if let Ok(friendly_id) = String::from_utf8(node.item.to_vec()) {
+                metrics::top_followee_count(friendly_id.clone()).set(node.count as f64);
                 info!("    {}: {} follows", friendly_id, node.count);
             }
         }
