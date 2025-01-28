@@ -38,13 +38,6 @@ impl NotificationFactory {
         //   lower values cause faster forgetting of infrequent items)
         let top_followees: TopK<Vec<u8>> = TopK::new(100, 500, 3, 0.5);
 
-        // Initialize metrics with 0 values
-        for node in top_followees.list() {
-            if let Ok(friendly_id) = String::from_utf8(node.item.to_vec()) {
-                metrics::top_followee_count(friendly_id).set(0.0);
-            }
-        }
-
         Self {
             followee_maps: OrderMap::with_capacity(1_000),
             burst,
@@ -61,10 +54,9 @@ impl NotificationFactory {
                 FolloweeNotificationFactory::new(self.burst, self.min_seconds_between_messages)
             });
 
-        // Add to TopK tracking when it's a follow (not unfollow)
+        // Add to TopK tracking only when it's a follow (not unfollow)
         if follow_change.is_follower() {
-            // Convert friendly_followee to bytes for TopK tracking
-            let friendly_id = follow_change.friendly_followee().to_string();
+            let friendly_id = follow_change.enriched_followee_display();
             self.top_followees.add(friendly_id.as_bytes().to_vec());
         }
 
@@ -142,8 +134,8 @@ impl NotificationFactory {
 
         info!("Top 100 most followed accounts:");
         for node in self.top_followees.list() {
-            if let Ok(friendly_id) = String::from_utf8(node.item.to_vec()) {
-                metrics::top_followee_count(friendly_id.clone()).set(node.count as f64);
+            if let Ok(id_str) = String::from_utf8(node.item.to_vec()) {
+                info!("    {}: {} follows", id_str, node.count);
             }
         }
     }

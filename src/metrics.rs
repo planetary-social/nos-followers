@@ -69,10 +69,6 @@ pub fn pagerank_seconds() -> Gauge {
     metrics::gauge!("pagerank_seconds")
 }
 
-pub fn top_followee_count(followee_id: String) -> Gauge {
-    metrics::gauge!("top_followee_count", "followee" => followee_id)
-}
-
 pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
     describe_counter!(
         "pubsub_messages",
@@ -122,7 +118,6 @@ pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
         "Number of retained follow changes"
     );
     describe_gauge!("pagerank_seconds", "Seconds it takes to calculate pagerank");
-    describe_gauge!("top_followee_count", "Number of follows for top followees");
 
     let prometheus_builder = PrometheusBuilder::new();
     let prometheus_handle = prometheus_builder.install_recorder()?;

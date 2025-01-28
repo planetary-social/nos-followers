@@ -112,6 +112,16 @@ impl FollowChange {
     pub fn followed_at(&self) -> DateTime<Utc> {
         self.followed_at
     }
+
+    pub fn enriched_follower_display(&self) -> String {
+        let npub = self.follower.to_bech32().ok();
+        self.friendly_follower.enriched_display(npub.as_deref())
+    }
+
+    pub fn enriched_followee_display(&self) -> String {
+        let npub = self.followee.to_bech32().ok();
+        self.friendly_followee.enriched_display(npub.as_deref())
+    }
 }
 
 impl fmt::Display for FollowChange {

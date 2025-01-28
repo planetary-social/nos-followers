@@ -64,6 +64,21 @@ impl From<&PublicKey> for FriendlyId {
     }
 }
 
+impl FriendlyId {
+    pub fn enriched_display(&self, npub: Option<&str>) -> String {
+        match self {
+            FriendlyId::Npub(_) | FriendlyId::PublicKey(_) => self.to_string(),
+            _ => {
+                if let Some(npub) = npub {
+                    format!("{} ({})", self, npub)
+                } else {
+                    self.to_string()
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountInfo {
     pub public_key: PublicKey,
