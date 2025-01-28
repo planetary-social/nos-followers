@@ -1,6 +1,7 @@
 use super::NotificationMessage;
 use crate::domain::{FollowChange, FolloweeNotificationFactory};
 use crate::metrics;
+use heavykeeper::TopK;
 use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
 use std::collections::HashSet;
@@ -17,6 +18,7 @@ pub struct NotificationFactory {
     followee_maps: OrderMap<Followee, FolloweeNotificationFactory>,
     burst: u16,
     min_seconds_between_messages: NonZeroUsize,
+    top_followees: TopK<Vec<u8>>,
 }
 
 impl NotificationFactory {
@@ -28,10 +30,18 @@ impl NotificationFactory {
 
         let min_seconds_between_messages = NonZeroUsize::new(min_seconds_between_messages).unwrap();
 
+        // Initialize TopK with parameters:
+        // k=20 (top 20 followees)
+        // width=1000 (internal width for accuracy)
+        // depth=5 (internal depth for accuracy)
+        // decay=0.925 (decay factor for aging out less frequent items)
+        let top_followees = TopK::new(20, 1000, 5, 0.925);
+
         Self {
             followee_maps: OrderMap::with_capacity(1_000),
             burst,
             min_seconds_between_messages,
+            top_followees,
         }
     }
 
@@ -42,6 +52,13 @@ impl NotificationFactory {
             .or_insert_with_key(|_| {
                 FolloweeNotificationFactory::new(self.burst, self.min_seconds_between_messages)
             });
+
+        // Add to TopK tracking when it's a follow (not unfollow)
+        if follow_change.is_follower() {
+            // Convert friendly_followee to bytes for TopK tracking
+            let friendly_id = follow_change.friendly_followee().to_string();
+            self.top_followees.add(friendly_id.as_bytes().to_vec());
+        }
 
         followee_info.insert(follow_change);
     }
@@ -114,6 +131,14 @@ impl NotificationFactory {
             messages.iter().filter(|m| m.is_single()).count(),
             messages.iter().filter(|m| !m.is_single()).count()
         );
+
+        // Log top 20 most followed accounts
+        info!("Top 20 most followed accounts:");
+        for node in self.top_followees.list() {
+            if let Ok(friendly_id) = String::from_utf8(node.item.to_vec()) {
+                info!("    {}: {} follows", friendly_id, node.count);
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
