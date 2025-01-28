@@ -30,12 +30,13 @@ impl NotificationFactory {
 
         let min_seconds_between_messages = NonZeroUsize::new(min_seconds_between_messages).unwrap();
 
-        // Initialize TopK with parameters:
-        // k=20 (top 20 followees)
-        // width=1000 (internal width for accuracy)
-        // depth=5 (internal depth for accuracy)
-        // decay=0.925 (decay factor for aging out less frequent items)
-        let top_followees = TopK::new(20, 1000, 5, 0.925);
+        // Initialize TopK with the following configuration:
+        // - k (track k number of most frequent followees)
+        // - width (internal parameter controlling accuracy)
+        // - depth (internal parameter controlling accuracy)
+        // - decay (decay factor between 0 and 1 for aging out less frequent items;
+        //   lower values cause faster forgetting of infrequent items)
+        let top_followees = TopK::new(100, 1000, 5, 0.5);
 
         Self {
             followee_maps: OrderMap::with_capacity(1_000),
@@ -132,8 +133,7 @@ impl NotificationFactory {
             messages.iter().filter(|m| !m.is_single()).count()
         );
 
-        // Log top 20 most followed accounts
-        info!("Top 20 most followed accounts:");
+        info!("Top 100 most followed accounts:");
         for node in self.top_followees.list() {
             if let Ok(friendly_id) = String::from_utf8(node.item.to_vec()) {
                 info!("    {}: {} follows", friendly_id, node.count);
