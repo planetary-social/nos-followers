@@ -19,6 +19,7 @@ pub struct FollowChange {
     friendly_follower: FriendlyId,
     followee: PublicKey,
     friendly_followee: FriendlyId,
+    trusted: bool, // Whether the follower is trusted
 }
 
 impl PartialEq for FollowChange {
@@ -27,6 +28,7 @@ impl PartialEq for FollowChange {
             && self.followed_at == other.followed_at
             && self.follower == other.follower
             && self.followee == other.followee
+            && self.trusted == other.trusted
     }
 }
 
@@ -43,6 +45,7 @@ impl FollowChange {
             friendly_follower: FriendlyId::PublicKey(follower.to_hex()),
             followee,
             friendly_followee: FriendlyId::PublicKey(followee.to_hex()),
+            trusted: false,
         }
     }
 
@@ -56,6 +59,7 @@ impl FollowChange {
             friendly_follower: FriendlyId::PublicKey(follower.to_hex()),
             followee,
             friendly_followee: FriendlyId::PublicKey(followee.to_hex()),
+            trusted: false,
         }
     }
 
@@ -65,6 +69,16 @@ impl FollowChange {
 
     pub fn followee(&self) -> &PublicKey {
         &self.followee
+    }
+
+    /// Returns the change type (Followed or Unfollowed)
+    pub fn change_type(&self) -> &ChangeType {
+        &self.change_type
+    }
+
+    /// Returns the timestamp when the follow change occurred
+    pub fn followed_at(&self) -> DateTime<Utc> {
+        self.followed_at
     }
 
     pub fn friendly_follower(&self) -> &FriendlyId {
@@ -109,8 +123,15 @@ impl FollowChange {
         self
     }
 
-    pub fn followed_at(&self) -> DateTime<Utc> {
-        self.followed_at
+    /// Sets whether the follower is trusted
+    pub fn with_trusted(mut self, trusted: bool) -> Self {
+        self.trusted = trusted;
+        self
+    }
+
+    /// Returns whether the follower is trusted
+    pub fn is_trusted(&self) -> bool {
+        self.trusted
     }
 
     pub fn enriched_follower_display(&self) -> String {

@@ -330,7 +330,7 @@ impl VerifyNip05 for Nip05Verifier {
             nip05::verify(public_key, nip05_value, None),
         )
         .await
-        .map_or(false, |inner_result| inner_result.unwrap_or(false))
+        .is_ok_and(|inner_result| inner_result.unwrap_or(false))
     }
 }
 

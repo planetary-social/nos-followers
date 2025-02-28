@@ -159,9 +159,25 @@ impl FolloweeNotificationFactory {
             return;
         }
 
-        let to_remove = self.follow_changes.len() - MAX_CHANGES_PER_FOLLOWEE;
+        // Check if we need to remove any follow changes
+        let to_remove = self
+            .follow_changes
+            .len()
+            .saturating_sub(MAX_CHANGES_PER_FOLLOWEE);
         if to_remove > 0 {
-            self.follow_changes.drain(0..to_remove);
+            // First, remove all untrusted follow changes by retaining only trusted ones
+            self.follow_changes
+                .retain(|_, follow_change| follow_change.is_trusted());
+
+            // If we still need to remove more to stay under the limit, drain from the beginning (oldest entries)
+            let remaining_to_remove = self
+                .follow_changes
+                .len()
+                .saturating_sub(MAX_CHANGES_PER_FOLLOWEE);
+            if remaining_to_remove > 0 {
+                // OrderMap preserves insertion order, so the first items are the oldest
+                self.follow_changes.drain(0..remaining_to_remove);
+            }
         }
 
         if self.follow_changes.is_empty() {

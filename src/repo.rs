@@ -634,7 +634,7 @@ impl RepoTrait for Repo {
 
         // If we have account info, use its is_trusted method
         // Otherwise, the account doesn't exist, so it's not trusted
-        let trusted = maybe_account_info.map_or(false, |account| account.is_trusted());
+        let trusted = maybe_account_info.is_some_and(|account| account.is_trusted());
 
         Ok(trusted)
     }

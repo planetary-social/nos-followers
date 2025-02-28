@@ -15,12 +15,9 @@ services:
       - cargo-git:/usr/local/cargo/git/db
       - build-cache:/app/target
       - ${HOME}/.config/gcloud/application_default_credentials.json:/app/gcloud/application_default_credentials.json
-
     depends_on:
-      db:
-        condition: service_healthy
-      relay:
-        condition: service_healthy
+      - db
+      - relay
     ports:
       - "3000:3000"
       - "3001:3001"
@@ -36,7 +33,7 @@ services:
     environment:
       - APP__followers__neo4j_uri=db:7687
       - APP__followers__neo4j_user=neo4j
-      - APP__followers__neo4j_password=mydevpassword
+      - APP__followers__neo4j_password=password
       - APP__ENVIRONMENT=development
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcloud/application_default_credentials.json
       - RUST_LOG=nos_followers=debug
@@ -49,66 +46,72 @@ services:
       - ${HOME}/.config/gcloud/application_default_credentials.json:/app/gcloud/application_default_credentials.json
     entrypoint: ["/bin/pagerank"]
     depends_on:
-      db:
-        condition: service_healthy
+      - db
     restart: "no"
     profiles:
       - pagerank-profile
 
   relay:
     image: ghcr.io/planetary-social/nosrelay:latest
+    platform: linux/amd64
     environment:
       - REDIS_URL=redis://redis:6379
       - RELAY_URL=ws://localhost:7777
     ports:
       - "7777:7777"
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
+    restart: on-failure
+    # Health checks are now optional for local development
+    # Option 1: Simple port check
+    # healthcheck:
+    #   test: ["CMD", "sh", "-c", "nc -z localhost 7777 || exit 1"]
+    #   interval: 10s
+    #   timeout: 10s
+    #   retries: 10
+    #   start_period: 30s
+
+    # Option 2: More advanced health check using a custom script
+    # healthcheck:
+    #   test: ["CMD", "sh", "-c", "echo '{\"id\": \"test\", \"method\": \"ping\"}' | websocat ws://localhost:7777 -n1 || exit 1"]
+    #   interval: 10s
+    #   timeout: 10s
+    #   retries: 10
+    #   start_period: 30s
 
   redis:
-    image: redis:latest
+    image: redis:7.2.4
+    platform: linux/amd64
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379:6379"
-    healthcheck:
-      test: redis-cli ping
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
 
   db:
-    image: neo4j:latest
+    image: neo4j:5.16.0
     platform: linux/amd64
+    command: ["bash", "-c", "rm -rf /data/* && rm -rf /logs/* && exec /startup/docker-entrypoint.sh neo4j"]
     ports:
-      - 7474:7474
-      - 7687:7687
+      - "7474:7474"
+      - "7687:7687"
     environment:
-      - NEO4J_AUTH=neo4j/mydevpassword
+      - NEO4J_AUTH=neo4j/password
+      - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_apoc_import_file_use__neo4j__config=true
-      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
-      - NEO4J_dbms_logs_debug_level=DEBUG
-      - NEO4J_dbms_logs_query_enabled=VERBOSE
-      - NEO4J_dbms_logs_query_threshold=0
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_internal_dbms_tx__log_fail__on__corrupted__log__files=false
     volumes:
-      - db-data:/data
-      - db-logs:/logs
-      - db-import:/var/lib/neo4j/import
-      - db-plugins:/plugins
-    healthcheck:
-      test: wget http://localhost:7474 || exit 1
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+      - neo4j_plugins:/plugins
 
 volumes:
-  db-data:
-  db-logs:
-  db-import:
-  db-plugins:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:
+  neo4j_plugins:
   cargo-registry:
   cargo-git:
   build-cache:

@@ -175,12 +175,19 @@ where
         event_created_at: DateTime<Utc>,
         follower_account_info: &AccountInfo,
     ) -> Result<(usize, usize, usize)> {
+        debug!(
+            "Processing follows diff for {}",
+            follower.to_bech32().unwrap_or_default()
+        );
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
 
         let send_notifications =
             should_send_notifications(follower_account_info, follower, event_created_at).await?;
+
+        // Get the trust status of the follower
+        let is_follower_trusted = follower_account_info.is_trusted();
 
         for (followee, diff) in follows_diff {
             match diff.stored_follow {
@@ -197,7 +204,8 @@ where
                                 FollowChange::new_unfollowed(event_created_at, *follower, followee)
                                     .with_friendly_follower(
                                         follower_account_info.friendly_id.clone(),
-                                    );
+                                    )
+                                    .with_trusted(is_follower_trusted);
                             self.send_follow_change(follow_change)?;
                         }
                         unfollowed_counter += 1;
@@ -218,7 +226,8 @@ where
                                 FollowChange::new_followed(event_created_at, *follower, followee)
                                     .with_friendly_follower(
                                         follower_account_info.friendly_id.clone(),
-                                    );
+                                    )
+                                    .with_trusted(is_follower_trusted);
                             self.send_follow_change(follow_change)?;
                         }
                         followed_counter += 1;
@@ -422,7 +431,6 @@ mod tests {
     use super::*;
     use crate::domain::contact_list_follow::ContactListFollow;
     use crate::repo::RepoError;
-    use assertables::*;
     use chrono::{Duration, Utc};
     use nostr_sdk::PublicKey;
     use std::borrow::Cow;
@@ -437,7 +445,6 @@ mod tests {
         LazyLock::new(|| DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0).unwrap());
 
     #[derive(Default)]
-
     struct MockNostrClient;
 
     #[async_trait]
@@ -530,7 +537,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_follows_differ_for_new_contact_list() {
         let followee_pubkey = Keys::generate().public_key();
         let follower_keys = Keys::generate();
@@ -549,11 +556,10 @@ mod tests {
                 follower_pubkey,
                 followee_pubkey,
             )],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_follows_differ_for_new_added_contact() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -587,11 +593,10 @@ mod tests {
                     followee2_pubkey,
                 ),
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_follows_differ_for_removed_contact() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -635,11 +640,10 @@ mod tests {
                     followee2_pubkey,
                 ),
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_follows_differ_ignores_adds_from_older_contact_list() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -688,11 +692,10 @@ mod tests {
                     followee2_pubkey,
                 ),
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_follows_differ_ignores_removes_from_older_contact_list() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -731,11 +734,10 @@ mod tests {
                     followee2_pubkey,
                 ),
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_no_follows_in_initial_contact_list() {
         let follower_keys = Keys::generate();
 
@@ -746,10 +748,10 @@ mod tests {
             seconds_to_datetime(1000),
         )];
 
-        assert_follow_changes(contact_events, vec![]).await;
+        assert_follow_changes(contact_events, vec![]);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_unfollow_all_contacts() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -789,11 +791,10 @@ mod tests {
                     followee2_pubkey,
                 ),
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_no_changes_for_unchanged_contact_list() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -827,11 +828,10 @@ mod tests {
                     followee2_pubkey,
                 ),
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_follow_self_ignored() {
         let follower_keys = Keys::generate();
         let follower_pubkey = follower_keys.public_key();
@@ -842,10 +842,10 @@ mod tests {
             seconds_to_datetime(1000),
         )];
 
-        assert_follow_changes(contact_events, vec![]).await;
+        assert_follow_changes(contact_events, vec![]);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_mixed_follow_and_unfollow_in_single_update() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -872,15 +872,10 @@ mod tests {
                 FollowChange::new_followed(
                     seconds_to_datetime(1),
                     follower_pubkey,
-                    followee1_pubkey,
+                    followee2_pubkey,
                 ),
                 FollowChange::new_followed(
                     seconds_to_datetime(1),
-                    follower_pubkey,
-                    followee2_pubkey,
-                ),
-                FollowChange::new_unfollowed(
-                    seconds_to_datetime(2),
                     follower_pubkey,
                     followee1_pubkey,
                 ),
@@ -889,12 +884,16 @@ mod tests {
                     follower_pubkey,
                     followee3_pubkey,
                 ),
+                FollowChange::new_unfollowed(
+                    seconds_to_datetime(2),
+                    follower_pubkey,
+                    followee1_pubkey,
+                ),
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_final_state_with_older_list_ignored() {
         let followee1_pubkey = Keys::generate().public_key();
         let followee2_pubkey = Keys::generate().public_key();
@@ -962,11 +961,10 @@ mod tests {
                 ),
                 // Tuesday's late update should do nothing
             ],
-        )
-        .await;
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_it_does_not_process_non_contact_events() {
         let follower_keys = Keys::generate();
         let followee_pubkey = Keys::generate().public_key();
@@ -978,7 +976,7 @@ mod tests {
             Kind::TextNote,
         );
 
-        assert_follow_changes(vec![wrong_event], vec![]).await;
+        assert_follow_changes(vec![wrong_event], vec![]);
     }
 
     #[test]
@@ -1004,15 +1002,63 @@ mod tests {
         assert!(!has_nos_agent(&event_with_no_tag));
     }
 
-    async fn assert_follow_changes(contact_events: Vec<Event>, expected: Vec<FollowChange>) {
-        let follow_changes = get_follow_changes_from_contact_events(contact_events)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|fc| *fc)
-            .collect::<Vec<FollowChange>>();
+    #[track_caller]
+    fn assert_follow_changes(contact_events: Vec<Event>, mut expected: Vec<FollowChange>) {
+        // First, get the follow changes in a blocking context
+        let mut follow_changes = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async {
+                get_follow_changes_from_contact_events(contact_events)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|fc| *fc)
+                    .collect::<Vec<FollowChange>>()
+            })
+        });
 
-        assert_bag_eq!(follow_changes, expected);
+        // Then do the assertions outside the block_in_place to preserve caller location
+        assert_eq!(
+            follow_changes.len(),
+            expected.len(),
+            "Number of follow changes doesn't match expected"
+        );
+
+        follow_changes.sort();
+        expected.sort();
+
+        for (i, (actual, expected)) in follow_changes.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                actual.change_type(),
+                expected.change_type(),
+                "Change type mismatch at index {}",
+                i
+            );
+            assert_eq!(
+                actual.followed_at(),
+                expected.followed_at(),
+                "Followed_at mismatch at index {}",
+                i
+            );
+            assert_eq!(
+                actual.follower().to_bech32(),
+                expected.follower().to_bech32(),
+                "Follower mismatch at index {}",
+                i
+            );
+            assert_eq!(
+                actual.followee().to_bech32(),
+                expected.followee().to_bech32(),
+                "Followee mismatch at index {}",
+                i
+            );
+            assert_eq!(
+                actual.is_trusted(),
+                expected.is_trusted(),
+                "Trust status mismatch at index {}",
+                i
+            );
+        }
     }
 
     fn create_contact_event(
