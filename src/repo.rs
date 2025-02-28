@@ -28,6 +28,14 @@ pub trait RepoTrait: Sync + Send + 'static {
         async { panic!("Not implemented") }
     }
 
+    /// Check if a user is trusted based on their account information
+    fn check_if_trusted(
+        &self,
+        _public_key: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<bool, RepoError>> + std::marker::Send {
+        async { panic!("Not implemented") }
+    }
+
     /// Get the friendly_id for a user
     fn get_friendly_id(
         &self,
@@ -614,6 +622,21 @@ impl RepoTrait for Repo {
             .map_err(RepoError::RemovePubkey)?;
 
         Ok(())
+    }
+
+    async fn check_if_trusted(&self, public_key: &PublicKey) -> Result<bool, RepoError> {
+        let maybe_account_info = self.get_account_info(public_key).await?;
+
+        info!(
+            "Checking if {}is trusted. Account: {:?}",
+            public_key, maybe_account_info
+        );
+
+        // If we have account info, use its is_trusted method
+        // Otherwise, the account doesn't exist, so it's not trusted
+        let trusted = maybe_account_info.map_or(false, |account| account.is_trusted());
+
+        Ok(trusted)
     }
 }
 

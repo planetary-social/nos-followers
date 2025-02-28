@@ -6,7 +6,6 @@ use nostr_sdk::PublicKey;
 use ordermap::OrderMap;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::time::Duration;
 use tracing::info;
 
 type Followee = PublicKey;
@@ -72,28 +71,15 @@ impl NotificationFactory {
         let initial_followees_len = self.followees_len();
 
         // First try normal flush
-        let mut messages = self
+        let messages = self
             .followee_maps
             .iter_mut()
             .flat_map(|(_, followee_factory)| followee_factory.flush())
             .collect::<Vec<_>>();
 
-        // Force flush changes older than 2 days
-        let force_flushed = self
-            .followee_maps
-            .iter_mut()
-            .flat_map(|(_, followee_factory)| {
-                followee_factory.force_flush_old_changes(Duration::from_secs(2 * 24 * 3600))
-            })
-            .collect::<Vec<_>>();
-
-        messages.extend(force_flushed);
-
         // More aggressive cleanup
-        self.followee_maps.retain(|_, followee_factory| {
-            !followee_factory.should_delete() && followee_factory.follow_changes.len() < 1000
-            // Add size limit per followee
-        });
+        self.followee_maps
+            .retain(|_, followee_factory| !followee_factory.should_delete());
 
         let follow_changes_len = self.follow_changes_len();
         record_metrics(&messages, follow_changes_len);

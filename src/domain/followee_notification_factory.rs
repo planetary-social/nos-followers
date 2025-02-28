@@ -1,6 +1,5 @@
 use super::{FollowChange, NotificationMessage, MAX_FOLLOWERS_PER_BATCH};
 use crate::rate_limiter::RateLimiter;
-use chrono::Utc;
 use nostr_sdk::prelude::*;
 use ordermap::OrderMap;
 use std::fmt::Debug;
@@ -13,6 +12,9 @@ type Follower = PublicKey;
 type Followee = PublicKey;
 
 static ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Maximum number of follow changes to keep per followee
+const MAX_CHANGES_PER_FOLLOWEE: usize = 1000;
+
 /// Accumulates messages for a followee and flushes them in batches
 pub struct FolloweeNotificationFactory {
     pub follow_changes: OrderMap<Follower, Box<FollowChange>>,
@@ -78,6 +80,7 @@ impl FolloweeNotificationFactory {
         };
 
         if one_day_elapsed {
+            // If a day has passed, we should flush regardless of rate limiting
             return true;
         }
 
@@ -145,44 +148,25 @@ impl FolloweeNotificationFactory {
             return messages;
         }
 
+        self.cleanup_and_handle_excess();
+
         vec![]
     }
 
-    // Force flushes changes older than the specified duration, regardless of rate limiting
-    pub fn force_flush_old_changes(&mut self, max_age: Duration) -> Vec<NotificationMessage> {
-        if self.no_followers() {
-            return vec![];
+    // Cleans up excess follows without sending notifications for them
+    pub fn cleanup_and_handle_excess(&mut self) {
+        if self.follow_changes.is_empty() {
+            return;
         }
 
-        let now = Utc::now();
-        let max_age = chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::zero());
-
-        // Filter changes that are older than max_age
-        let (old_changes, remaining_changes): (Vec<_>, Vec<_>) = self
-            .follow_changes
-            .drain(..)
-            .map(|(_, v)| v)
-            .filter(|v| v.is_follower())
-            .partition(|v| {
-                let age = now.signed_duration_since(v.followed_at());
-                age > max_age
-            });
-
-        // Put back the changes that are not old enough
-        for change in remaining_changes {
-            self.follow_changes.insert(*change.follower(), change);
+        let to_remove = self.follow_changes.len() - MAX_CHANGES_PER_FOLLOWEE;
+        if to_remove > 0 {
+            self.follow_changes.drain(0..to_remove);
         }
 
-        if old_changes.is_empty() {
-            return vec![];
+        if self.follow_changes.is_empty() {
+            self.emptied_at = Some(Instant::now());
         }
-
-        self.emptied_at = Some(Instant::now());
-
-        old_changes
-            .chunks(MAX_FOLLOWERS_PER_BATCH)
-            .map(|batch| batch.to_vec().into())
-            .collect()
     }
 }
 

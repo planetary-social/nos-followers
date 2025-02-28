@@ -2,6 +2,7 @@ use crate::metrics;
 use crate::{
     relay_subscriber::GetEventsOf,
     repo::{Repo, RepoTrait},
+    trust_policy,
 };
 use cached::proc_macro::cached;
 use cached::TimedSizedCache;
@@ -102,6 +103,22 @@ impl AccountInfo {
             last_contact_list_at: None,
         }
     }
+
+    /// Determines if this account is trusted based on the trust policy
+    ///
+    /// # Returns
+    /// `true` if the account is trusted, `false` otherwise
+    pub fn is_trusted(&self) -> bool {
+        // Check if the account has a high enough pagerank
+        let has_good_enough_followers = self.pagerank.is_some_and(|pr| pr > 0.2);
+
+        // TODO: This is a placeholder, we need to implement this from a nos user registration endpoint
+        let is_nos_user = false;
+
+        // The account exists since we have an instance of it
+        trust_policy::is_trusted(true, has_good_enough_followers, is_nos_user)
+    }
+
     pub fn with_friendly_id(self, friendly_id: Option<FriendlyId>) -> Self {
         Self {
             friendly_id,

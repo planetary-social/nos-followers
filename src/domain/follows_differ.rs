@@ -50,9 +50,10 @@ where
         let follower = event.pubkey;
         let event_created_at = convert_timestamp(event.created_at.as_u64())?;
         let maybe_account_info = self.repo.get_account_info(&follower).await?;
-        let mut account_info = maybe_account_info.unwrap_or_else(|| AccountInfo::new(follower));
+        let mut follower_account_info =
+            maybe_account_info.unwrap_or_else(|| AccountInfo::new(follower));
 
-        if probably_inactive_or_spam(&event, &account_info) {
+        if probably_inactive_or_spam(&event, &follower_account_info) {
             debug!(
                 "Skipping event from {} as it's probably spam",
                 event.pubkey.to_bech32().unwrap_or_default()
@@ -61,7 +62,7 @@ where
         }
 
         // Check if the event is older than the latest stored update and skip if so
-        if let Some(last_contact_list_at) = account_info.last_contact_list_at {
+        if let Some(last_contact_list_at) = follower_account_info.last_contact_list_at {
             if event_created_at < last_contact_list_at {
                 debug!(
                     "Skipping follow list for {} as it's older than the last update",
@@ -73,14 +74,14 @@ where
             }
         }
 
-        account_info.last_contact_list_at = Some(event_created_at);
+        follower_account_info.last_contact_list_at = Some(event_created_at);
         self.repo
             .update_last_contact_list_at(&follower, &event_created_at)
             .await?;
 
         // Grab profile nostr event and update what we know
         // TODO: This should be done in a separate worker
-        account_info
+        follower_account_info
             .refresh_metadata(&self.nostr_client, true)
             .await;
 
@@ -92,7 +93,12 @@ where
 
         // Process the follows_diff and apply changes
         let (followed_counter, unfollowed_counter, unchanged) = self
-            .process_follows_diff(follows_diff, &follower, event_created_at, &account_info)
+            .process_follows_diff(
+                follows_diff,
+                &follower,
+                event_created_at,
+                &follower_account_info,
+            )
             .await?;
 
         if let Some(log_line) = log_line(
@@ -100,7 +106,7 @@ where
             followed_counter,
             unfollowed_counter,
             unchanged,
-            account_info,
+            follower_account_info,
             &event,
         ) {
             info!("{}", log_line);
@@ -167,14 +173,14 @@ where
         follows_diff: HashMap<PublicKey, FollowsDiff>,
         follower: &PublicKey,
         event_created_at: DateTime<Utc>,
-        account_info: &AccountInfo,
+        follower_account_info: &AccountInfo,
     ) -> Result<(usize, usize, usize)> {
         let mut followed_counter = 0;
         let mut unfollowed_counter = 0;
         let mut unchanged = 0;
 
         let send_notifications =
-            should_send_notifications(account_info, follower, event_created_at).await?;
+            should_send_notifications(follower_account_info, follower, event_created_at).await?;
 
         for (followee, diff) in follows_diff {
             match diff.stored_follow {
@@ -189,7 +195,9 @@ where
                         if send_notifications {
                             let follow_change =
                                 FollowChange::new_unfollowed(event_created_at, *follower, followee)
-                                    .with_friendly_follower(account_info.friendly_id.clone());
+                                    .with_friendly_follower(
+                                        follower_account_info.friendly_id.clone(),
+                                    );
                             self.send_follow_change(follow_change)?;
                         }
                         unfollowed_counter += 1;
@@ -208,7 +216,9 @@ where
                         if send_notifications {
                             let follow_change =
                                 FollowChange::new_followed(event_created_at, *follower, followee)
-                                    .with_friendly_follower(account_info.friendly_id.clone());
+                                    .with_friendly_follower(
+                                        follower_account_info.friendly_id.clone(),
+                                    );
                             self.send_follow_change(follow_change)?;
                         }
                         followed_counter += 1;

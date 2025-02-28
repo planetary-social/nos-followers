@@ -11,5 +11,6 @@ pub mod relay_subscriber;
 pub mod repo;
 pub mod scheduler;
 pub mod tcp_importer;
+pub mod trust_policy;
 pub mod vanish_subscriber;
 pub mod worker_pool;
