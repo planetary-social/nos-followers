@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use neo4rs::{query, Graph};
 use std::fs;
 use std::io::prelude::*;
 use std::path::Path;
-use tracing::info;
+use tracing::{error, info};
 
 pub async fn apply_migrations(graph: &Graph) -> Result<()> {
     // Ensure the migration node exists
@@ -20,10 +20,23 @@ pub async fn apply_migrations(graph: &Graph) -> Result<()> {
     for entry in entries {
         if let Some(extension) = entry.path().extension() {
             if extension == "cypher" {
-                let migration_number = extract_migration_number(&entry.path())?;
+                let path = entry.path();
+                let migration_number = extract_migration_number(&path)
+                    .with_context(|| format!("Failed to extract migration number from {:?}", path))?;
+                
                 if migration_number > current_migration_number {
-                    run_migration(graph, &entry.path()).await?;
-                    update_migration_number(graph, migration_number).await?;
+                    info!("Applying migration {:?} (number: {})", path, migration_number);
+                    
+                    if let Err(e) = run_migration(graph, &path).await {
+                        error!("Failed to apply migration {:?}: {}", path, e);
+                        return Err(e).with_context(|| 
+                            format!("Failed to apply migration {:?} (number: {})", path, migration_number)
+                        );
+                    }
+                    
+                    update_migration_number(graph, migration_number)
+                        .await
+                        .with_context(|| format!("Failed to update migration number to {}", migration_number))?;
                 }
             }
         }
@@ -74,19 +87,35 @@ fn extract_migration_number(path: &Path) -> Result<i32> {
 }
 
 async fn run_migration(graph: &Graph, path: &Path) -> Result<()> {
-    let mut file = fs::File::open(path)?;
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("Failed to open migration file {:?}", path))?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("Failed to read migration file {:?}", path))?;
+    
     let statements = contents.split(";");
+    let mut statement_count = 0;
 
-    for statement in statements {
-        if statement.trim().is_empty() {
+    for (index, statement) in statements.enumerate() {
+        let trimmed = statement.trim();
+        if trimmed.is_empty() {
             continue;
         }
 
-        graph.run(query(statement)).await?;
-        info!("Migration applied: {:?}", path.display());
+        info!("Executing statement {} from migration {:?}", index + 1, path.file_name());
+        info!("Statement: {}", trimmed);
+        
+        if let Err(e) = graph.run(query(trimmed)).await {
+            error!("Failed to execute statement {} in migration {:?}", index + 1, path);
+            error!("Statement was: {}", trimmed);
+            error!("Error: {}", e);
+            return Err(e).with_context(|| 
+                format!("Failed to execute statement {} in migration {:?}", index + 1, path)
+            );
+        }
+        statement_count += 1;
     }
 
+    info!("Migration applied successfully: {:?} ({} statements)", path.display(), statement_count);
     Ok(())
 }

@@ -1,7 +1,8 @@
 use super::AppState;
 use crate::config::Settings;
 use crate::http_server::handlers::{
-    cached_check_if_trusted, cached_get_recommendations, serve_root_page,
+    cached_check_if_trusted, cached_get_recommendations, check_recommendation_status,
+    serve_root_page,
 };
 use crate::metrics::setup_metrics;
 use crate::relay_subscriber::GetEventsOf;
@@ -71,6 +72,10 @@ where
                 .route(
                     "/recommendations/:pubkey",
                     get(cached_get_recommendations::<T, U>),
+                )
+                .route(
+                    "/recommendations/:pubkey/status",
+                    get(check_recommendation_status::<T, U>),
                 )
                 .route("/trusted/:pubkey", get(cached_check_if_trusted::<T, U>))
                 .layer(TimeoutLayer::new(Duration::from_secs(5)))

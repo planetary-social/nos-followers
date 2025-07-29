@@ -6,6 +6,7 @@ use nos_followers::{
     follow_change_handler::FollowChangeHandler,
     http_server::HttpServer,
     migrations::apply_migrations,
+    recommendation_queue::RecommendationQueue,
     relay_subscriber::{create_client, start_nostr_subscription},
     repo::{Repo, RepoTrait},
     scheduler::start_scheduler,
@@ -42,7 +43,7 @@ async fn main() -> Result<()> {
     let settings = config.get::<Settings>()?;
 
     if let Err(e) = start_server(settings).await {
-        error!("Failed to start the server: {}", e);
+        error!("Failed to start the server: {:#}", e);
     }
 
     Ok(())
@@ -68,6 +69,27 @@ async fn start_server(settings: Settings) -> Result<()> {
     let task_tracker = TaskTracker::new();
     let cancellation_token = CancellationToken::new();
 
+    // Create recommendation queue and cache
+    info!("Initializing recommendation queue");
+    let recommendation_cache = moka::future::Cache::builder()
+        .time_to_live(std::time::Duration::from_secs(86400)) // 1 day
+        .max_capacity(4000)
+        .build();
+
+    let (recommendation_queue, recommendation_receiver) = RecommendationQueue::new(
+        repo.clone(),
+        recommendation_cache,
+        1000, // channel size
+    );
+    let recommendation_queue = Arc::new(recommendation_queue);
+
+    // Start recommendation queue worker
+    recommendation_queue.start_worker(
+        task_tracker.clone(),
+        recommendation_receiver,
+        cancellation_token.clone(),
+    );
+
     // Leave the http server at the top so the health endpoint is available quickly
     info!("Starting HTTP server at port {}", settings.http_port);
     HttpServer::start(
@@ -75,6 +97,7 @@ async fn start_server(settings: Settings) -> Result<()> {
         &settings,
         repo.clone(),
         shared_nostr_client.clone(),
+        recommendation_queue,
         cancellation_token.clone(),
     )?;
 

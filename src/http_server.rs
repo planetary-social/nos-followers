@@ -4,6 +4,7 @@ mod trust_policy;
 
 use crate::{
     config::Settings,
+    recommendation_queue::RecommendationQueue,
     relay_subscriber::GetEventsOf,
     repo::{Recommendation, RepoTrait},
 };
@@ -27,6 +28,7 @@ where
     pub nostr_client: Arc<U>,
     pub recommendation_cache: Cache<String, Vec<Recommendation>>,
     pub trust_cache: Cache<String, bool>,
+    pub recommendation_queue: Arc<RecommendationQueue<T>>,
 }
 
 impl<T, U> AppState<T, U>
@@ -34,7 +36,11 @@ where
     T: RepoTrait + 'static,
     U: GetEventsOf + 'static,
 {
-    pub fn new(repo: Arc<T>, nostr_client: Arc<U>) -> Self {
+    pub fn new(
+        repo: Arc<T>,
+        nostr_client: Arc<U>,
+        recommendation_queue: Arc<RecommendationQueue<T>>,
+    ) -> Self {
         let recommendation_cache = Cache::builder()
             .time_to_live(Duration::from_secs(86400)) // 1 day
             .max_capacity(4000)
@@ -50,6 +56,7 @@ where
             nostr_client,
             recommendation_cache,
             trust_cache,
+            recommendation_queue,
         }
     }
 }
@@ -61,13 +68,14 @@ impl HttpServer {
         settings: &Settings,
         repo: Arc<T>,
         nostr_client: Arc<U>,
+        recommendation_queue: Arc<RecommendationQueue<T>>,
         cancellation_token: CancellationToken,
     ) -> Result<()>
     where
         T: RepoTrait + 'static,
         U: GetEventsOf + 'static,
     {
-        let state = Arc::new(AppState::new(repo, nostr_client));
+        let state = Arc::new(AppState::new(repo, nostr_client, recommendation_queue));
         let router = create_router(state, settings)?;
 
         start_http_server(task_tracker, settings.http_port, router, cancellation_token);

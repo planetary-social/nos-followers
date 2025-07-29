@@ -3,7 +3,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use core::panic;
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -777,7 +777,7 @@ impl RepoError {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendationReason {
     HighSimilarity,     // Similarity score > 0.3
@@ -787,7 +787,7 @@ pub enum RecommendationReason {
     LowSimilarity,      // Default for lower similarity matches
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Recommendation {
     pub pubkey: PublicKey,
     pub friendly_id: String,

@@ -1,1 +1,1 @@
-CREATE INDEX FOR (u:User) ON (u.followee_count);
+CREATE INDEX IF NOT EXISTS FOR (u:User) ON (u.followee_count);

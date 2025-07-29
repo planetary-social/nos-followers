@@ -1,1 +1,1 @@
-CREATE INDEX user_pagerank_idx FOR (u:User) ON (u.pagerank);
+CREATE INDEX user_pagerank_idx IF NOT EXISTS FOR (u:User) ON (u.pagerank);
