@@ -2,18 +2,21 @@ use crate::repo::{Recommendation, RepoTrait};
 use moka::future::Cache;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::sync::RwLock;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{error, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RecommendationStatus {
-    Pending,
+    Pending { position: usize },
     Processing,
     Completed(Vec<Recommendation>),
     Failed(String),
+    QueueFull,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +35,9 @@ where
     status_cache: Cache<String, RecommendationStatus>,
     result_cache: Cache<String, Vec<Recommendation>>,
     request_sender: broadcast::Sender<RecommendationRequest>,
+    pending_requests: Arc<RwLock<Vec<String>>>, // Track cache keys in order
+    queue_size: Arc<AtomicUsize>,
+    max_queue_size: usize,
 }
 
 impl<T> RecommendationQueue<T>
@@ -55,6 +61,9 @@ where
             status_cache,
             result_cache,
             request_sender,
+            pending_requests: Arc::new(RwLock::new(Vec::new())),
+            queue_size: Arc::new(AtomicUsize::new(0)),
+            max_queue_size: 50, // Maximum 50 requests in queue
         };
 
         (queue, request_receiver)
@@ -83,6 +92,12 @@ where
             return Ok(status);
         }
 
+        // Check if queue is full
+        let current_size = self.queue_size.load(Ordering::Relaxed);
+        if current_size >= self.max_queue_size {
+            return Ok(RecommendationStatus::QueueFull);
+        }
+
         // Create new request
         let request = RecommendationRequest {
             pubkey,
@@ -91,17 +106,34 @@ where
             cache_key: cache_key.clone(),
         };
 
-        // Mark as pending
+        // Add to pending requests and get position
+        let position = {
+            let mut pending = self.pending_requests.write().await;
+            pending.push(cache_key.clone());
+            pending.len()
+        };
+
+        // Update queue size
+        self.queue_size.fetch_add(1, Ordering::Relaxed);
+
+        // Mark as pending with position
         self.status_cache
-            .insert(cache_key.clone(), RecommendationStatus::Pending)
+            .insert(
+                cache_key.clone(),
+                RecommendationStatus::Pending { position },
+            )
             .await;
 
         // Send request to worker
-        self.request_sender
-            .send(request)
-            .map_err(|_| "Failed to queue recommendation request")?;
+        if let Err(_) = self.request_sender.send(request) {
+            // If send fails, clean up
+            self.queue_size.fetch_sub(1, Ordering::Relaxed);
+            let mut pending = self.pending_requests.write().await;
+            pending.retain(|k| k != &cache_key);
+            return Err("Failed to queue recommendation request".into());
+        }
 
-        Ok(RecommendationStatus::Pending)
+        Ok(RecommendationStatus::Pending { position })
     }
 
     pub async fn get_status(&self, cache_key: &str) -> Option<RecommendationStatus> {
@@ -123,6 +155,8 @@ where
         let repo = self.repo.clone();
         let status_cache = self.status_cache.clone();
         let result_cache = self.result_cache.clone();
+        let pending_requests = self.pending_requests.clone();
+        let queue_size = self.queue_size.clone();
 
         task_tracker.spawn(async move {
             info!("Recommendation queue worker started");
@@ -135,6 +169,19 @@ where
                     }
                     Ok(request) = receiver.recv() => {
                         let cache_key = request.cache_key.clone();
+
+                        // Remove from pending requests and update positions
+                        {
+                            let mut pending = pending_requests.write().await;
+                            pending.retain(|k| k != &cache_key);
+
+                            // Update positions for remaining requests
+                            for (index, key) in pending.iter().enumerate() {
+                                status_cache
+                                    .insert(key.clone(), RecommendationStatus::Pending { position: index + 1 })
+                                    .await;
+                            }
+                        }
 
                         // Mark as processing
                         status_cache
@@ -182,6 +229,9 @@ where
                                     .await;
                             }
                         }
+
+                        // Update queue size
+                        queue_size.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }

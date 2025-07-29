@@ -21,22 +21,31 @@ pub async fn apply_migrations(graph: &Graph) -> Result<()> {
         if let Some(extension) = entry.path().extension() {
             if extension == "cypher" {
                 let path = entry.path();
-                let migration_number = extract_migration_number(&path)
-                    .with_context(|| format!("Failed to extract migration number from {:?}", path))?;
-                
+                let migration_number = extract_migration_number(&path).with_context(|| {
+                    format!("Failed to extract migration number from {:?}", path)
+                })?;
+
                 if migration_number > current_migration_number {
-                    info!("Applying migration {:?} (number: {})", path, migration_number);
-                    
+                    info!(
+                        "Applying migration {:?} (number: {})",
+                        path, migration_number
+                    );
+
                     if let Err(e) = run_migration(graph, &path).await {
                         error!("Failed to apply migration {:?}: {}", path, e);
-                        return Err(e).with_context(|| 
-                            format!("Failed to apply migration {:?} (number: {})", path, migration_number)
-                        );
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Failed to apply migration {:?} (number: {})",
+                                path, migration_number
+                            )
+                        });
                     }
-                    
+
                     update_migration_number(graph, migration_number)
                         .await
-                        .with_context(|| format!("Failed to update migration number to {}", migration_number))?;
+                        .with_context(|| {
+                            format!("Failed to update migration number to {}", migration_number)
+                        })?;
                 }
             }
         }
@@ -92,7 +101,7 @@ async fn run_migration(graph: &Graph, path: &Path) -> Result<()> {
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .with_context(|| format!("Failed to read migration file {:?}", path))?;
-    
+
     let statements = contents.split(";");
     let mut statement_count = 0;
 
@@ -102,20 +111,36 @@ async fn run_migration(graph: &Graph, path: &Path) -> Result<()> {
             continue;
         }
 
-        info!("Executing statement {} from migration {:?}", index + 1, path.file_name());
+        info!(
+            "Executing statement {} from migration {:?}",
+            index + 1,
+            path.file_name()
+        );
         info!("Statement: {}", trimmed);
-        
+
         if let Err(e) = graph.run(query(trimmed)).await {
-            error!("Failed to execute statement {} in migration {:?}", index + 1, path);
+            error!(
+                "Failed to execute statement {} in migration {:?}",
+                index + 1,
+                path
+            );
             error!("Statement was: {}", trimmed);
             error!("Error: {}", e);
-            return Err(e).with_context(|| 
-                format!("Failed to execute statement {} in migration {:?}", index + 1, path)
-            );
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to execute statement {} in migration {:?}",
+                    index + 1,
+                    path
+                )
+            });
         }
         statement_count += 1;
     }
 
-    info!("Migration applied successfully: {:?} ({} statements)", path.display(), statement_count);
+    info!(
+        "Migration applied successfully: {:?} ({} statements)",
+        path.display(),
+        statement_count
+    );
     Ok(())
 }

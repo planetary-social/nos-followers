@@ -24,9 +24,23 @@ pub struct RecommendationParams {
 #[serde(untagged)]
 pub enum RecommendationResponse {
     Completed(Vec<Recommendation>),
-    Pending { status: String, message: String },
-    Processing { status: String, message: String },
-    Failed { status: String, error: String },
+    Pending {
+        status: String,
+        message: String,
+        position: Option<usize>,
+    },
+    Processing {
+        status: String,
+        message: String,
+    },
+    Failed {
+        status: String,
+        error: String,
+    },
+    QueueFull {
+        status: String,
+        message: String,
+    },
 }
 
 pub async fn cached_get_recommendations<T, U>(
@@ -65,13 +79,17 @@ where
             )
                 .into_response())
         }
-        RecommendationStatus::Pending => {
-            info!("Recommendation request pending for {}", pubkey);
+        RecommendationStatus::Pending { position } => {
+            info!(
+                "Recommendation request pending for {} at position {}",
+                pubkey, position
+            );
             Ok((
                 StatusCode::ACCEPTED,
                 Json(RecommendationResponse::Pending {
                     status: "pending".to_string(),
-                    message: "Recommendation calculation queued".to_string(),
+                    message: format!("Recommendation calculation queued at position {}", position),
+                    position: Some(position),
                 }),
             )
                 .into_response())
@@ -94,6 +112,19 @@ where
                 Json(RecommendationResponse::Failed {
                     status: "failed".to_string(),
                     error,
+                }),
+            )
+                .into_response())
+        }
+        RecommendationStatus::QueueFull => {
+            info!("Recommendation queue full for {}", pubkey);
+            Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(RecommendationResponse::QueueFull {
+                    status: "queue_full".to_string(),
+                    message:
+                        "Recommendation queue is full (max 50 requests). Please try again later."
+                            .to_string(),
                 }),
             )
                 .into_response())
@@ -152,11 +183,20 @@ where
         params.limit.unwrap_or(10)
     );
 
-    let status = state
-        .recommendation_queue
-        .get_status(&cache_key)
-        .await
-        .unwrap_or(RecommendationStatus::Pending);
+    let status = match state.recommendation_queue.get_status(&cache_key).await {
+        Some(status) => status,
+        None => {
+            info!("Status check: no status found for {}", pubkey);
+            return Ok((
+                StatusCode::NOT_FOUND,
+                axum::response::Json(serde_json::json!({
+                    "status": "not_found",
+                    "message": "No recommendation request found for this key"
+                })),
+            )
+                .into_response());
+        }
+    };
 
     match status {
         RecommendationStatus::Completed(recommendations) => {
@@ -171,13 +211,17 @@ where
             )
                 .into_response())
         }
-        RecommendationStatus::Pending => {
-            info!("Status check: recommendations pending for {}", pubkey);
+        RecommendationStatus::Pending { position } => {
+            info!(
+                "Status check: recommendations pending for {} at position {}",
+                pubkey, position
+            );
             Ok((
                 StatusCode::OK,
                 Json(RecommendationResponse::Pending {
                     status: "pending".to_string(),
-                    message: "Recommendation calculation queued".to_string(),
+                    message: format!("Recommendation calculation queued at position {}", position),
+                    position: Some(position),
                 }),
             )
                 .into_response())
@@ -203,6 +247,19 @@ where
                 Json(RecommendationResponse::Failed {
                     status: "failed".to_string(),
                     error,
+                }),
+            )
+                .into_response())
+        }
+        RecommendationStatus::QueueFull => {
+            info!("Status check: recommendation queue full for {}", pubkey);
+            Ok((
+                StatusCode::OK,
+                Json(RecommendationResponse::QueueFull {
+                    status: "queue_full".to_string(),
+                    message:
+                        "Recommendation queue is full (max 50 requests). Please try again later."
+                            .to_string(),
                 }),
             )
                 .into_response())
