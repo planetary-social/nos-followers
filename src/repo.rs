@@ -103,6 +103,8 @@ pub trait RepoTrait: Sync + Send + 'static {
     fn get_recommendations(
         &self,
         _pubkey: &PublicKey,
+        _min_pagerank: Option<f64>,
+        _limit: Option<usize>,
     ) -> impl std::future::Future<Output = Result<Vec<Recommendation>, RepoError>> + std::marker::Send
     {
         async { panic!("Not implemented") }
@@ -458,12 +460,29 @@ impl RepoTrait for Repo {
     async fn get_recommendations(
         &self,
         pubkey: &PublicKey,
+        min_pagerank: Option<f64>,
+        limit: Option<usize>,
     ) -> Result<Vec<Recommendation>, RepoError> {
+        // Validate and set defaults
+        let min_pagerank = min_pagerank.unwrap_or(0.3);
+        if min_pagerank < 0.0 {
+            return Err(RepoError::InvalidParameter(
+                "min_pagerank must be non-negative".into(),
+            ));
+        }
+
+        let limit = limit.unwrap_or(50);
+        if limit == 0 {
+            return Err(RepoError::InvalidParameter(
+                "limit must be greater than 0".into(),
+            ));
+        }
+
         let statement = r#"
             // Step 1: Get valid target nodes
             MATCH (source:User {pubkey: $pubkey_val})
             MATCH (target:User)
-            WHERE target.pagerank >= 0.3
+            WHERE target.pagerank >= $min_pagerank
             AND NOT EXISTS {
                 MATCH (source)-[:FOLLOWS]->(target)
             }
@@ -473,19 +492,28 @@ impl RepoTrait for Repo {
             CALL gds.nodeSimilarity.filtered.stream('filteredGraph', {
                 sourceNodeFilter: [id(source)],
                 targetNodeFilter: targetNodeIds,
-                topK: 10,
+                topK: $limit,
                 similarityCutoff: 0.1
             })
             YIELD node1, node2, similarity
             WITH gds.util.asNode(node2) AS targetUser, similarity
+
+            // Step 3: Count how many of source's follows also follow the target
+            OPTIONAL MATCH (source)-[:FOLLOWS]->(mutual:User)-[:FOLLOWS]->(targetUser)
+            WITH targetUser, similarity, count(DISTINCT mutual) AS mutualFollowCount
+
             RETURN targetUser.pubkey AS target_pubkey,
                    targetUser.friendly_id AS friendly_id,
                    similarity,
-                   targetUser.pagerank AS pagerank
+                   targetUser.pagerank AS pagerank,
+                   mutualFollowCount
             ORDER BY similarity DESC, pagerank DESC;
         "#;
 
-        let query = query(statement).param("pubkey_val", pubkey.to_hex());
+        let query = query(statement)
+            .param("pubkey_val", pubkey.to_hex())
+            .param("min_pagerank", min_pagerank)
+            .param("limit", limit as i64);
 
         let mut records = self
             .graph
@@ -507,6 +535,20 @@ impl RepoTrait for Repo {
             let pagerank: f64 = row.get::<f64>("pagerank").map_err(|e| {
                 RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
             })?;
+            let mutual_follow_count: i64 = row.get::<i64>("mutualFollowCount").unwrap_or(0);
+
+            // Determine recommendation reason
+            let reason_type = if similarity > 0.5 {
+                RecommendationReason::HighSimilarity
+            } else if similarity > 0.3 {
+                RecommendationReason::ModerateSimularity
+            } else if mutual_follow_count > 5 {
+                RecommendationReason::FollowedByMany
+            } else if pagerank > 1.0 {
+                RecommendationReason::PopularAccount
+            } else {
+                RecommendationReason::ModerateSimularity
+            };
 
             recommendations.push(Recommendation {
                 pubkey: PublicKey::from_hex(&pubkey)
@@ -514,6 +556,7 @@ impl RepoTrait for Repo {
                 friendly_id,
                 similarity,
                 pagerank,
+                reason_type,
             });
         }
 
@@ -710,6 +753,9 @@ pub enum RepoError {
 
     #[error("Failed to remove pubkey: {0}")]
     RemovePubkey(neo4rs::Error),
+
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
 }
 
 impl RepoError {
@@ -725,9 +771,19 @@ impl RepoError {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationReason {
+    HighSimilarity,     // Similarity score > 0.5
+    ModerateSimularity, // Similarity score 0.3-0.5
+    PopularAccount,     // High pagerank but lower similarity
+    FollowedByMany,     // Many of your follows also follow them
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct Recommendation {
-    pubkey: PublicKey,
-    friendly_id: String,
-    similarity: f64,
-    pagerank: f64,
+    pub pubkey: PublicKey,
+    pub friendly_id: String,
+    pub similarity: f64,
+    pub pagerank: f64,
+    pub reason_type: RecommendationReason,
 }
