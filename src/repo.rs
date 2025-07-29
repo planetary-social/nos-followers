@@ -483,25 +483,29 @@ impl RepoTrait for Repo {
             MATCH (source:User {pubkey: $pubkey_val})
             WHERE source.followee_count > 0
 
-            // Find users with common followees
-            MATCH (source)-[:FOLLOWS]->(commonFollowee:User)<-[:FOLLOWS]-(target:User)
+            // Collect source's followees first to reduce repeated traversals
+            MATCH (source)-[:FOLLOWS]->(followee:User)
+            WITH source, collect(DISTINCT followee) as sourceFollowees, source.followee_count AS source_followees
+
+            // Find targets through the collected followees
+            UNWIND sourceFollowees as commonFollowee
+            MATCH (target:User)-[:FOLLOWS]->(commonFollowee)
             WHERE target.pagerank >= $min_pagerank
-            AND target <> source
-            AND NOT EXISTS {
-                MATCH (source)-[:FOLLOWS]->(target)
-            }
+              AND target <> source
+              AND target.followee_count > 0
+              AND NOT EXISTS {
+                  MATCH (source)-[:FOLLOWS]->(target)
+              }
 
             // Group and count common followees
-            WITH source, target, COUNT(DISTINCT commonFollowee) AS common_count
+            WITH source_followees, target, COUNT(DISTINCT commonFollowee) AS common_count
 
             // Calculate Jaccard similarity using cached counts
             WITH target,
                  common_count,
-                 source.followee_count AS source_followees,
-                 target.followee_count AS target_followees
-            WITH target,
-                 common_count,
-                 toFloat(common_count) / (source_followees + target_followees - common_count) AS similarity
+                 source_followees,
+                 target.followee_count AS target_followees,
+                 toFloat(common_count) / (source_followees + target.followee_count - common_count) AS similarity
             WHERE similarity > 0.1
 
             RETURN target.pubkey AS target_pubkey,
@@ -540,17 +544,17 @@ impl RepoTrait for Repo {
             })?;
             let mutual_follow_count: i64 = row.get::<i64>("mutualFollowCount").unwrap_or(0);
 
-            // Determine recommendation reason based on common followees
-            let reason_type = if similarity > 0.5 {
+            // Determine recommendation reason based on realistic Nostr network thresholds
+            let reason_type = if similarity > 0.3 {
                 RecommendationReason::HighSimilarity
-            } else if similarity > 0.3 {
-                RecommendationReason::ModerateSimularity
-            } else if mutual_follow_count > 10 {
-                RecommendationReason::FollowedByMany // Many common interests
-            } else if pagerank > 1.0 {
+            } else if similarity > 0.15 {
+                RecommendationReason::ModerateSimilarity
+            } else if mutual_follow_count >= 5 {
+                RecommendationReason::SharedInterests
+            } else if pagerank > 0.5 && similarity > 0.1 {
                 RecommendationReason::PopularAccount
             } else {
-                RecommendationReason::ModerateSimularity
+                RecommendationReason::LowSimilarity
             };
 
             recommendations.push(Recommendation {
@@ -776,10 +780,11 @@ impl RepoError {
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendationReason {
-    HighSimilarity,     // Similarity score > 0.5
-    ModerateSimularity, // Similarity score 0.3-0.5
-    PopularAccount,     // High pagerank but lower similarity
-    FollowedByMany,     // Many common followees (shared interests)
+    HighSimilarity,     // Similarity score > 0.3
+    ModerateSimilarity, // Similarity score 0.15-0.3
+    SharedInterests,    // Many common followees (>= 5)
+    PopularAccount,     // High pagerank (> 0.5) with some similarity
+    LowSimilarity,      // Default for lower similarity matches
 }
 
 #[derive(Debug, Serialize, Clone)]

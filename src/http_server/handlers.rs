@@ -12,6 +12,7 @@ use axum::{
 use nostr_sdk::PublicKey;
 use serde::Deserialize;
 use std::sync::Arc;
+use tracing::info;
 
 #[derive(Debug, Deserialize)]
 pub struct RecommendationParams {
@@ -28,6 +29,11 @@ where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    info!(
+        "GET /api/v1/recommendations/{} - params: {:?}",
+        pubkey, params
+    );
+
     let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
 
     // Create cache key that includes parameters
@@ -39,9 +45,11 @@ where
     );
 
     if let Some(cached_recommendation_result) = state.recommendation_cache.get(&cache_key).await {
+        info!("Cache hit for recommendations: {}", cache_key);
         return Ok(Json(cached_recommendation_result));
     }
 
+    info!("Cache miss for recommendations: {}", cache_key);
     let recommendations =
         get_recommendations(&state.repo, public_key, params.min_pagerank, params.limit).await?;
 
@@ -50,6 +58,11 @@ where
         .insert(cache_key, recommendations.clone())
         .await;
 
+    info!(
+        "Returning {} recommendations for {}",
+        recommendations.len(),
+        pubkey
+    );
     Ok(Json(recommendations))
 }
 
@@ -75,16 +88,21 @@ where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    info!("GET /api/v1/trusted/{}", pubkey);
+
     let public_key = PublicKey::from_hex(&pubkey).map_err(ApiError::InvalidPublicKey)?;
 
     if let Some(cached_spammer_result) = state.trust_cache.get(&pubkey).await {
+        info!("Cache hit for trusted check: {} -> {}", pubkey, cached_spammer_result);
         return Ok(Json(cached_spammer_result));
     }
 
+    info!("Cache miss for trusted check: {}", pubkey);
     let trusted = state.repo.check_if_trusted(&public_key).await?;
 
-    state.trust_cache.insert(pubkey, trusted).await;
+    state.trust_cache.insert(pubkey.clone(), trusted).await;
 
+    info!("Trusted check result for {}: {}", pubkey, trusted);
     Ok(Json(trusted))
 }
 

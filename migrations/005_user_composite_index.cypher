@@ -1,0 +1,1 @@
+CREATE INDEX user_followee_pagerank_idx FOR (u:User) ON (u.followee_count, u.pagerank);
