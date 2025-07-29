@@ -479,35 +479,38 @@ impl RepoTrait for Repo {
         }
 
         let statement = r#"
-            // Step 1: Get valid target nodes
+            // Get source user and ensure they follow someone
             MATCH (source:User {pubkey: $pubkey_val})
-            MATCH (target:User)
+            WHERE source.followee_count > 0
+
+            // Find users with common followees
+            MATCH (source)-[:FOLLOWS]->(commonFollowee:User)<-[:FOLLOWS]-(target:User)
             WHERE target.pagerank >= $min_pagerank
+            AND target <> source
             AND NOT EXISTS {
                 MATCH (source)-[:FOLLOWS]->(target)
             }
-            WITH source, collect(id(target)) AS targetNodeIds
 
-            // Step 2: Run the similarity algorithm using the filtered target nodes
-            CALL gds.nodeSimilarity.filtered.stream('filteredGraph', {
-                sourceNodeFilter: [id(source)],
-                targetNodeFilter: targetNodeIds,
-                topK: $limit,
-                similarityCutoff: 0.1
-            })
-            YIELD node1, node2, similarity
-            WITH gds.util.asNode(node2) AS targetUser, similarity
+            // Group and count common followees
+            WITH source, target, COUNT(DISTINCT commonFollowee) AS common_count
 
-            // Step 3: Count how many of source's follows also follow the target
-            OPTIONAL MATCH (source)-[:FOLLOWS]->(mutual:User)-[:FOLLOWS]->(targetUser)
-            WITH targetUser, similarity, count(DISTINCT mutual) AS mutualFollowCount
+            // Calculate Jaccard similarity using cached counts
+            WITH target,
+                 common_count,
+                 source.followee_count AS source_followees,
+                 target.followee_count AS target_followees
+            WITH target,
+                 common_count,
+                 toFloat(common_count) / (source_followees + target_followees - common_count) AS similarity
+            WHERE similarity > 0.1
 
-            RETURN targetUser.pubkey AS target_pubkey,
-                   targetUser.friendly_id AS friendly_id,
+            RETURN target.pubkey AS target_pubkey,
+                   target.friendly_id AS friendly_id,
                    similarity,
-                   targetUser.pagerank AS pagerank,
-                   mutualFollowCount
-            ORDER BY similarity DESC, pagerank DESC;
+                   target.pagerank AS pagerank,
+                   common_count AS mutualFollowCount
+            ORDER BY similarity DESC, pagerank DESC
+            LIMIT $limit;
         "#;
 
         let query = query(statement)
@@ -537,13 +540,13 @@ impl RepoTrait for Repo {
             })?;
             let mutual_follow_count: i64 = row.get::<i64>("mutualFollowCount").unwrap_or(0);
 
-            // Determine recommendation reason
+            // Determine recommendation reason based on common followees
             let reason_type = if similarity > 0.5 {
                 RecommendationReason::HighSimilarity
             } else if similarity > 0.3 {
                 RecommendationReason::ModerateSimularity
-            } else if mutual_follow_count > 5 {
-                RecommendationReason::FollowedByMany
+            } else if mutual_follow_count > 10 {
+                RecommendationReason::FollowedByMany // Many common interests
             } else if pagerank > 1.0 {
                 RecommendationReason::PopularAccount
             } else {
@@ -776,7 +779,7 @@ pub enum RecommendationReason {
     HighSimilarity,     // Similarity score > 0.5
     ModerateSimularity, // Similarity score 0.3-0.5
     PopularAccount,     // High pagerank but lower similarity
-    FollowedByMany,     // Many of your follows also follow them
+    FollowedByMany,     // Many common followees (shared interests)
 }
 
 #[derive(Debug, Serialize, Clone)]
