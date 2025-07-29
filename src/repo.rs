@@ -471,7 +471,7 @@ impl RepoTrait for Repo {
             ));
         }
 
-        let limit = limit.unwrap_or(50);
+        let limit = limit.unwrap_or(10);
         if limit == 0 {
             return Err(RepoError::InvalidParameter(
                 "limit must be greater than 0".into(),

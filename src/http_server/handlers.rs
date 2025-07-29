@@ -149,7 +149,7 @@ where
         "{}:{}:{}",
         pubkey,
         params.min_pagerank.unwrap_or(0.3),
-        params.limit.unwrap_or(50)
+        params.limit.unwrap_or(10)
     );
 
     let status = state

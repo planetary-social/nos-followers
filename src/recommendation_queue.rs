@@ -70,7 +70,7 @@ where
             "{}:{}:{}",
             pubkey.to_hex(),
             min_pagerank.unwrap_or(0.3),
-            limit.unwrap_or(50)
+            limit.unwrap_or(10)
         );
 
         // Check if we already have a result
