@@ -109,7 +109,7 @@ impl FolloweeNotificationFactory {
     pub fn should_delete(&mut self) -> bool {
         // If it has been empty for a day, it's ok to delete
         self.follow_changes.is_empty()
-            && self.emptied_at.map_or(true, |emptied_at| {
+            && self.emptied_at.is_none_or(|emptied_at| {
                 Instant::now().duration_since(emptied_at) >= ONE_DAY
             })
     }

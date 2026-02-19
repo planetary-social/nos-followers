@@ -125,7 +125,7 @@ where
             .await;
 
         // Send request to worker
-        if let Err(_) = self.request_sender.send(request) {
+        if self.request_sender.send(request).is_err() {
             // If send fails, clean up
             self.queue_size.fetch_sub(1, Ordering::Relaxed);
             let mut pending = self.pending_requests.write().await;

@@ -176,7 +176,7 @@ mod tests {
     use assertables::*;
     use chrono::{DateTime, Utc};
     use nostr_sdk::prelude::Keys;
-    use std::iter::repeat;
+
     use std::sync::LazyLock;
     use std::time::Duration;
     use tokio::time::advance;
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(messages.len(), 1,);
         assert!(messages[0].is_single());
 
-        repeat(()).take(MAX_FOLLOWERS_TIMES_TEN).for_each(|_| {
+        std::iter::repeat_n((), MAX_FOLLOWERS_TIMES_TEN).for_each(|_| {
             insert_new_follower(&mut notification_factory, followee);
         });
 
