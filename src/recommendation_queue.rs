@@ -53,7 +53,7 @@ where
 
         let status_cache = Cache::builder()
             .time_to_live(Duration::from_secs(300)) // 5 minutes for status
-            .max_capacity(10000)
+            .max_capacity(500)
             .build();
 
         let queue = Self {
@@ -206,15 +206,13 @@ where
                                     recommendations.len()
                                 );
 
-                                // Store in result cache
+                                // Store in result cache (get_status checks this first)
                                 result_cache
-                                    .insert(cache_key.clone(), recommendations.clone())
+                                    .insert(cache_key.clone(), recommendations)
                                     .await;
 
-                                // Update status
-                                status_cache
-                                    .insert(cache_key, RecommendationStatus::Completed(recommendations))
-                                    .await;
+                                // Remove transient status now that result is cached
+                                status_cache.remove(&cache_key).await;
                             }
                             Err(e) => {
                                 error!(

@@ -46,7 +46,7 @@ impl Publisher {
         burst: NonZeroU16,
     ) -> Result<Self, PublisherError> {
         let (publication_sender, mut publication_receiver) =
-            mpsc::channel::<Box<FollowChange>>(20000);
+            mpsc::channel::<Box<FollowChange>>(5000);
 
         let mut buffer = NotificationFactory::new(burst.get(), min_seconds_between_messages.get());
         tokio::spawn(async move {

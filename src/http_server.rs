@@ -6,7 +6,7 @@ use crate::{
     config::Settings,
     recommendation_queue::RecommendationQueue,
     relay_subscriber::GetEventsOf,
-    repo::{Recommendation, RepoTrait},
+    repo::RepoTrait,
 };
 use anyhow::{Context, Result};
 use axum::Router;
@@ -26,7 +26,6 @@ where
 {
     pub repo: Arc<T>,
     pub nostr_client: Arc<U>,
-    pub recommendation_cache: Cache<String, Vec<Recommendation>>,
     pub trust_cache: Cache<String, bool>,
     pub recommendation_queue: Arc<RecommendationQueue<T>>,
 }
@@ -41,20 +40,14 @@ where
         nostr_client: Arc<U>,
         recommendation_queue: Arc<RecommendationQueue<T>>,
     ) -> Self {
-        let recommendation_cache = Cache::builder()
-            .time_to_live(Duration::from_secs(86400)) // 1 day
-            .max_capacity(4000)
-            .build();
-
         let trust_cache = Cache::builder()
             .time_to_live(Duration::from_secs(86400)) // 1 day
-            .max_capacity(4000)
+            .max_capacity(1000)
             .build();
 
         Self {
             repo,
             nostr_client,
-            recommendation_cache,
             trust_cache,
             recommendation_queue,
         }

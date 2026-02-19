@@ -73,7 +73,7 @@ async fn start_server(settings: Settings) -> Result<()> {
     info!("Initializing recommendation queue");
     let recommendation_cache = moka::future::Cache::builder()
         .time_to_live(std::time::Duration::from_secs(86400)) // 1 day
-        .max_capacity(4000)
+        .max_capacity(500)
         .build();
 
     let (recommendation_queue, recommendation_receiver) = RecommendationQueue::new(

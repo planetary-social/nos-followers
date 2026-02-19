@@ -12,8 +12,7 @@ type Follower = PublicKey;
 type Followee = PublicKey;
 
 static ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
-/// Maximum number of follow changes to keep per followee
-const MAX_CHANGES_PER_FOLLOWEE: usize = 1000;
+const DEFAULT_MAX_CHANGES_PER_FOLLOWEE: usize = 600;
 
 /// Accumulates messages for a followee and flushes them in batches
 pub struct FolloweeNotificationFactory {
@@ -21,12 +20,23 @@ pub struct FolloweeNotificationFactory {
     pub followee: Option<Followee>,
     rate_limiter: RateLimiter,
     emptied_at: Option<Instant>,
+    max_changes: usize,
 }
 
 impl FolloweeNotificationFactory {
     pub fn new(capacity: u16, min_seconds_between_messages: NonZeroUsize) -> Self {
-        // Rate limiter for 1 message every `min_seconds_between_messages`, with a
-        // burst of `capacity`.
+        Self::with_max_changes(
+            capacity,
+            min_seconds_between_messages,
+            DEFAULT_MAX_CHANGES_PER_FOLLOWEE,
+        )
+    }
+
+    pub fn with_max_changes(
+        capacity: u16,
+        min_seconds_between_messages: NonZeroUsize,
+        max_changes: usize,
+    ) -> Self {
         let min_time_between_messages =
             Duration::from_secs(min_seconds_between_messages.get() as u64);
         let rate_limiter = RateLimiter::new(capacity as f64, min_time_between_messages);
@@ -36,6 +46,7 @@ impl FolloweeNotificationFactory {
             followee: None,
             rate_limiter,
             emptied_at: None,
+            max_changes,
         }
     }
 
@@ -163,7 +174,7 @@ impl FolloweeNotificationFactory {
         let to_remove = self
             .follow_changes
             .len()
-            .saturating_sub(MAX_CHANGES_PER_FOLLOWEE);
+            .saturating_sub(self.max_changes);
         if to_remove > 0 {
             // First, remove all untrusted follow changes by retaining only trusted ones
             self.follow_changes
@@ -173,7 +184,7 @@ impl FolloweeNotificationFactory {
             let remaining_to_remove = self
                 .follow_changes
                 .len()
-                .saturating_sub(MAX_CHANGES_PER_FOLLOWEE);
+                .saturating_sub(self.max_changes);
             if remaining_to_remove > 0 {
                 // OrderMap preserves insertion order, so the first items are the oldest
                 self.follow_changes.drain(0..remaining_to_remove);

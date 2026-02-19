@@ -7,7 +7,7 @@ followers:
   tcp_importer_port: 3001
   event_channel_size: 1000
   diff_workers: 1000
-  follow_change_channel_size: 50000
+  follow_change_channel_size: 5000
   follow_change_workers: 30
   worker_timeout_secs: 15
   google_project_id: "pub-verse-app"

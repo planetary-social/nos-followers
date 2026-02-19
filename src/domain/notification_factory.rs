@@ -17,11 +17,20 @@ pub struct NotificationFactory {
     followee_maps: OrderMap<Followee, FolloweeNotificationFactory>,
     burst: u16,
     min_seconds_between_messages: NonZeroUsize,
+    max_changes_per_followee: usize,
     top_followees: TopK<Vec<u8>>,
 }
 
 impl NotificationFactory {
     pub fn new(burst: u16, min_seconds_between_messages: usize) -> Self {
+        Self::with_max_changes(burst, min_seconds_between_messages, 600)
+    }
+
+    pub fn with_max_changes(
+        burst: u16,
+        min_seconds_between_messages: usize,
+        max_changes_per_followee: usize,
+    ) -> Self {
         info!(
             "One message in {} seconds allowed",
             min_seconds_between_messages
@@ -29,18 +38,13 @@ impl NotificationFactory {
 
         let min_seconds_between_messages = NonZeroUsize::new(min_seconds_between_messages).unwrap();
 
-        // Initialize TopK with parameters:
-        // k=100 (track top 100 items)
-        // width=500 (internal parameter controlling accuracy)
-        // depth=3 (internal parameter controlling accuracy)
-        // decay=0.5 (decay factor between 0 and 1 for aging out less frequent items;
-        //   lower values cause faster forgetting of infrequent items)
         let top_followees: TopK<Vec<u8>> = TopK::new(100, 500, 3, 0.5);
 
         Self {
             followee_maps: OrderMap::with_capacity(1_000),
             burst,
             min_seconds_between_messages,
+            max_changes_per_followee,
             top_followees,
         }
     }
@@ -50,7 +54,11 @@ impl NotificationFactory {
             .followee_maps
             .entry(*follow_change.followee())
             .or_insert_with_key(|_| {
-                FolloweeNotificationFactory::new(self.burst, self.min_seconds_between_messages)
+                FolloweeNotificationFactory::with_max_changes(
+                    self.burst,
+                    self.min_seconds_between_messages,
+                    self.max_changes_per_followee,
+                )
             });
 
         // Add to TopK tracking only when it's a follow (not unfollow)
@@ -581,5 +589,71 @@ mod tests {
         at: DateTime<Utc>,
     ) -> FollowChange {
         FollowChange::new_unfollowed(at, follower, followee)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cleanup_caps_trusted_changes_at_max() {
+        let max_changes = 5;
+        let min_seconds_between_messages = 3600;
+
+        let mut factory =
+            NotificationFactory::with_max_changes(1, min_seconds_between_messages, max_changes);
+
+        let followee = Keys::generate().public_key();
+
+        // Use the single burst token so subsequent flushes are rate-limited
+        insert_new_follower(&mut factory, followee);
+        let messages = factory.flush();
+        assert_eq!(messages.len(), 1);
+
+        // Insert trusted changes exceeding the max
+        for _ in 0..max_changes + 3 {
+            let follower = Keys::generate().public_key();
+            let change =
+                FollowChange::new_followed(*NOW, follower, followee).with_trusted(true);
+            factory.insert(change.into());
+        }
+        assert_eq!(factory.follow_changes_len(), max_changes + 3);
+
+        // Flush triggers cleanup_and_handle_excess (rate limiter blocks),
+        // which drains oldest trusted entries to stay at the cap
+        factory.flush();
+        assert_eq!(factory.follow_changes_len(), max_changes);
+
+        // After waiting, the retained changes flush normally
+        advance(Duration::from_secs(min_seconds_between_messages as u64 + 1)).await;
+        let messages = factory.flush();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(factory.follow_changes_len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cleanup_removes_untrusted_first() {
+        let max_changes = 3;
+        let min_seconds_between_messages = 3600;
+
+        let mut factory =
+            NotificationFactory::with_max_changes(1, min_seconds_between_messages, max_changes);
+
+        let followee = Keys::generate().public_key();
+
+        // Exhaust burst
+        insert_new_follower(&mut factory, followee);
+        factory.flush();
+
+        // Insert mix of trusted and untrusted
+        for trusted in [false, true, false, true, false] {
+            let follower = Keys::generate().public_key();
+            let change =
+                FollowChange::new_followed(*NOW, follower, followee).with_trusted(trusted);
+            factory.insert(change.into());
+        }
+
+        assert_eq!(factory.follow_changes_len(), 5);
+
+        // Flush while rate-limited triggers cleanup: removes all untrusted
+        // first, leaving only the 2 trusted (under max_changes=3)
+        factory.flush();
+        assert_eq!(factory.follow_changes_len(), 2);
     }
 }
