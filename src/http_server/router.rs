@@ -47,13 +47,15 @@ where
         .on_failure(DefaultOnFailure::new().level(Level::ERROR));
 
     let metrics_handle = setup_metrics().map_err(|e| ApiError::InternalServerError(e.into()))?;
-    let rate_limit_config = GovernorConfigBuilder::default()
-        .key_extractor(SmartIpKeyExtractor)
-        .per_second(1000) // Let's start big, we reduce it after metrics
-        .burst_size(2000)
-        .use_headers()
-        .finish()
-        .unwrap();
+    let rate_limit_config = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(SmartIpKeyExtractor)
+            .per_second(1000) // Let's start big, we reduce it after metrics
+            .burst_size(2000)
+            .use_headers()
+            .finish()
+            .unwrap(),
+    );
 
     let cors = CorsLayer::new()
         .allow_methods([
@@ -89,6 +91,11 @@ where
             open_ranking::RECOMMEND_ENDPOINT,
             post(open_ranking::serve_recommend::<T, U>),
         )
+        .layer(TimeoutLayer::new(Duration::from_secs(5)))
+        .layer(GovernorLayer {
+            config: rate_limit_config.clone(),
+        })
+        .layer(cors.clone())
         .with_state(state.clone());
 
     Ok(Router::new()
@@ -113,7 +120,7 @@ where
                 .route("/trusted/:pubkey", get(cached_check_if_trusted::<T, U>))
                 .layer(TimeoutLayer::new(Duration::from_secs(5)))
                 .layer(GovernorLayer {
-                    config: Arc::new(rate_limit_config),
+                    config: rate_limit_config.clone(),
                 })
                 .layer(cors)
                 .route_layer(axum::middleware::from_fn(move |req, next| {
