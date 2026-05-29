@@ -1,4 +1,5 @@
 mod handlers;
+mod open_ranking;
 mod router;
 mod trust_policy;
 

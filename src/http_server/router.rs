@@ -1,3 +1,4 @@
+use super::open_ranking;
 use super::AppState;
 use crate::config::Settings;
 use crate::http_server::handlers::{
@@ -66,6 +67,10 @@ where
     Ok(Router::new()
         .route("/", get(serve_root_page))
         .route("/metrics", get(|| async move { metrics_handle.render() }))
+        .route(
+            open_ranking::CAPABILITY_PATH,
+            get(open_ranking::serve_capability_document),
+        )
         .nest(
             "/api/v1",
             Router::new()
