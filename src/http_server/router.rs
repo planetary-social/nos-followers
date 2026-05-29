@@ -85,6 +85,10 @@ where
             open_ranking::FOLLOWERS_ENDPOINT,
             post(open_ranking::serve_followers::<T, U>),
         )
+        .route(
+            open_ranking::RECOMMEND_ENDPOINT,
+            post(open_ranking::serve_recommend::<T, U>),
+        )
         .with_state(state.clone());
 
     Ok(Router::new()

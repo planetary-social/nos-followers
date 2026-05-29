@@ -518,11 +518,90 @@ where
     Ok(Json(response))
 }
 
+/// Request body for `POST /recommend` (ORE-03). Unknown fields (e.g. `topic`,
+/// which our algorithms do not use) are ignored for forward compatibility.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RecommendRequest {
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    #[serde(default)]
+    pub pov: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Core `/recommend` logic (ORE-03): personalised follow recommendations.
+///
+/// Computed synchronously via [`RepoTrait::get_recommendations`] and bounded by
+/// the HTTP route timeout, since the protocol has no pending/processing state.
+pub(crate) async fn recommend<T: RepoTrait>(
+    repo: &T,
+    request: RecommendRequest,
+) -> Result<RankResponse, OpenRankingError> {
+    let algorithm = resolve_algorithm(RECOMMEND_ENDPOINT, request.algorithm.as_deref())?;
+
+    // ORE-01: a personalised algorithm requires a pov pubkey.
+    let pov = match (algorithm.pov, request.pov.as_deref()) {
+        (true, None) => {
+            return Err(OpenRankingError::unprocessable(format!(
+                "algorithm '{}' requires a pov",
+                algorithm.id
+            )))
+        }
+        (true, Some(pov)) => PublicKey::from_hex(pov)
+            .map_err(|e| OpenRankingError::unprocessable(format!("pov is invalid: {e}")))?,
+        // Every /recommend algorithm we offer is personalised; a global one would
+        // have no pubkey to recommend for.
+        (false, _) => {
+            return Err(OpenRankingError::unprocessable(
+                "global recommendation algorithms are not supported",
+            ))
+        }
+    };
+
+    let limit = resolve_limit(request.limit, DEFAULT_LIMIT)?;
+
+    let recommendations = repo
+        .get_recommendations(&pov, None, Some(limit))
+        .await
+        .map_err(|e| {
+            error!("/recommend get_recommendations failed: {e}");
+            OpenRankingError::Internal
+        })?;
+
+    let profiles = recommendations
+        .into_iter()
+        .map(|recommendation| Profile {
+            pubkey: recommendation.pubkey.to_hex(),
+            rank: recommendation.similarity,
+        })
+        .collect();
+
+    Ok(RankResponse {
+        profiles,
+        ttl: Some(RANK_TTL_SECONDS),
+    })
+}
+
+/// `POST /recommend` (ORE-03).
+pub(crate) async fn serve_recommend<T, U>(
+    State(state): State<Arc<AppState<T, U>>>,
+    body: Bytes,
+) -> Result<Json<RankResponse>, OpenRankingError>
+where
+    T: RepoTrait,
+    U: GetEventsOf,
+{
+    let request: RecommendRequest = parse_json_body(&body)?;
+    let response = recommend(state.repo.as_ref(), request).await?;
+    Ok(Json(response))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::AccountInfo;
-    use crate::repo::{RepoError, RepoTrait, TopFollowers};
+    use crate::repo::{Recommendation, RecommendationReason, RepoError, RepoTrait, TopFollowers};
     use axum::http::StatusCode;
     use nostr_sdk::{Keys, PublicKey};
     use std::collections::HashMap;
@@ -539,6 +618,8 @@ mod tests {
         accounts: HashMap<PublicKey, AccountInfo>,
         /// Full follower set per target, sorted by rank desc (as the real query returns).
         top_followers: HashMap<PublicKey, Vec<(PublicKey, f64)>>,
+        /// Recommendations per pov pubkey, sorted by similarity desc.
+        recommendations: HashMap<PublicKey, Vec<Recommendation>>,
         fail: bool,
     }
 
@@ -581,6 +662,24 @@ mod tests {
                 }
                 None => Ok((Vec::new(), None)),
             }
+        }
+
+        async fn get_recommendations(
+            &self,
+            pubkey: &PublicKey,
+            _min_pagerank: Option<f64>,
+            limit: Option<usize>,
+        ) -> Result<Vec<Recommendation>, RepoError> {
+            if self.fail {
+                return Err(RepoError::InvalidParameter("boom".into()));
+            }
+            let recommendations = self
+                .recommendations
+                .get(pubkey)
+                .cloned()
+                .unwrap_or_default();
+            let limit = limit.unwrap_or(recommendations.len());
+            Ok(recommendations.into_iter().take(limit).collect())
         }
     }
 
@@ -992,6 +1091,115 @@ mod tests {
             limit: None,
         };
         let error = followers(&repo, request)
+            .await
+            .expect_err("unknown algorithm rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ---- /recommend (ORE-03) ----
+
+    fn recommendation(pubkey: PublicKey, similarity: f64) -> Recommendation {
+        Recommendation {
+            pubkey,
+            friendly_id: pubkey.to_hex(),
+            similarity,
+            pagerank: 0.5,
+            reason_type: RecommendationReason::HighSimilarity,
+        }
+    }
+
+    fn recommend_request(pov: Option<&str>, limit: Option<i64>) -> RecommendRequest {
+        RecommendRequest {
+            algorithm: None,
+            pov: pov.map(|pov| pov.to_string()),
+            limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn recommend_maps_recommendations_to_profiles_ranked_by_similarity() {
+        let pov = fresh_pubkey();
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let repo = MockRepo {
+            recommendations: HashMap::from([(
+                pov,
+                vec![recommendation(a, 0.8), recommendation(b, 0.3)],
+            )]),
+            ..Default::default()
+        };
+
+        let response = recommend(&repo, recommend_request(Some(&pov.to_hex()), None))
+            .await
+            .expect("recommend succeeds");
+
+        let pubkeys: Vec<String> = response.profiles.iter().map(|p| p.pubkey.clone()).collect();
+        assert_eq!(pubkeys, vec![a.to_hex(), b.to_hex()]);
+        assert_eq!(response.profiles[0].rank, 0.8);
+        assert_eq!(response.profiles[1].rank, 0.3);
+    }
+
+    #[tokio::test]
+    async fn recommend_without_pov_is_422() {
+        let repo = MockRepo::default();
+        let error = recommend(&repo, recommend_request(None, None))
+            .await
+            .expect_err("missing pov rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn recommend_invalid_pov_is_422() {
+        let repo = MockRepo::default();
+        let error = recommend(&repo, recommend_request(Some("not-a-pubkey"), None))
+            .await
+            .expect_err("invalid pov rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn recommend_respects_limit() {
+        let pov = fresh_pubkey();
+        let repo = MockRepo {
+            recommendations: HashMap::from([(
+                pov,
+                vec![
+                    recommendation(fresh_pubkey(), 0.9),
+                    recommendation(fresh_pubkey(), 0.6),
+                    recommendation(fresh_pubkey(), 0.4),
+                ],
+            )]),
+            ..Default::default()
+        };
+
+        let response = recommend(&repo, recommend_request(Some(&pov.to_hex()), Some(1)))
+            .await
+            .expect("recommend succeeds");
+
+        assert_eq!(response.profiles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recommend_non_positive_limit_is_422() {
+        let repo = MockRepo::default();
+        let error = recommend(
+            &repo,
+            recommend_request(Some(&fresh_pubkey().to_hex()), Some(0)),
+        )
+        .await
+        .expect_err("non-positive limit rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn recommend_unknown_algorithm_is_422() {
+        let repo = MockRepo::default();
+        let request = RecommendRequest {
+            algorithm: Some("does-not-exist".into()),
+            pov: Some(fresh_pubkey().to_hex()),
+            limit: None,
+        };
+        let error = recommend(&repo, request)
             .await
             .expect_err("unknown algorithm rejected");
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
