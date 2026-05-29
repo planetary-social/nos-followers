@@ -112,6 +112,11 @@ const MAX_PUBKEYS: usize = 1000;
 /// a daily cron, so an hour is a safe "still fresh" hint for clients.
 const RANK_TTL_SECONDS: u64 = 3600;
 
+/// Default and maximum `limit` for endpoints that select their own candidates
+/// (`/followers`, `/recommend`).
+const DEFAULT_LIMIT: usize = 50;
+const MAX_LIMIT: usize = 1000;
+
 /// An ORE-02 Profile: a ranked Nostr identity. Higher `rank` is always better.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Profile {
@@ -435,11 +440,89 @@ where
     Ok(Json(response))
 }
 
+/// Response body for `POST /followers` (ORE-04).
+#[derive(Debug, Serialize)]
+pub(crate) struct FollowersResponse {
+    pub profiles: Vec<Profile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
+}
+
+/// Request body for `POST /followers` (ORE-04). Unknown fields are ignored.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FollowersRequest {
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Validate an optional `limit`, applying the provider default and maximum.
+fn resolve_limit(limit: Option<i64>, default: usize) -> Result<usize, OpenRankingError> {
+    match limit {
+        None => Ok(default),
+        Some(limit) if limit < 1 => Err(OpenRankingError::unprocessable(
+            "limit must be a positive integer",
+        )),
+        Some(limit) if limit as usize > MAX_LIMIT => Err(OpenRankingError::unprocessable(format!(
+            "limit exceeds the maximum of {MAX_LIMIT}"
+        ))),
+        Some(limit) => Ok(limit as usize),
+    }
+}
+
+/// Core `/followers` logic (ORE-04): a pubkey's top followers by PageRank.
+pub(crate) async fn followers<T: RepoTrait>(
+    repo: &T,
+    request: FollowersRequest,
+) -> Result<FollowersResponse, OpenRankingError> {
+    resolve_algorithm(FOLLOWERS_ENDPOINT, request.algorithm.as_deref())?;
+    let pubkey = parse_required_pubkey(request.pubkey.as_deref())?;
+    let limit = resolve_limit(request.limit, DEFAULT_LIMIT)?;
+
+    let (top_followers, total) = repo.get_top_followers(&pubkey, limit).await.map_err(|e| {
+        error!("/followers get_top_followers failed: {e}");
+        OpenRankingError::Internal
+    })?;
+
+    let profiles = top_followers
+        .into_iter()
+        .map(|(pubkey, rank)| Profile {
+            pubkey: pubkey.to_hex(),
+            rank,
+        })
+        .collect();
+
+    Ok(FollowersResponse {
+        profiles,
+        total,
+        ttl: Some(RANK_TTL_SECONDS),
+    })
+}
+
+/// `POST /followers` (ORE-04).
+pub(crate) async fn serve_followers<T, U>(
+    State(state): State<Arc<AppState<T, U>>>,
+    body: Bytes,
+) -> Result<Json<FollowersResponse>, OpenRankingError>
+where
+    T: RepoTrait,
+    U: GetEventsOf,
+{
+    let request: FollowersRequest = parse_json_body(&body)?;
+    let response = followers(state.repo.as_ref(), request).await?;
+    Ok(Json(response))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::AccountInfo;
-    use crate::repo::{RepoError, RepoTrait};
+    use crate::repo::{RepoError, RepoTrait, TopFollowers};
     use axum::http::StatusCode;
     use nostr_sdk::{Keys, PublicKey};
     use std::collections::HashMap;
@@ -454,6 +537,8 @@ mod tests {
     struct MockRepo {
         pageranks: HashMap<PublicKey, f64>,
         accounts: HashMap<PublicKey, AccountInfo>,
+        /// Full follower set per target, sorted by rank desc (as the real query returns).
+        top_followers: HashMap<PublicKey, Vec<(PublicKey, f64)>>,
         fail: bool,
     }
 
@@ -479,6 +564,23 @@ mod tests {
                 return Err(RepoError::InvalidParameter("boom".into()));
             }
             Ok(self.accounts.get(pubkey).cloned())
+        }
+
+        async fn get_top_followers(
+            &self,
+            pubkey: &PublicKey,
+            limit: usize,
+        ) -> Result<TopFollowers, RepoError> {
+            if self.fail {
+                return Err(RepoError::InvalidParameter("boom".into()));
+            }
+            match self.top_followers.get(pubkey) {
+                Some(all) => {
+                    let total = all.len() as u64;
+                    Ok((all.iter().take(limit).cloned().collect(), Some(total)))
+                }
+                None => Ok((Vec::new(), None)),
+            }
         }
     }
 
@@ -775,6 +877,121 @@ mod tests {
             algorithm: Some("does-not-exist".into()),
         };
         let error = reputation(&repo, request)
+            .await
+            .expect_err("unknown algorithm rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ---- /followers (ORE-04) ----
+
+    fn followers_request(pubkey: &str, limit: Option<i64>) -> FollowersRequest {
+        FollowersRequest {
+            pubkey: Some(pubkey.to_string()),
+            algorithm: None,
+            limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn followers_returns_top_followers_in_order_with_total() {
+        let target = fresh_pubkey();
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let c = fresh_pubkey();
+        let repo = MockRepo {
+            top_followers: HashMap::from([(target, vec![(a, 0.9), (b, 0.5), (c, 0.2)])]),
+            ..Default::default()
+        };
+
+        let response = followers(&repo, followers_request(&target.to_hex(), None))
+            .await
+            .expect("followers succeeds");
+
+        assert_eq!(response.total, Some(3));
+        let pubkeys: Vec<String> = response.profiles.iter().map(|p| p.pubkey.clone()).collect();
+        assert_eq!(pubkeys, vec![a.to_hex(), b.to_hex(), c.to_hex()]);
+        assert_eq!(response.profiles[0].rank, 0.9);
+    }
+
+    #[tokio::test]
+    async fn followers_respects_limit_but_total_reflects_full_set() {
+        let target = fresh_pubkey();
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let c = fresh_pubkey();
+        let repo = MockRepo {
+            top_followers: HashMap::from([(target, vec![(a, 0.9), (b, 0.5), (c, 0.2)])]),
+            ..Default::default()
+        };
+
+        let response = followers(&repo, followers_request(&target.to_hex(), Some(2)))
+            .await
+            .expect("followers succeeds");
+
+        assert_eq!(response.profiles.len(), 2);
+        assert_eq!(response.total, Some(3), "total is the full follower set");
+    }
+
+    #[tokio::test]
+    async fn followers_unknown_target_returns_empty_and_omits_total() {
+        let repo = MockRepo::default();
+
+        let response = followers(&repo, followers_request(&fresh_pubkey().to_hex(), None))
+            .await
+            .expect("followers succeeds");
+
+        assert!(response.profiles.is_empty());
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("total").is_none(),
+            "total omitted for unknown target"
+        );
+    }
+
+    #[tokio::test]
+    async fn followers_missing_pubkey_is_422() {
+        let repo = MockRepo::default();
+        let request = FollowersRequest {
+            pubkey: None,
+            algorithm: None,
+            limit: None,
+        };
+        let error = followers(&repo, request)
+            .await
+            .expect_err("missing pubkey rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn followers_non_positive_limit_is_422() {
+        let repo = MockRepo::default();
+        let error = followers(&repo, followers_request(&fresh_pubkey().to_hex(), Some(0)))
+            .await
+            .expect_err("non-positive limit rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn followers_limit_above_maximum_is_422() {
+        let repo = MockRepo::default();
+        let error = followers(
+            &repo,
+            followers_request(&fresh_pubkey().to_hex(), Some(1001)),
+        )
+        .await
+        .expect_err("oversized limit rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn followers_unknown_algorithm_is_422() {
+        let repo = MockRepo::default();
+        let request = FollowersRequest {
+            pubkey: Some(fresh_pubkey().to_hex()),
+            algorithm: Some("does-not-exist".into()),
+            limit: None,
+        };
+        let error = followers(&repo, request)
             .await
             .expect_err("unknown algorithm rejected");
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);

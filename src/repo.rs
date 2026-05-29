@@ -18,6 +18,11 @@ impl Repo {
     }
 }
 
+/// A page of a pubkey's top followers ranked by PageRank (descending), paired
+/// with the total size of the indexed follower set (`None` when the user is
+/// unknown to the provider).
+pub type TopFollowers = (Vec<(PublicKey, f64)>, Option<u64>);
+
 // Default trait raises not implemented just to ease testing
 pub trait RepoTrait: Sync + Send + 'static {
     /// Set the last contact list date seen for a user if it's newer than the stored value
@@ -117,6 +122,17 @@ pub trait RepoTrait: Sync + Send + 'static {
         &self,
         _pubkeys: &[PublicKey],
     ) -> impl std::future::Future<Output = Result<HashMap<PublicKey, f64>, RepoError>> + std::marker::Send
+    {
+        async { panic!("Not implemented") }
+    }
+
+    /// Fetch up to `limit` of a pubkey's followers ranked by PageRank desc, plus
+    /// the size of the indexed follower set (None if the user is unknown).
+    fn get_top_followers(
+        &self,
+        _pubkey: &PublicKey,
+        _limit: usize,
+    ) -> impl std::future::Future<Output = Result<TopFollowers, RepoError>> + std::marker::Send
     {
         async { panic!("Not implemented") }
     }
@@ -620,6 +636,61 @@ impl RepoTrait for Repo {
         Ok(pageranks)
     }
 
+    async fn get_top_followers(
+        &self,
+        pubkey: &PublicKey,
+        limit: usize,
+    ) -> Result<TopFollowers, RepoError> {
+        // OPTIONAL MATCH so a known user with zero followers still yields a row
+        // carrying `total` (with a null follower_pubkey we skip below).
+        let statement = r#"
+            MATCH (target:User {pubkey: $pubkey})
+            OPTIONAL MATCH (follower:User)-[:FOLLOWS]->(target)
+            WITH target.follower_count AS total,
+                 follower.pubkey AS follower_pubkey,
+                 coalesce(follower.pagerank, 0.0) AS pagerank
+            ORDER BY pagerank DESC
+            RETURN total, follower_pubkey, pagerank
+            LIMIT $limit
+        "#;
+
+        let query = query(statement)
+            .param("pubkey", pubkey.to_hex())
+            .param("limit", limit as i64);
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::GetTopFollowers)?;
+
+        let mut followers = Vec::new();
+        let mut total: Option<u64> = None;
+        while let Ok(Some(row)) = records.next().await {
+            if total.is_none() {
+                total = row.get::<Option<u64>>("total").map_err(|e| {
+                    RepoError::deserialization_with_context(e, "deserializing 'total' field")
+                })?;
+            }
+
+            let follower_pubkey = row.get::<Option<String>>("follower_pubkey").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'follower_pubkey' field")
+            })?;
+            let Some(follower_pubkey) = follower_pubkey else {
+                continue;
+            };
+
+            let pagerank = row.get::<f64>("pagerank").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
+            })?;
+            let follower_pubkey =
+                PublicKey::from_hex(&follower_pubkey).map_err(RepoError::GetTopFollowersPubkey)?;
+            followers.push((follower_pubkey, pagerank));
+        }
+
+        Ok((followers, total))
+    }
+
     async fn get_account_info(
         &self,
         public_key: &PublicKey,
@@ -810,6 +881,12 @@ pub enum RepoError {
 
     #[error("Failed to parse pubkey from pagerank query: {0}")]
     GetPageRankPubkey(nostr_sdk::key::Error),
+
+    #[error("Failed to get top followers: {0}")]
+    GetTopFollowers(neo4rs::Error),
+
+    #[error("Failed to parse pubkey from top followers query: {0}")]
+    GetTopFollowersPubkey(nostr_sdk::key::Error),
 
     #[error("Failed to remove pubkey: {0}")]
     RemovePubkey(neo4rs::Error),
