@@ -8,7 +8,13 @@ use crate::http_server::handlers::{
 use crate::metrics::setup_metrics;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::{RepoError, RepoTrait};
-use axum::{body::Body, http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum::{
+    body::Body,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
 use hyper::http::{header, HeaderValue, Method, Request};
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
@@ -64,6 +70,15 @@ where
 
     let cache_duration = settings.http_cache_seconds;
 
+    // OpenRanking endpoints live at the top level (not under /api/v1) per the
+    // protocol; they share AppState with the rest of the server.
+    let open_ranking_routes = Router::new()
+        .route(
+            open_ranking::RANK_ENDPOINT,
+            post(open_ranking::serve_rank::<T, U>),
+        )
+        .with_state(state.clone());
+
     Ok(Router::new()
         .route("/", get(serve_root_page))
         .route("/metrics", get(|| async move { metrics_handle.render() }))
@@ -71,6 +86,7 @@ where
             open_ranking::CAPABILITY_PATH,
             get(open_ranking::serve_capability_document),
         )
+        .merge(open_ranking_routes)
         .nest(
             "/api/v1",
             Router::new()

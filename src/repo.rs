@@ -4,6 +4,7 @@ use core::panic;
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -106,6 +107,16 @@ pub trait RepoTrait: Sync + Send + 'static {
         _min_pagerank: Option<f64>,
         _limit: Option<usize>,
     ) -> impl std::future::Future<Output = Result<Vec<Recommendation>, RepoError>> + std::marker::Send
+    {
+        async { panic!("Not implemented") }
+    }
+
+    /// Fetch the stored PageRank for each of the given pubkeys. Pubkeys absent
+    /// from the result are unknown to the provider and should be treated as 0.
+    fn get_pageranks(
+        &self,
+        _pubkeys: &[PublicKey],
+    ) -> impl std::future::Future<Output = Result<HashMap<PublicKey, f64>, RepoError>> + std::marker::Send
     {
         async { panic!("Not implemented") }
     }
@@ -570,6 +581,45 @@ impl RepoTrait for Repo {
         Ok(recommendations)
     }
 
+    async fn get_pageranks(
+        &self,
+        pubkeys: &[PublicKey],
+    ) -> Result<HashMap<PublicKey, f64>, RepoError> {
+        if pubkeys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let statement = r#"
+            UNWIND $pubkeys AS pubkey
+            MATCH (user:User {pubkey: pubkey})
+            WHERE user.pagerank IS NOT NULL
+            RETURN user.pubkey AS pubkey, user.pagerank AS pagerank
+        "#;
+
+        let pubkeys_hex: Vec<String> = pubkeys.iter().map(PublicKey::to_hex).collect();
+        let query = query(statement).param("pubkeys", pubkeys_hex);
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::GetPageRank)?;
+
+        let mut pageranks = HashMap::new();
+        while let Ok(Some(row)) = records.next().await {
+            let pubkey = row.get::<String>("pubkey").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'pubkey' field")
+            })?;
+            let pagerank = row.get::<f64>("pagerank").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
+            })?;
+            let pubkey = PublicKey::from_hex(&pubkey).map_err(RepoError::GetPageRankPubkey)?;
+            pageranks.insert(pubkey, pagerank);
+        }
+
+        Ok(pageranks)
+    }
+
     async fn get_account_info(
         &self,
         public_key: &PublicKey,
@@ -757,6 +807,9 @@ pub enum RepoError {
 
     #[error("Failed to get pagerank: {0}")]
     GetPageRank(neo4rs::Error),
+
+    #[error("Failed to parse pubkey from pagerank query: {0}")]
+    GetPageRankPubkey(nostr_sdk::key::Error),
 
     #[error("Failed to remove pubkey: {0}")]
     RemovePubkey(neo4rs::Error),

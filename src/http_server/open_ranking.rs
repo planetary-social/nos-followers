@@ -4,8 +4,20 @@
 //! capability discovery (ORE-01) plus the `/rank`, `/reputation`, `/followers`
 //! and `/recommend` endpoints. See OREs 00-06 for the full specification.
 
-use axum::response::IntoResponse;
-use serde::Serialize;
+use super::AppState;
+use crate::relay_subscriber::GetEventsOf;
+use crate::repo::RepoTrait;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use nostr_sdk::PublicKey;
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::sync::Arc;
+use tracing::error;
 
 /// Endpoint paths exposed by this provider. Each is a key in the capability
 /// document (ORE-01) and the route path for the corresponding handler.
@@ -93,9 +105,274 @@ pub(crate) async fn serve_capability_document() -> impl IntoResponse {
     axum::Json(capability_document())
 }
 
+/// Maximum number of pubkeys accepted by `/rank` in a single request (ORE-02).
+const MAX_PUBKEYS: usize = 1000;
+
+/// TTL hint (seconds) for PageRank-derived responses. PageRank is recomputed on
+/// a daily cron, so an hour is a safe "still fresh" hint for clients.
+const RANK_TTL_SECONDS: u64 = 3600;
+
+/// An ORE-02 Profile: a ranked Nostr identity. Higher `rank` is always better.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Profile {
+    /// 64-char lowercase hex pubkey (ORE-00).
+    pub pubkey: String,
+    pub rank: f64,
+}
+
+/// The shared `/rank`-shaped response: profiles sorted by rank desc + a TTL hint.
+#[derive(Debug, Serialize)]
+pub(crate) struct RankResponse {
+    pub profiles: Vec<Profile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
+}
+
+/// Request body for `POST /rank` (ORE-02). Unknown fields are ignored for
+/// forward compatibility; a `pov` sent to the global algorithm is ignored.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RankRequest {
+    #[serde(default)]
+    pub pubkeys: Vec<String>,
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Errors returned by OpenRanking endpoints, mapped to their HTTP status codes.
+/// The human-readable reason is also sent in the `X-Reason` header (ORE-00).
+#[derive(Debug)]
+pub(crate) enum OpenRankingError {
+    /// 400: the request body is malformed or not valid JSON.
+    MalformedBody(String),
+    /// 413: the request exceeds the provider's size limit.
+    PayloadTooLarge(String),
+    /// 422: the request is well-formed but semantically invalid.
+    Unprocessable(String),
+    /// 500: an internal error (e.g. the graph database is unavailable).
+    Internal,
+}
+
+impl OpenRankingError {
+    pub fn malformed_body(reason: impl Into<String>) -> Self {
+        Self::MalformedBody(reason.into())
+    }
+
+    pub fn payload_too_large(reason: impl Into<String>) -> Self {
+        Self::PayloadTooLarge(reason.into())
+    }
+
+    pub fn unprocessable(reason: impl Into<String>) -> Self {
+        Self::Unprocessable(reason.into())
+    }
+
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::MalformedBody(_) => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::MalformedBody(reason)
+            | Self::PayloadTooLarge(reason)
+            | Self::Unprocessable(reason) => reason,
+            Self::Internal => "internal server error",
+        }
+    }
+}
+
+impl IntoResponse for OpenRankingError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        let reason = self.reason().to_string();
+
+        // ORE-00: surface the reason in the X-Reason header.
+        let mut headers = axum::http::HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&reason) {
+            headers.insert("x-reason", value);
+        }
+
+        (
+            status,
+            headers,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response()
+    }
+}
+
+/// Resolve the algorithm for an endpoint. With no request, the default is the
+/// first algorithm listed (ORE-01); an unsupported id is a 422.
+pub(crate) fn resolve_algorithm(
+    endpoint: &str,
+    requested: Option<&str>,
+) -> Result<AlgorithmSpec, OpenRankingError> {
+    let algorithms = registry()
+        .into_iter()
+        .find(|(path, _)| *path == endpoint)
+        .map(|(_, algorithms)| algorithms)
+        .expect("endpoint is registered");
+
+    match requested {
+        None => Ok(algorithms
+            .into_iter()
+            .next()
+            .expect("each endpoint has at least one algorithm")),
+        Some(id) => algorithms
+            .into_iter()
+            .find(|algorithm| algorithm.id == id)
+            .ok_or_else(|| {
+                OpenRankingError::unprocessable(format!(
+                    "algorithm '{id}' is not supported by {endpoint}"
+                ))
+            }),
+    }
+}
+
+/// Parse a JSON request body, mapping any deserialization failure to 400.
+fn parse_json_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, OpenRankingError> {
+    serde_json::from_slice(body)
+        .map_err(|e| OpenRankingError::malformed_body(format!("invalid JSON body: {e}")))
+}
+
+/// Core `/rank` logic (ORE-02): rank the requested pubkeys by global PageRank.
+pub(crate) async fn rank<T: RepoTrait>(
+    repo: &T,
+    request: RankRequest,
+) -> Result<RankResponse, OpenRankingError> {
+    // ORE-01: validate the requested algorithm (defaults to the first listed).
+    resolve_algorithm(RANK_ENDPOINT, request.algorithm.as_deref())?;
+
+    // ORE-02: pubkeys MUST contain at least one entry.
+    if request.pubkeys.is_empty() {
+        return Err(OpenRankingError::unprocessable(
+            "pubkeys must contain at least one pubkey",
+        ));
+    }
+
+    // ORE-02: providers MAY reject oversized requests with 413.
+    if request.pubkeys.len() > MAX_PUBKEYS {
+        return Err(OpenRankingError::payload_too_large(format!(
+            "pubkeys exceeds the maximum of {MAX_PUBKEYS}"
+        )));
+    }
+
+    // ORE-02: limit, when provided, MUST be a positive integer.
+    if let Some(limit) = request.limit {
+        if limit < 1 {
+            return Err(OpenRankingError::unprocessable(
+                "limit must be a positive integer",
+            ));
+        }
+    }
+
+    // ORE-02: the default limit is the number of requested pubkeys, and a larger
+    // limit is silently clamped to that count.
+    let default_limit = request.pubkeys.len();
+    let limit = request
+        .limit
+        .map(|limit| limit as usize)
+        .unwrap_or(default_limit)
+        .min(default_limit);
+
+    // Parse and de-duplicate the pubkeys, preserving request order.
+    let mut seen = HashSet::new();
+    let mut pubkeys = Vec::with_capacity(request.pubkeys.len());
+    for raw in &request.pubkeys {
+        let pubkey = PublicKey::from_hex(raw).map_err(|e| {
+            OpenRankingError::malformed_body(format!("invalid pubkey '{raw}': {e}"))
+        })?;
+        if seen.insert(pubkey) {
+            pubkeys.push(pubkey);
+        }
+    }
+
+    let pageranks = repo.get_pageranks(&pubkeys).await.map_err(|e| {
+        error!("/rank get_pageranks failed: {e}");
+        OpenRankingError::Internal
+    })?;
+
+    // ORE-02: return a rank for every requested pubkey; unknown pubkeys rank 0.
+    let mut profiles: Vec<Profile> = pubkeys
+        .iter()
+        .map(|pubkey| Profile {
+            pubkey: pubkey.to_hex(),
+            rank: pageranks.get(pubkey).copied().unwrap_or(0.0),
+        })
+        .collect();
+
+    profiles.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(Ordering::Equal));
+    profiles.truncate(limit);
+
+    Ok(RankResponse {
+        profiles,
+        ttl: Some(RANK_TTL_SECONDS),
+    })
+}
+
+/// `POST /rank` (ORE-02).
+pub(crate) async fn serve_rank<T, U>(
+    State(state): State<Arc<AppState<T, U>>>,
+    body: Bytes,
+) -> Result<Json<RankResponse>, OpenRankingError>
+where
+    T: RepoTrait,
+    U: GetEventsOf,
+{
+    let request: RankRequest = parse_json_body(&body)?;
+    let response = rank(state.repo.as_ref(), request).await?;
+    Ok(Json(response))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::{RepoError, RepoTrait};
+    use axum::http::StatusCode;
+    use nostr_sdk::{Keys, PublicKey};
+    use std::collections::HashMap;
+
+    fn fresh_pubkey() -> PublicKey {
+        Keys::generate().public_key()
+    }
+
+    /// A repo stub that knows the PageRank of a fixed set of pubkeys and, like
+    /// the real Cypher query, returns only the requested ones it knows about.
+    #[derive(Default)]
+    struct MockRepo {
+        pageranks: HashMap<PublicKey, f64>,
+        fail: bool,
+    }
+
+    impl RepoTrait for MockRepo {
+        async fn get_pageranks(
+            &self,
+            pubkeys: &[PublicKey],
+        ) -> Result<HashMap<PublicKey, f64>, RepoError> {
+            if self.fail {
+                return Err(RepoError::InvalidParameter("boom".into()));
+            }
+            Ok(pubkeys
+                .iter()
+                .filter_map(|pubkey| self.pageranks.get(pubkey).map(|rank| (*pubkey, *rank)))
+                .collect())
+        }
+    }
+
+    fn rank_request(pubkeys: &[PublicKey], limit: Option<i64>) -> RankRequest {
+        RankRequest {
+            pubkeys: pubkeys.iter().map(PublicKey::to_hex).collect(),
+            algorithm: None,
+            limit,
+        }
+    }
+
+    // ---- capability document (ORE-01) ----
 
     #[test]
     fn capability_document_lists_each_endpoint_with_nonempty_algorithms() {
@@ -133,5 +410,152 @@ mod tests {
             rank.get("pov").is_none(),
             "global algorithms must omit pov, got {rank}"
         );
+    }
+
+    // ---- algorithm selection + errors (ORE-00/01) ----
+
+    #[test]
+    fn resolve_algorithm_defaults_to_the_first_listed() {
+        let algorithm = resolve_algorithm(RANK_ENDPOINT, None).expect("default resolves");
+        assert_eq!(algorithm.id, "pagerank");
+    }
+
+    #[test]
+    fn resolve_algorithm_rejects_unknown_algorithm_with_422() {
+        let error = resolve_algorithm(RANK_ENDPOINT, Some("does-not-exist"))
+            .expect_err("unknown algorithm is rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn error_status_codes_match_the_spec() {
+        assert_eq!(
+            OpenRankingError::malformed_body("x").status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            OpenRankingError::payload_too_large("x").status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            OpenRankingError::unprocessable("x").status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn parse_json_body_rejects_malformed_json_with_400() {
+        let error = parse_json_body::<RankRequest>(b"not json").expect_err("malformed rejected");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- /rank (ORE-02) ----
+
+    #[tokio::test]
+    async fn rank_rejects_empty_pubkeys_with_422() {
+        let repo = MockRepo::default();
+        let error = rank(&repo, rank_request(&[], None))
+            .await
+            .expect_err("empty pubkeys rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn rank_rejects_more_than_1000_pubkeys_with_413() {
+        let repo = MockRepo::default();
+        let pubkeys: Vec<PublicKey> = (0..1001).map(|_| fresh_pubkey()).collect();
+        let error = rank(&repo, rank_request(&pubkeys, None))
+            .await
+            .expect_err("oversized request rejected");
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn rank_rejects_non_positive_limit_with_422() {
+        let repo = MockRepo::default();
+        let error = rank(&repo, rank_request(&[fresh_pubkey()], Some(0)))
+            .await
+            .expect_err("non-positive limit rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn rank_rejects_unknown_algorithm_with_422() {
+        let repo = MockRepo::default();
+        let mut request = rank_request(&[fresh_pubkey()], None);
+        request.algorithm = Some("does-not-exist".into());
+        let error = rank(&repo, request)
+            .await
+            .expect_err("unknown algorithm rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn rank_returns_a_rank_for_every_pubkey_sorted_desc_with_unknowns_at_zero() {
+        let known = fresh_pubkey();
+        let other = fresh_pubkey();
+        let unknown = fresh_pubkey();
+        let repo = MockRepo {
+            pageranks: HashMap::from([(known, 0.9), (other, 0.4)]),
+            fail: false,
+        };
+
+        let response = rank(&repo, rank_request(&[unknown, other, known], None))
+            .await
+            .expect("ranking succeeds");
+
+        assert_eq!(response.profiles.len(), 3, "a rank for every pubkey");
+        assert_eq!(response.profiles[0].pubkey, known.to_hex());
+        assert_eq!(response.profiles[0].rank, 0.9);
+        assert_eq!(response.profiles[1].pubkey, other.to_hex());
+        assert_eq!(response.profiles[1].rank, 0.4);
+        assert_eq!(response.profiles[2].pubkey, unknown.to_hex());
+        assert_eq!(response.profiles[2].rank, 0.0, "unknown pubkey backfilled");
+    }
+
+    #[tokio::test]
+    async fn rank_clamps_results_to_limit() {
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let c = fresh_pubkey();
+        let repo = MockRepo {
+            pageranks: HashMap::from([(a, 0.1), (b, 0.5), (c, 0.9)]),
+            fail: false,
+        };
+
+        let response = rank(&repo, rank_request(&[a, b, c], Some(2)))
+            .await
+            .expect("ranking succeeds");
+
+        assert_eq!(response.profiles.len(), 2);
+        assert_eq!(response.profiles[0].pubkey, c.to_hex());
+        assert_eq!(response.profiles[1].pubkey, b.to_hex());
+    }
+
+    #[tokio::test]
+    async fn rank_deduplicates_repeated_pubkeys() {
+        let a = fresh_pubkey();
+        let repo = MockRepo {
+            pageranks: HashMap::from([(a, 0.3)]),
+            fail: false,
+        };
+
+        let response = rank(&repo, rank_request(&[a, a, a], None))
+            .await
+            .expect("ranking succeeds");
+
+        assert_eq!(response.profiles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rank_maps_repo_failure_to_500() {
+        let repo = MockRepo {
+            fail: true,
+            ..Default::default()
+        };
+        let error = rank(&repo, rank_request(&[fresh_pubkey()], None))
+            .await
+            .expect_err("repo failure surfaces");
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
