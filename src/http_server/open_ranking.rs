@@ -329,9 +329,116 @@ where
     Ok(Json(response))
 }
 
+/// An ORE-06 `stats` object: non-negative integer counts from our index.
+#[derive(Debug, Serialize)]
+pub(crate) struct ReputationStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follows: Option<u64>,
+}
+
+/// Provider-specific `x` extensions for `/reputation` (ORE-06).
+#[derive(Debug, Serialize)]
+pub(crate) struct ReputationExtensions {
+    /// Our boolean trust verdict (PageRank-based; see `AccountInfo::is_trusted`).
+    pub trusted: bool,
+}
+
+/// Response body for `POST /reputation` (ORE-06). `pubkey` and `rank` are
+/// always present; the rest are omitted when we have no data.
+#[derive(Debug, Serialize)]
+pub(crate) struct ReputationResponse {
+    pub pubkey: String,
+    pub rank: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<ReputationStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<ReputationExtensions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
+}
+
+/// Request body for `POST /reputation` (ORE-06). Unknown fields are ignored.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ReputationRequest {
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    #[serde(default)]
+    pub algorithm: Option<String>,
+}
+
+/// Parse a required pubkey field. A missing or invalid pubkey is a 422
+/// (ORE-04/06), unlike a malformed pubkey inside a `/rank` array.
+fn parse_required_pubkey(pubkey: Option<&str>) -> Result<PublicKey, OpenRankingError> {
+    let pubkey =
+        pubkey.ok_or_else(|| OpenRankingError::unprocessable("pubkey field is required"))?;
+    PublicKey::from_hex(pubkey)
+        .map_err(|e| OpenRankingError::unprocessable(format!("pubkey is invalid: {e}")))
+}
+
+/// Core `/reputation` logic (ORE-06): structured PageRank reputation for a pubkey.
+pub(crate) async fn reputation<T: RepoTrait>(
+    repo: &T,
+    request: ReputationRequest,
+) -> Result<ReputationResponse, OpenRankingError> {
+    resolve_algorithm(REPUTATION_ENDPOINT, request.algorithm.as_deref())?;
+    let pubkey = parse_required_pubkey(request.pubkey.as_deref())?;
+
+    let account = repo.get_account_info(&pubkey).await.map_err(|e| {
+        error!("/reputation get_account_info failed: {e}");
+        OpenRankingError::Internal
+    })?;
+
+    let Some(account) = account else {
+        // Unknown pubkey: rank is still required, but there are no stats to report.
+        return Ok(ReputationResponse {
+            pubkey: pubkey.to_hex(),
+            rank: 0.0,
+            stats: None,
+            x: None,
+            ttl: Some(RANK_TTL_SECONDS),
+        });
+    };
+
+    let stats = if account.follower_count.is_some() || account.followee_count.is_some() {
+        Some(ReputationStats {
+            followers: account.follower_count,
+            follows: account.followee_count,
+        })
+    } else {
+        None
+    };
+
+    Ok(ReputationResponse {
+        pubkey: pubkey.to_hex(),
+        rank: account.pagerank.unwrap_or(0.0),
+        stats,
+        x: Some(ReputationExtensions {
+            trusted: account.is_trusted(),
+        }),
+        ttl: Some(RANK_TTL_SECONDS),
+    })
+}
+
+/// `POST /reputation` (ORE-06).
+pub(crate) async fn serve_reputation<T, U>(
+    State(state): State<Arc<AppState<T, U>>>,
+    body: Bytes,
+) -> Result<Json<ReputationResponse>, OpenRankingError>
+where
+    T: RepoTrait,
+    U: GetEventsOf,
+{
+    let request: ReputationRequest = parse_json_body(&body)?;
+    let response = reputation(state.repo.as_ref(), request).await?;
+    Ok(Json(response))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::AccountInfo;
     use crate::repo::{RepoError, RepoTrait};
     use axum::http::StatusCode;
     use nostr_sdk::{Keys, PublicKey};
@@ -346,6 +453,7 @@ mod tests {
     #[derive(Default)]
     struct MockRepo {
         pageranks: HashMap<PublicKey, f64>,
+        accounts: HashMap<PublicKey, AccountInfo>,
         fail: bool,
     }
 
@@ -361,6 +469,16 @@ mod tests {
                 .iter()
                 .filter_map(|pubkey| self.pageranks.get(pubkey).map(|rank| (*pubkey, *rank)))
                 .collect())
+        }
+
+        async fn get_account_info(
+            &self,
+            pubkey: &PublicKey,
+        ) -> Result<Option<AccountInfo>, RepoError> {
+            if self.fail {
+                return Err(RepoError::InvalidParameter("boom".into()));
+            }
+            Ok(self.accounts.get(pubkey).cloned())
         }
     }
 
@@ -497,7 +615,7 @@ mod tests {
         let unknown = fresh_pubkey();
         let repo = MockRepo {
             pageranks: HashMap::from([(known, 0.9), (other, 0.4)]),
-            fail: false,
+            ..Default::default()
         };
 
         let response = rank(&repo, rank_request(&[unknown, other, known], None))
@@ -520,7 +638,7 @@ mod tests {
         let c = fresh_pubkey();
         let repo = MockRepo {
             pageranks: HashMap::from([(a, 0.1), (b, 0.5), (c, 0.9)]),
-            fail: false,
+            ..Default::default()
         };
 
         let response = rank(&repo, rank_request(&[a, b, c], Some(2)))
@@ -537,7 +655,7 @@ mod tests {
         let a = fresh_pubkey();
         let repo = MockRepo {
             pageranks: HashMap::from([(a, 0.3)]),
-            fail: false,
+            ..Default::default()
         };
 
         let response = rank(&repo, rank_request(&[a, a, a], None))
@@ -557,5 +675,108 @@ mod tests {
             .await
             .expect_err("repo failure surfaces");
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- /reputation (ORE-06) ----
+
+    fn account(pubkey: PublicKey, pagerank: f64, followers: u64, follows: u64) -> AccountInfo {
+        AccountInfo::new(pubkey)
+            .with_pagerank(Some(pagerank))
+            .with_follower_count(Some(followers))
+            .with_followee_count(Some(follows))
+    }
+
+    fn reputation_request(pubkey: &str) -> ReputationRequest {
+        ReputationRequest {
+            pubkey: Some(pubkey.to_string()),
+            algorithm: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reputation_returns_rank_stats_and_trust_for_a_known_account() {
+        let pubkey = fresh_pubkey();
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 100, 20))]),
+            ..Default::default()
+        };
+
+        let response = reputation(&repo, reputation_request(&pubkey.to_hex()))
+            .await
+            .expect("reputation succeeds");
+
+        assert_eq!(response.pubkey, pubkey.to_hex());
+        assert_eq!(response.rank, 0.5);
+        let stats = response.stats.expect("known account has stats");
+        assert_eq!(stats.followers, Some(100));
+        assert_eq!(stats.follows, Some(20));
+        assert!(
+            response.x.expect("known account has extensions").trusted,
+            "pagerank 0.5 is trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_low_pagerank_is_not_trusted() {
+        let pubkey = fresh_pubkey();
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.1, 3, 9))]),
+            ..Default::default()
+        };
+
+        let response = reputation(&repo, reputation_request(&pubkey.to_hex()))
+            .await
+            .expect("reputation succeeds");
+
+        assert!(!response.x.expect("extensions present").trusted);
+    }
+
+    #[tokio::test]
+    async fn reputation_unknown_pubkey_returns_zero_rank_and_omits_stats_and_x() {
+        let repo = MockRepo::default();
+
+        let response = reputation(&repo, reputation_request(&fresh_pubkey().to_hex()))
+            .await
+            .expect("reputation succeeds");
+
+        assert_eq!(response.rank, 0.0);
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("stats").is_none(), "stats omitted for unknown");
+        assert!(json.get("x").is_none(), "x omitted for unknown");
+    }
+
+    #[tokio::test]
+    async fn reputation_missing_pubkey_is_422() {
+        let repo = MockRepo::default();
+        let request = ReputationRequest {
+            pubkey: None,
+            algorithm: None,
+        };
+        let error = reputation(&repo, request)
+            .await
+            .expect_err("missing pubkey rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn reputation_invalid_pubkey_is_422() {
+        let repo = MockRepo::default();
+        let error = reputation(&repo, reputation_request("not-a-pubkey"))
+            .await
+            .expect_err("invalid pubkey rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn reputation_unknown_algorithm_is_422() {
+        let repo = MockRepo::default();
+        let request = ReputationRequest {
+            pubkey: Some(fresh_pubkey().to_hex()),
+            algorithm: Some("does-not-exist".into()),
+        };
+        let error = reputation(&repo, request)
+            .await
+            .expect_err("unknown algorithm rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

@@ -77,6 +77,10 @@ where
             open_ranking::RANK_ENDPOINT,
             post(open_ranking::serve_rank::<T, U>),
         )
+        .route(
+            open_ranking::REPUTATION_ENDPOINT,
+            post(open_ranking::serve_reputation::<T, U>),
+        )
         .with_state(state.clone());
 
     Ok(Router::new()
