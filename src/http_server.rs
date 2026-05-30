@@ -27,6 +27,9 @@ where
     pub nostr_client: Arc<U>,
     pub trust_cache: Cache<String, bool>,
     pub recommendation_queue: Arc<RecommendationQueue<T>>,
+    /// Short-lived single-flight result caches for the synchronous open-ranking
+    /// reads (`/rank`, `/reputation`, `/followers`); see [`open_ranking::OpenRankingReadCache`].
+    pub(crate) open_ranking_read_cache: open_ranking::OpenRankingReadCache,
 }
 
 impl<T, U> AppState<T, U>
@@ -49,6 +52,7 @@ where
             nostr_client,
             trust_cache,
             recommendation_queue,
+            open_ranking_read_cache: open_ranking::OpenRankingReadCache::new(),
         }
     }
 }

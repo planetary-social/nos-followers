@@ -13,11 +13,13 @@ use axum::extract::State;
 use axum::http::{header::CACHE_CONTROL, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use moka::future::Cache;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::error;
 
 /// Endpoint paths exposed by this provider. Each is a key in the capability
@@ -141,7 +143,7 @@ pub(crate) struct Profile {
 }
 
 /// The shared `/rank`-shaped response: profiles sorted by rank desc + a TTL hint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct RankResponse {
     pub profiles: Vec<Profile>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,7 +164,7 @@ pub(crate) struct RankRequest {
 
 /// Errors returned by OpenRanking endpoints, mapped to their HTTP status codes.
 /// The human-readable reason is also sent in the `X-Reason` header (ORE-00).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum OpenRankingError {
     /// 400: the request body is malformed or not valid JSON.
     MalformedBody(String),
@@ -276,6 +278,94 @@ fn cached_json<T: Serialize>(body: T, ttl: Option<u64>) -> Response {
     response
 }
 
+/// Server-side TTL for the synchronous read caches. Short by design: it only has
+/// to span a burst window, and PageRank is recomputed daily, so a minute of reuse
+/// bounds staleness well under that while still collapsing the herd.
+const READ_CACHE_TTL_SECONDS: u64 = 60;
+
+/// Max distinct cached read responses per endpoint (LRU-evicted). Bounds memory
+/// for `/rank`, whose key is an arbitrary pubkey set.
+const READ_CACHE_CAPACITY: u64 = 1_000;
+
+/// Short-lived per-endpoint result caches for the synchronous heavy reads
+/// (`/rank`, `/reputation`, `/followers`). Each `try_get_with` both single-flights
+/// — concurrent identical requests collapse to one Neo4j query — and reuses the
+/// result for [`READ_CACHE_TTL_SECONDS`]. Errors are never cached, so a failed or
+/// timed-out query is retried rather than replayed.
+///
+/// Known limits: this does not rescue a single query that exceeds the 5s route
+/// timeout (that future is dropped before it can populate the cache — mitigating
+/// it would need a background compute like `/recommend`, or a longer timeout).
+/// And because these endpoints are POST, standard shared HTTP caches will not
+/// reuse them; this server-side cache is what actually collapses the herd.
+#[derive(Clone)]
+pub(crate) struct OpenRankingReadCache {
+    rank: Cache<String, RankResponse>,
+    reputation: Cache<String, ReputationResponse>,
+    followers: Cache<String, FollowersResponse>,
+}
+
+impl OpenRankingReadCache {
+    pub(crate) fn new() -> Self {
+        fn build<V: Clone + Send + Sync + 'static>() -> Cache<String, V> {
+            Cache::builder()
+                .time_to_live(Duration::from_secs(READ_CACHE_TTL_SECONDS))
+                .max_capacity(READ_CACHE_CAPACITY)
+                .build()
+        }
+        Self {
+            rank: build(),
+            reputation: build(),
+            followers: build(),
+        }
+    }
+}
+
+impl Default for OpenRankingReadCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Cache key for `/reputation`: pubkey + algorithm. A missing/invalid pubkey
+/// errors before the repo call (and errors are never cached), so the empty
+/// placeholder for `None` is harmless.
+fn reputation_cache_key(request: &ReputationRequest) -> String {
+    format!(
+        "{}|{}",
+        request.pubkey.as_deref().unwrap_or(""),
+        request.algorithm.as_deref().unwrap_or("")
+    )
+}
+
+/// Cache key for `/followers`: pubkey + limit + algorithm.
+fn followers_cache_key(request: &FollowersRequest) -> String {
+    format!(
+        "{}|{}|{}",
+        request.pubkey.as_deref().unwrap_or(""),
+        request.limit.map(|l| l.to_string()).unwrap_or_default(),
+        request.algorithm.as_deref().unwrap_or("")
+    )
+}
+
+/// Cache key for `/rank`: a hash of the order-independent pubkey set plus the
+/// algorithm and limit. The response is determined by the set (it is sorted by
+/// rank and unknowns rank 0), so request order must not split the cache.
+fn rank_cache_key(request: &RankRequest) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut pubkeys: Vec<&str> = request.pubkeys.iter().map(String::as_str).collect();
+    pubkeys.sort_unstable();
+    pubkeys.dedup();
+
+    let mut hasher = DefaultHasher::new();
+    pubkeys.hash(&mut hasher);
+    request.algorithm.hash(&mut hasher);
+    request.limit.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Core `/rank` logic (ORE-02): rank the requested pubkeys by global PageRank.
 pub(crate) async fn rank<T: RepoTrait>(
     repo: &T,
@@ -361,13 +451,20 @@ where
     U: GetEventsOf,
 {
     let request: RankRequest = parse_json_body(&body)?;
-    let response = rank(state.repo.as_ref(), request).await?;
+    let key = rank_cache_key(&request);
+    let repo = state.repo.clone();
+    let response = state
+        .open_ranking_read_cache
+        .rank
+        .try_get_with(key, async move { rank(repo.as_ref(), request).await })
+        .await
+        .map_err(|err| (*err).clone())?;
     let ttl = response.ttl;
     Ok(cached_json(response, ttl))
 }
 
 /// An ORE-06 `stats` object: non-negative integer counts from our index.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReputationStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub followers: Option<u64>,
@@ -376,7 +473,7 @@ pub(crate) struct ReputationStats {
 }
 
 /// Provider-specific `x` extensions for `/reputation` (ORE-06).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReputationExtensions {
     /// Our boolean trust verdict (PageRank-based; see `AccountInfo::is_trusted`).
     pub trusted: bool,
@@ -384,7 +481,7 @@ pub(crate) struct ReputationExtensions {
 
 /// Response body for `POST /reputation` (ORE-06). `pubkey` and `rank` are
 /// always present; the rest are omitted when we have no data.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReputationResponse {
     pub pubkey: String,
     pub rank: f64,
@@ -468,13 +565,20 @@ where
     U: GetEventsOf,
 {
     let request: ReputationRequest = parse_json_body(&body)?;
-    let response = reputation(state.repo.as_ref(), request).await?;
+    let key = reputation_cache_key(&request);
+    let repo = state.repo.clone();
+    let response = state
+        .open_ranking_read_cache
+        .reputation
+        .try_get_with(key, async move { reputation(repo.as_ref(), request).await })
+        .await
+        .map_err(|err| (*err).clone())?;
     let ttl = response.ttl;
     Ok(cached_json(response, ttl))
 }
 
 /// Response body for `POST /followers` (ORE-04).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct FollowersResponse {
     pub profiles: Vec<Profile>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -551,7 +655,14 @@ where
     U: GetEventsOf,
 {
     let request: FollowersRequest = parse_json_body(&body)?;
-    let response = followers(state.repo.as_ref(), request).await?;
+    let key = followers_cache_key(&request);
+    let repo = state.repo.clone();
+    let response = state
+        .open_ranking_read_cache
+        .followers
+        .try_get_with(key, async move { followers(repo.as_ref(), request).await })
+        .await
+        .map_err(|err| (*err).clone())?;
     let ttl = response.ttl;
     Ok(cached_json(response, ttl))
 }
@@ -752,6 +863,12 @@ mod tests {
         recommendations: HashMap<PublicKey, Vec<Recommendation>>,
         /// Counts calls to `get_recommendations`, to assert cache reuse.
         recommendation_calls: Arc<AtomicUsize>,
+        /// Counts calls to the synchronous heavy reads, to assert the
+        /// single-flight + result cache collapses identical concurrent/repeat
+        /// requests into one Neo4j query.
+        pagerank_calls: Arc<AtomicUsize>,
+        account_calls: Arc<AtomicUsize>,
+        top_followers_calls: Arc<AtomicUsize>,
         /// Number of leading `get_recommendations` calls that fail transiently
         /// before recovering, to exercise the queue's self-healing Failed path.
         recommendation_failures: Arc<AtomicUsize>,
@@ -763,6 +880,7 @@ mod tests {
             &self,
             pubkeys: &[PublicKey],
         ) -> Result<HashMap<PublicKey, f64>, RepoError> {
+            self.pagerank_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
             }
@@ -776,6 +894,7 @@ mod tests {
             &self,
             pubkey: &PublicKey,
         ) -> Result<Option<AccountInfo>, RepoError> {
+            self.account_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
             }
@@ -787,6 +906,7 @@ mod tests {
             pubkey: &PublicKey,
             limit: usize,
         ) -> Result<TopFollowers, RepoError> {
+            self.top_followers_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
             }
@@ -1685,6 +1805,155 @@ mod tests {
         assert!(
             cache_control(&response).is_none(),
             "error responses must not carry a Cache-Control header"
+        );
+    }
+
+    // ---- single-flight + short result cache for the synchronous heavy reads ----
+
+    use tokio::sync::Barrier;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_reputation_requests_hit_the_repo_once() {
+        // A thundering herd of identical /reputation requests must collapse to a
+        // single Neo4j query (single-flight), not one query per request.
+        const BURST: usize = 16;
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 10, 2))]),
+            account_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() }));
+
+        let barrier = Arc::new(Barrier::new(BURST));
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let state = state.clone();
+            let body = body.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                serve_reputation(State(state), body)
+                    .await
+                    .expect("reputation succeeds");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("request task completes");
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "identical concurrent /reputation reads must single-flight to one query"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_reputation_request_is_served_from_cache() {
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 10, 2))]),
+            account_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() }));
+
+        serve_reputation(State(state.clone()), body.clone())
+            .await
+            .expect("first reputation succeeds");
+        serve_reputation(State(state), body)
+            .await
+            .expect("second reputation succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the repeated identical request must be served from the result cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_followers_request_is_served_from_cache() {
+        let target = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            top_followers: HashMap::from([(target, vec![(fresh_pubkey(), 0.7)])]),
+            top_followers_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": target.to_hex() }));
+
+        serve_followers(State(state.clone()), body.clone())
+            .await
+            .expect("first followers succeeds");
+        serve_followers(State(state), body)
+            .await
+            .expect("second followers succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second request hits the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_rank_request_is_served_from_cache() {
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            pageranks: HashMap::from([(pubkey, 0.9)]),
+            pagerank_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkeys": [pubkey.to_hex()] }));
+
+        serve_rank(State(state.clone()), body.clone())
+            .await
+            .expect("first rank succeeds");
+        serve_rank(State(state), body)
+            .await
+            .expect("second rank succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second request hits the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_repo_errors_are_not_cached() {
+        // A failed query must not poison the cache: try_get_with never caches the
+        // error, so the next request retries the repo instead of replaying a 500.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            account_calls: calls.clone(),
+            fail: true,
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": fresh_pubkey().to_hex() }));
+
+        let first = serve_reputation(State(state.clone()), body.clone()).await;
+        let second = serve_reputation(State(state), body).await;
+
+        assert!(first.is_err(), "a repo failure surfaces as an error");
+        assert!(
+            second.is_err(),
+            "the retry also errors (nothing was cached)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "each request retried the repo; the failure was not cached"
         );
     }
 }
