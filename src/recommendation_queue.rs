@@ -51,6 +51,60 @@ where
     max_queue_size: usize,
 }
 
+/// RAII reservation of one recommendation-queue slot.
+///
+/// Constructing it with `reserve` takes a slot (counter += 1) and republishes the
+/// depth gauge; dropping it releases the slot (counter -= 1) and republishes the
+/// gauge. Because the counter and the gauge always move together in one place,
+/// the gauge can never drift from the counter, and a slot is freed on *every*
+/// exit path — including a dropped/cancelled future between reserving and
+/// dispatching (e.g. the route timeout firing mid-await).
+///
+/// On a successful dispatch the request path hands the single pending release to
+/// the worker: it `disarm`s its local guard and the worker `adopt`s the
+/// reservation, so the slot is released exactly once, when the compute finishes.
+struct QueueSlot {
+    queue_size: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+impl QueueSlot {
+    /// Reserve a fresh slot (counter += 1) and publish the new depth.
+    fn reserve(queue_size: Arc<AtomicUsize>) -> Self {
+        let depth = queue_size.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::metrics::recommendation_queue_depth().set(depth as f64);
+        Self {
+            queue_size,
+            armed: true,
+        }
+    }
+
+    /// Adopt an already-reserved slot without changing the counter, so its single
+    /// release happens when this guard drops. Pairs with `disarm` on the handoff.
+    fn adopt(queue_size: Arc<AtomicUsize>) -> Self {
+        Self {
+            queue_size,
+            armed: true,
+        }
+    }
+
+    /// Hand the pending release to another owner: this guard will not release on
+    /// drop. Consumes the guard so it cannot be used afterwards.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let depth = self.queue_size.fetch_sub(1, Ordering::Relaxed) - 1;
+        crate::metrics::recommendation_queue_depth().set(depth as f64);
+    }
+}
+
 impl<T> RecommendationQueue<T>
 where
     T: RepoTrait + 'static,
@@ -133,16 +187,18 @@ where
             return Ok(entry.into_value());
         }
 
-        // We won the single-flight for this key: reserve the queue slot, record
-        // the real queue position, and dispatch the background warm-up.
+        // We won the single-flight for this key. Reserve the queue slot *first*,
+        // via an RAII guard, so the reservation is released on every exit path
+        // below — including a dropped/cancelled future between here and dispatch.
+        // The guard also keeps the depth gauge in lockstep with the counter.
+        let slot = QueueSlot::reserve(self.queue_size.clone());
+
+        // Record the real queue position and dispatch the background warm-up.
         let position = {
             let mut pending = self.pending_requests.write().await;
             pending.push(cache_key.clone());
             pending.len()
         };
-        self.queue_size.fetch_add(1, Ordering::Relaxed);
-        crate::metrics::recommendation_queue_depth()
-            .set(self.queue_size.load(Ordering::Relaxed) as f64);
 
         let pending_status = RecommendationStatus::Pending { position };
         self.status_cache
@@ -156,17 +212,19 @@ where
             cache_key: cache_key.clone(),
         };
         if self.request_sender.send(request).is_err() {
-            // Dispatch failed: undo the reservation and clear the in-flight status
-            // so a later retry re-enqueues instead of joining a phantom request.
-            self.queue_size.fetch_sub(1, Ordering::Relaxed);
-            crate::metrics::recommendation_queue_depth()
-                .set(self.queue_size.load(Ordering::Relaxed) as f64);
+            // Dispatch failed: clear the in-flight status so a later retry
+            // re-enqueues instead of joining a phantom request. The `slot` guard
+            // releases the reservation as it drops on return.
             let mut pending = self.pending_requests.write().await;
             pending.retain(|k| k != &cache_key);
             self.status_cache.invalidate(&cache_key).await;
             return Err("Failed to queue recommendation request".into());
         }
 
+        // Dispatch succeeded: hand the slot's single release to the worker, which
+        // releases it when the compute finishes. `disarm` stops this local guard
+        // from also releasing it (which would double-count).
+        slot.disarm();
         Ok(pending_status)
     }
 
@@ -203,6 +261,13 @@ where
                     }
                     Ok(request) = receiver.recv() => {
                         let cache_key = request.cache_key.clone();
+
+                        // Take over the queue-slot reservation the request path
+                        // handed off on dispatch. Its Drop releases the slot (and
+                        // republishes the depth gauge) when this job finishes, on
+                        // every arm below, so the gauge can never diverge from the
+                        // counter.
+                        let _slot = QueueSlot::adopt(queue_size.clone());
 
                         // Remove from pending requests and update positions
                         {
@@ -271,11 +336,8 @@ where
                                     .await;
                             }
                         }
-
-                        // Update queue size
-                        queue_size.fetch_sub(1, Ordering::Relaxed);
-                        crate::metrics::recommendation_queue_depth()
-                            .set(queue_size.load(Ordering::Relaxed) as f64);
+                        // `_slot` drops here, releasing the reservation and
+                        // republishing the depth gauge.
                     }
                 }
             }
@@ -367,6 +429,102 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "a concurrent cold burst for one key must collapse to a single compute"
+        );
+    }
+
+    /// A request future that is dropped (cancelled) after it has reserved its
+    /// queue slot but before it dispatches must still release that slot —
+    /// otherwise a route timeout firing mid-await would leak a slot and, over
+    /// time, wedge the queue at `QueueFull`. The reservation rides an RAII guard
+    /// acquired before the first await, so the cancellation releases it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_cancelled_before_dispatch_releases_its_slot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(queue_with_worker(calls));
+        let pov = Keys::generate().public_key();
+
+        // Hold the pending-requests lock so the winning request parks *after* it
+        // reserves its slot but *before* it can record its position and dispatch.
+        let lock = queue.pending_requests.write().await;
+
+        let request = {
+            let queue = queue.clone();
+            tokio::spawn(async move { queue.request_recommendations(pov, None, Some(10)).await })
+        };
+
+        // Wait until the slot is reserved (the request is now parked on the lock).
+        let mut reserved = false;
+        for _ in 0..500 {
+            if queue.queue_size.load(Ordering::SeqCst) == 1 {
+                reserved = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            reserved,
+            "the winning request reserves its slot before the first await"
+        );
+
+        // Cancel the in-flight request while it is parked before dispatch.
+        request.abort();
+        let _ = request.await;
+        drop(lock);
+
+        // The guard must have released the slot despite the cancellation.
+        let mut released = false;
+        for _ in 0..500 {
+            if queue.queue_size.load(Ordering::SeqCst) == 0 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            released,
+            "a cancelled request must release its reserved slot"
+        );
+    }
+
+    #[test]
+    fn reserve_then_drop_conserves_the_slot_counter() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let _slot = QueueSlot::reserve(counter.clone());
+            assert_eq!(counter.load(Ordering::SeqCst), 1, "reserve takes a slot");
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "drop releases the slot");
+    }
+
+    #[test]
+    fn a_disarmed_slot_does_not_release_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let slot = QueueSlot::reserve(counter.clone());
+        slot.disarm();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "disarm hands the release to another owner; the slot stays reserved"
+        );
+    }
+
+    #[test]
+    fn an_adopted_slot_releases_the_handed_off_reservation_on_drop() {
+        // Models the worker side: the request path reserved (counter == 1) and
+        // disarmed its guard, handing the single release to the worker.
+        let counter = Arc::new(AtomicUsize::new(1));
+        {
+            let _slot = QueueSlot::adopt(counter.clone());
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "adopt does not re-reserve"
+            );
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "the adopting owner releases the slot on drop"
         );
     }
 }
