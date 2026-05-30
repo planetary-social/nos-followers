@@ -609,8 +609,7 @@ mod tests {
         // Insert trusted changes exceeding the max
         for _ in 0..max_changes + 3 {
             let follower = Keys::generate().public_key();
-            let change =
-                FollowChange::new_followed(*NOW, follower, followee).with_trusted(true);
+            let change = FollowChange::new_followed(*NOW, follower, followee).with_trusted(true);
             factory.insert(change.into());
         }
         assert_eq!(factory.follow_changes_len(), max_changes + 3);
@@ -644,8 +643,7 @@ mod tests {
         // Insert mix of trusted and untrusted
         for trusted in [false, true, false, true, false] {
             let follower = Keys::generate().public_key();
-            let change =
-                FollowChange::new_followed(*NOW, follower, followee).with_trusted(trusted);
+            let change = FollowChange::new_followed(*NOW, follower, followee).with_trusted(trusted);
             factory.insert(change.into());
         }
 

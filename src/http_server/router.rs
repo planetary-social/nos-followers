@@ -234,7 +234,11 @@ mod tests {
         let repo = Arc::new(MockRepo);
         let result_cache = moka::future::Cache::builder().build();
         let (queue, _receiver) = RecommendationQueue::new(repo.clone(), result_cache, 16);
-        Arc::new(AppState::new(repo, Arc::new(MockNostrClient), Arc::new(queue)))
+        Arc::new(AppState::new(
+            repo,
+            Arc::new(MockNostrClient),
+            Arc::new(queue),
+        ))
     }
 
     /// Regression test for the discovery document being served outside the
