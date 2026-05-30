@@ -605,7 +605,10 @@ pub(crate) async fn recommend<T: RepoTrait>(
         // client back once the shared cache is warm.
         RecommendationStatus::Pending { .. }
         | RecommendationStatus::Processing
-        | RecommendationStatus::QueueFull => (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS),
+        | RecommendationStatus::QueueFull => {
+            crate::metrics::recommend_cold_miss().increment(1);
+            (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS)
+        }
         RecommendationStatus::Failed(reason) => {
             // The queue self-heals (request_recommendations re-enqueues on a
             // cached Failed), so a Failed reaching here is a transient blip: log
@@ -613,6 +616,7 @@ pub(crate) async fn recommend<T: RepoTrait>(
             // other in-flight states so the client retries per the
             // retry-after-ttl contract instead of receiving a sustained 500.
             error!("/recommend background computation failed, will retry: {reason}");
+            crate::metrics::recommend_cold_miss().increment(1);
             (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS)
         }
     };
@@ -691,6 +695,27 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("background warm-up never populated the recommendation cache");
+    }
+
+    /// Render the Prometheus metrics emitted while running `body` under a fresh,
+    /// test-local recorder. Lets a test assert which metrics a code path emits
+    /// without installing the global recorder, so tests stay isolated and never
+    /// race over shared metric state.
+    fn render_metrics_for<F, Fut>(body: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime")
+                .block_on(body());
+        });
+        handle.render()
     }
 
     /// A repo stub that knows the PageRank of a fixed set of pubkeys and, like
@@ -1281,6 +1306,43 @@ mod tests {
             warmed.profiles.len(),
             1,
             "the recommendation warmed after the transient failure recovered"
+        );
+    }
+
+    #[test]
+    fn recommend_emits_a_cold_miss_metric_on_the_warming_path() {
+        // A cold miss returns the empty + short-TTL warming response; that path
+        // must bump the cold-miss counter so operators can watch its rate.
+        let pov = fresh_pubkey();
+        let rendered = render_metrics_for(|| async move {
+            let queue = recommendation_queue(MockRepo::default());
+            let response = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+                .await
+                .expect("cold miss returns the warming response");
+            assert!(response.profiles.is_empty(), "a cold miss is empty");
+        });
+        assert!(
+            rendered.contains("recommend_cold_miss"),
+            "the warming path increments the cold-miss counter:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn warm_compute_records_the_warm_latency_histogram() {
+        // When the background worker completes a compute it records how long the
+        // warm-up took, so operators can watch warm latency.
+        let pov = fresh_pubkey();
+        let rendered = render_metrics_for(|| async move {
+            let repo = MockRepo {
+                recommendations: HashMap::from([(pov, vec![recommendation(fresh_pubkey(), 0.8)])]),
+                ..Default::default()
+            };
+            let queue = recommendation_queue(repo);
+            recommend_until_warm(&queue, &pov, None).await;
+        });
+        assert!(
+            rendered.contains("recommend_warm_seconds"),
+            "a completed warm-up records the latency histogram:\n{rendered}"
         );
     }
 

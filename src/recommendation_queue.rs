@@ -4,7 +4,7 @@ use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -206,11 +206,17 @@ where
                         );
 
                         // Calculate recommendations
+                        let started = Instant::now();
                         match repo
                             .get_recommendations(&request.pubkey, request.min_pagerank, request.limit)
                             .await
                         {
                             Ok(recommendations) => {
+                                // Record how long the warm-up compute took so
+                                // operators can watch warm latency.
+                                crate::metrics::recommend_warm_seconds()
+                                    .record(started.elapsed().as_secs_f64());
+
                                 info!(
                                     "Completed recommendation calculation for {}: {} results",
                                     request.pubkey.to_hex(),
