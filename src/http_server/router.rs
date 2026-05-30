@@ -73,8 +73,14 @@ where
     let cache_duration = settings.http_cache_seconds;
 
     // OpenRanking endpoints live at the top level (not under /api/v1) per the
-    // protocol; they share AppState with the rest of the server.
+    // protocol; they share AppState with the rest of the server. The capability
+    // document lives here too so it carries the same CORS layer as the endpoints
+    // it advertises (browsers fetch it cross-origin during discovery).
     let open_ranking_routes = Router::new()
+        .route(
+            open_ranking::CAPABILITY_PATH,
+            get(open_ranking::serve_capability_document),
+        )
         .route(
             open_ranking::RANK_ENDPOINT,
             post(open_ranking::serve_rank::<T, U>),
@@ -101,10 +107,6 @@ where
     Ok(Router::new()
         .route("/", get(serve_root_page))
         .route("/metrics", get(|| async move { metrics_handle.render() }))
-        .route(
-            open_ranking::CAPABILITY_PATH,
-            get(open_ranking::serve_capability_document),
-        )
         .merge(open_ranking_routes)
         .nest(
             "/api/v1",
@@ -170,5 +172,100 @@ impl IntoResponse for ApiError {
 
         error!("Api error: {}", self);
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Settings;
+    use crate::recommendation_queue::RecommendationQueue;
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use nostr_sdk::{Event, Filter};
+    use tower::ServiceExt;
+
+    /// Minimal repo: the capability route never touches it, so the trait's
+    /// default (panicking) implementations are fine.
+    #[derive(Default)]
+    struct MockRepo;
+    impl RepoTrait for MockRepo {}
+
+    #[derive(Default)]
+    struct MockNostrClient;
+
+    #[async_trait]
+    impl GetEventsOf for MockNostrClient {
+        async fn get_events_of(
+            &self,
+            _filters: Vec<Filter>,
+            _timeout: Option<Duration>,
+        ) -> Result<Vec<Event>, nostr_sdk::client::Error> {
+            Ok(vec![])
+        }
+    }
+
+    fn test_settings() -> Settings {
+        serde_json::from_value(serde_json::json!({
+            "relay": "wss://relay.example",
+            "neo4j_uri": "db:7687",
+            "neo4j_user": "neo4j",
+            "neo4j_password": "x",
+            "event_channel_size": 1000,
+            "diff_workers": 1,
+            "follow_change_channel_size": 1000,
+            "follow_change_workers": 1,
+            "worker_timeout_secs": 15,
+            "google_project_id": "p",
+            "google_topic": "t",
+            "flush_period_seconds": 60,
+            "min_seconds_between_messages": 60,
+            "tcp_importer_port": 3001,
+            "http_port": 3000,
+            "pagerank_cron_expression": "0 0 0 * * *",
+            "http_cache_seconds": 86400,
+            "burst": 10,
+            "redis_url": "redis://localhost"
+        }))
+        .expect("test settings deserialize")
+    }
+
+    fn test_state() -> Arc<AppState<MockRepo, MockNostrClient>> {
+        let repo = Arc::new(MockRepo);
+        let result_cache = moka::future::Cache::builder().build();
+        let (queue, _receiver) = RecommendationQueue::new(repo.clone(), result_cache, 16);
+        Arc::new(AppState::new(repo, Arc::new(MockNostrClient), Arc::new(queue)))
+    }
+
+    /// Regression test for the discovery document being served outside the
+    /// CORS-layered group: it must carry `Access-Control-Allow-Origin` like the
+    /// endpoints it advertises. `setup_metrics` installs a process-global
+    /// recorder, so this is the only test that builds the full router.
+    #[tokio::test]
+    async fn capability_document_route_is_cors_enabled() {
+        let router = create_router(test_state(), &test_settings()).expect("router builds");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(open_ranking::CAPABILITY_PATH)
+                    .header(header::ORIGIN, "https://example.com")
+                    // SmartIpKeyExtractor needs a client IP; supply one so the
+                    // rate-limit layer does not reject the test request.
+                    .header("x-forwarded-for", "203.0.113.7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "discovery document must send CORS headers like the endpoints it advertises"
+        );
     }
 }
