@@ -372,22 +372,24 @@ fn followers_cache_key(request: &FollowersRequest) -> String {
     )
 }
 
-/// Cache key for `/rank`: a hash of the order-independent pubkey set plus the
-/// algorithm and limit. The response is determined by the set (it is sorted by
-/// rank and unknowns rank 0), so request order must not split the cache.
+/// Cache key for `/rank`: the order-independent pubkey set plus the algorithm
+/// and limit, rendered as a canonical string (mirroring `reputation_cache_key`
+/// and `followers_cache_key`). The response is determined by the set (it is
+/// sorted by rank and unknowns rank 0), so request order must not split the
+/// cache. Keying on the canonical representation rather than a 64-bit hash keeps
+/// distinct requests in distinct entries: a digest could collide and serve one
+/// request's ranks for another's.
 fn rank_cache_key(request: &RankRequest) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let mut pubkeys: Vec<&str> = request.pubkeys.iter().map(String::as_str).collect();
     pubkeys.sort_unstable();
     pubkeys.dedup();
 
-    let mut hasher = DefaultHasher::new();
-    pubkeys.hash(&mut hasher);
-    request.algorithm.hash(&mut hasher);
-    request.limit.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    format!(
+        "{}|{}|{}",
+        pubkeys.join(","),
+        request.algorithm.as_deref().unwrap_or(""),
+        request.limit.map(|l| l.to_string()).unwrap_or_default(),
+    )
 }
 
 /// Core `/rank` logic (ORE-02): rank the requested pubkeys by global PageRank.
@@ -1171,6 +1173,78 @@ mod tests {
             .await
             .expect_err("repo failure surfaces");
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- /rank cache key (canonical, collision-safe — not a 64-bit hash) ----
+
+    #[test]
+    fn rank_cache_key_is_canonical_sorted_and_deduplicated() {
+        // The key is the canonical request representation — the sorted,
+        // de-duplicated pubkey set plus algorithm and limit — so distinct
+        // requests always land in distinct cache entries. A 64-bit hash digest
+        // (the previous implementation) risks silent collisions that would
+        // serve one request's ranks for another's.
+        let key = rank_cache_key(&RankRequest {
+            pubkeys: vec!["bbbb".into(), "aaaa".into(), "bbbb".into()],
+            algorithm: Some("pagerank".into()),
+            limit: Some(5),
+        });
+
+        assert_eq!(key, "aaaa,bbbb|pagerank|5");
+    }
+
+    #[test]
+    fn rank_cache_key_renders_absent_algorithm_and_limit_as_empty_fields() {
+        // Absent optionals render as empty fields (mirroring the sibling keys),
+        // and a present limit is always >= 1 (smaller values are rejected before
+        // caching), so `None` can never collide with a real limit.
+        let key = rank_cache_key(&RankRequest {
+            pubkeys: vec!["aaaa".into()],
+            algorithm: None,
+            limit: None,
+        });
+
+        assert_eq!(key, "aaaa||");
+    }
+
+    #[test]
+    fn rank_cache_key_distinguishes_requests_that_differ_in_any_field() {
+        let base = RankRequest {
+            pubkeys: vec!["aaaa".into(), "bbbb".into()],
+            algorithm: Some("pagerank".into()),
+            limit: Some(5),
+        };
+        let key = rank_cache_key(&base);
+
+        // A different pubkey set, algorithm, or limit must each change the key:
+        // no field may be lost to a collision.
+        assert_ne!(
+            rank_cache_key(&RankRequest {
+                pubkeys: vec!["aaaa".into(), "cccc".into()],
+                algorithm: Some("pagerank".into()),
+                limit: Some(5),
+            }),
+            key,
+            "a different pubkey set must change the key"
+        );
+        assert_ne!(
+            rank_cache_key(&RankRequest {
+                pubkeys: vec!["aaaa".into(), "bbbb".into()],
+                algorithm: Some("followers".into()),
+                limit: Some(5),
+            }),
+            key,
+            "a different algorithm must change the key"
+        );
+        assert_ne!(
+            rank_cache_key(&RankRequest {
+                pubkeys: vec!["aaaa".into(), "bbbb".into()],
+                algorithm: Some("pagerank".into()),
+                limit: Some(6),
+            }),
+            key,
+            "a different limit must change the key"
+        );
     }
 
     // ---- /reputation (ORE-06) ----
