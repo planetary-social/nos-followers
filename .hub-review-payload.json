@@ -1,0 +1,65 @@
+{
+  "findings": [
+    {
+      "id": "a1",
+      "kind": "architecture",
+      "file": "src/recommendation_queue.rs",
+      "line": 232,
+      "severity": "medium",
+      "confidence": 85,
+      "covered_finding_ids": ["f1"],
+      "replaces_finding_ids": ["f1"],
+      "title": "Terminal Failed recommendation status is cached for the full 300s transient TTL and consumed before re-enqueue, wedging /recommend (and /api/v1) after one transient compute failure",
+      "summary": "A get_recommendations failure caches a terminal Failed status with the 300s transient TTL and is returned ahead of any re-enqueue, so a single backend blip makes /recommend return HTTP 500 for ~5 minutes with no recompute, contradicting its documented short-TTL retry. The smallest fix is in the queue's Failed lifecycle, not the handler.",
+      "body": "On a `get_recommendations` error the background worker inserts `RecommendationStatus::Failed` into `status_cache` with the same 300s TTL used for transient `Pending`/`Processing` states (src/recommendation_queue.rs:232, TTL at src/recommendation_queue.rs:66) and never removes it — `status_cache.remove` runs only on the success path (src/recommendation_queue.rs:221). `request_recommendations` consults `status_cache` (src/recommendation_queue.rs:97) before the queue-full check and before re-enqueueing, so a cached `Failed` short-circuits every subsequent request for that `cache_key` for the full 300s and the compute is never re-attempted in that window. A single shared `RecommendationQueue` (src/main.rs:79, shared via `AppState`) backs both `/recommend` (src/http_server/open_ranking.rs:561) and `/api/v1/recommendations` (src/http_server/handlers.rs:65) under the identical `cache_key_for`, so one transient blip wedges both endpoints: `/recommend` maps `Failed` to `OpenRankingError::Internal` -> HTTP 500 (src/http_server/open_ranking.rs:609-611) while its own doc comment and README.md:51 tell clients to retry after the short 10s warming TTL, so the documented recovery is wrong — retries get 500 for 300s, not an empty-then-warm result. The root cause is treating a terminal failure as a long-lived transient status in a structure read ahead of re-enqueue. No test exercises the `/recommend` Failed path (the `MockRepo.fail` flag at src/http_server/open_ranking.rs:703 is used only by the /rank failure test).",
+      "worker_instruction": "Fix the Failed lifecycle in src/recommendation_queue.rs so a transient compute failure self-heals and triggers a recompute, rather than patching only the /recommend handler. Minimal options: (a) do not persist a long-lived terminal Failed in status_cache — skip caching Failed, or insert it with a very short TTL decoupled from the 300s transient TTL; and/or (b) in request_recommendations, treat a cached Failed as a cache miss so it falls through to re-enqueue instead of short-circuiting at recommendation_queue.rs:97. Once the queue self-heals, /recommend's existing empty + short-TTL warming branch (src/http_server/open_ranking.rs:608) covers the warming window; if Failed can still reach the handler, map it to the same empty + RECOMMEND_WARMING_TTL_SECONDS response rather than HTTP 500 so the README.md:51 retry-after-ttl contract holds. Add a regression test driving the /recommend Failed path via MockRepo.fail (src/http_server/open_ranking.rs:703) asserting recovery/re-enqueue within the warming window instead of a sustained 500.",
+      "reviewer_check": "Confirm a cached RecommendationStatus::Failed no longer pins both endpoints for 300s: either Failed is not stored with the transient 300s TTL, or request_recommendations re-enqueues on a cached Failed rather than returning it at recommendation_queue.rs:97. Confirm /recommend honors the documented retry-after-ttl behavior (no sustained 500) and that a regression test exercises the Failed path for /recommend.",
+      "trigger_path": "A single transient Repo::get_recommendations failure (Neo4j hiccup/timeout) for a pov while serving POST /recommend -> worker caches Failed for 300s (recommendation_queue.rs:232) -> every subsequent request for that cache_key hits the short-circuit at recommendation_queue.rs:97 -> /recommend returns HTTP 500 (open_ranking.rs:609-611) for the full 300s with no recompute.",
+      "required_conditions": [
+        "Repo::get_recommendations returns Err at least once for a pov (transient backend failure on the heavy Jaccard query)",
+        "subsequent requests use the same cache_key (same pov; /recommend normalizes min_pagerank=None and limit=Some)",
+        "requests arrive within 300s of the failure"
+      ],
+      "likelihood": "likely",
+      "impact": "medium",
+      "speculation_level": "confirmed",
+      "importance_rationale": "The mechanism is confirmed by reading the code. Transient failures of the heavy Jaccard query are an expected production event (the same heaviness that motivated the background-warming design), and the consequence amplifies a single blip into a ~5-minute degradation across both endpoints with no self-recompute, while the README documents a recovery that does not occur. Severity is medium rather than high because the blast radius is bounded to one cache_key at a time and the state self-heals when the 300s TTL expires; it is not data loss, a security issue, or a global outage. Fixing at the queue level resolves the shared defect once instead of only re-mapping /recommend's 500."
+    },
+    {
+      "id": "f1",
+      "kind": "raw",
+      "file": "src/http_server/open_ranking.rs",
+      "line": 609,
+      "severity": "medium",
+      "confidence": 85,
+      "title": "/recommend maps a cached Failed status to HTTP 500, so a transient compute failure returns 500 for ~5 minutes despite the documented short-TTL retry",
+      "summary": "On a cache miss /recommend returns empty + a 10s retry TTL, but when the background compute fails it returns HTTP 500, and the queue keeps returning that Failed for 300s without re-enqueueing, so the documented retry never recovers.",
+      "body": "On a cache miss /recommend returns empty profiles + a 10s 'retry soon' TTL (src/http_server/open_ranking.rs:608) and README.md:51 tells clients to retry after the TTL. But when the background compute fails, the handler maps `RecommendationStatus::Failed` to `OpenRankingError::Internal` -> HTTP 500 (src/http_server/open_ranking.rs:609-611). Because the queue caches that Failed for 300s and returns it on every subsequent request without re-enqueueing (src/recommendation_queue.rs:97, src/recommendation_queue.rs:232), the 10s-retry advice never recovers: /recommend returns 500 for the full status TTL. Handler-local symptom of the queue-lifecycle root cause.",
+      "worker_instruction": "Covered by the queue-lifecycle root-cause fix in src/recommendation_queue.rs. No separate handler-only change is needed beyond what that fix specifies (if a Failed can still reach the handler, map it to the empty + RECOMMEND_WARMING_TTL_SECONDS warming response instead of HTTP 500).",
+      "reviewer_check": "Verify /recommend no longer returns a sustained HTTP 500 after a single transient background-compute failure; covered by the root-cause reviewer check.",
+      "trigger_path": "POST /recommend for a cold pov -> background compute fails once -> queue caches Failed for 300s -> client retries after the 10s TTL -> handler returns the cached Failed as HTTP 500 (open_ranking.rs:609-611) for up to 300s.",
+      "required_conditions": [
+        "Repo::get_recommendations returns Err once for the pov",
+        "client retries within the 300s status-cache TTL using the same cache_key"
+      ],
+      "likelihood": "likely",
+      "impact": "medium",
+      "speculation_level": "confirmed",
+      "importance_rationale": "Handler-local symptom of the queue-lifecycle root cause; retained as supporting evidence for the architecture fix rather than as a separate worker todo."
+    }
+  ],
+  "completeness": [
+    "ORE-01 capability document + /.well-known/open-ranking discovery: addressed (served from the CORS-layered group alongside the endpoints; CORS-header regression test in router.rs)",
+    "ORE-02 /rank: addressed (a rank for every requested pubkey incl. unknown=0, 413 over 1000, 422 empty/bad-limit/bad-algo, 400 malformed JSON, dedup, sort desc, clamp to limit; unit-tested)",
+    "ORE-06 /reputation: addressed (pagerank as rank, stats followers/follows, is_trusted in x; unknown pubkey omits stats/x; unit-tested)",
+    "ORE-04 /followers: addressed (top followers by pagerank; total counted from FOLLOWS edges; total=Some(0) for a known user with no followers vs None for an unknown user; Neo4j integration tests)",
+    "ORE-03 /recommend happy/validation paths: addressed (for-you requires pov, similarity mapped to rank, cap of 10 enforced)",
+    "Human feedback (warm the cold-compute path so /recommend never blocks on the heavy query under the route timeout): addressed — /recommend now enqueues a background warm-up via the shared RecommendationQueue and returns empty + short TTL on a miss",
+    "Residual gap: the background-warming transient-failure path is incorrect — a cached Failed status wedges /recommend with HTTP 500 for the 300s status TTL and contradicts the documented retry-after-ttl; the /recommend Failed path is untested (see findings a1/f1)"
+  ],
+  "posture_outputs": [
+    {"agent": "hub-review-input", "status": "ok", "output": "[]"},
+    {"agent": "hub-review-flow", "status": "ok", "output": "[{\"file\":\"src/http_server/open_ranking.rs\",\"line\":609,\"severity\":\"high\",\"confidence\":85,\"title\":\"/recommend returns HTTP 500 for ~5 minutes after a single transient background-compute failure; documented short-TTL retry does not recover and no re-compute is attempted\",\"trigger_path\":\"cold /recommend -> background heavy Jaccard get_recommendations -> transient Neo4j failure -> Failed cached 300s -> subsequent /recommend returns cached Failed -> 500 for up to 5 min, no re-compute\",\"required_conditions\":[\"get_recommendations Err once\",\"retry within 300s status TTL, same cache_key\"],\"likelihood\":\"likely\",\"impact\":\"per-pov /recommend (and shared /api/v1 key) 500 for ~5 min; documented retry does not recover\",\"speculation_level\":\"inferred\",\"importance_rationale\":\"heavy graph queries fail transiently in production; sticky 5-min Failed->500 with no re-enqueue turns a one-off blip into a multi-minute outage and contradicts the README/handler retry contract\"}]"},
+    {"agent": "hub-review-boundary", "status": "ok", "output": "[]"}
+  ]
+}

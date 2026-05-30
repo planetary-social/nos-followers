@@ -109,9 +109,9 @@ impl FolloweeNotificationFactory {
     pub fn should_delete(&mut self) -> bool {
         // If it has been empty for a day, it's ok to delete
         self.follow_changes.is_empty()
-            && self.emptied_at.is_none_or(|emptied_at| {
-                Instant::now().duration_since(emptied_at) >= ONE_DAY
-            })
+            && self
+                .emptied_at
+                .is_none_or(|emptied_at| Instant::now().duration_since(emptied_at) >= ONE_DAY)
     }
 
     pub fn no_followers(&self) -> bool {
@@ -171,20 +171,14 @@ impl FolloweeNotificationFactory {
         }
 
         // Check if we need to remove any follow changes
-        let to_remove = self
-            .follow_changes
-            .len()
-            .saturating_sub(self.max_changes);
+        let to_remove = self.follow_changes.len().saturating_sub(self.max_changes);
         if to_remove > 0 {
             // First, remove all untrusted follow changes by retaining only trusted ones
             self.follow_changes
                 .retain(|_, follow_change| follow_change.is_trusted());
 
             // If we still need to remove more to stay under the limit, drain from the beginning (oldest entries)
-            let remaining_to_remove = self
-                .follow_changes
-                .len()
-                .saturating_sub(self.max_changes);
+            let remaining_to_remove = self.follow_changes.len().saturating_sub(self.max_changes);
             if remaining_to_remove > 0 {
                 // OrderMap preserves insertion order, so the first items are the oldest
                 self.follow_changes.drain(0..remaining_to_remove);

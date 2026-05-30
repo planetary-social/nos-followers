@@ -4,6 +4,7 @@ use core::panic;
 use neo4rs::{query, Graph};
 use nostr_sdk::prelude::PublicKey;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -16,6 +17,12 @@ impl Repo {
         Self { graph }
     }
 }
+
+/// A page of a pubkey's top followers ranked by PageRank (descending), paired
+/// with the total number of follower edges for that user. The total is `Some`
+/// for any known user (including `Some(0)` when they have no followers) and is
+/// `None` only when the user is unknown to the provider.
+pub type TopFollowers = (Vec<(PublicKey, f64)>, Option<u64>);
 
 // Default trait raises not implemented just to ease testing
 pub trait RepoTrait: Sync + Send + 'static {
@@ -106,6 +113,28 @@ pub trait RepoTrait: Sync + Send + 'static {
         _min_pagerank: Option<f64>,
         _limit: Option<usize>,
     ) -> impl std::future::Future<Output = Result<Vec<Recommendation>, RepoError>> + std::marker::Send
+    {
+        async { panic!("Not implemented") }
+    }
+
+    /// Fetch the stored PageRank for each of the given pubkeys. Pubkeys absent
+    /// from the result are unknown to the provider and should be treated as 0.
+    fn get_pageranks(
+        &self,
+        _pubkeys: &[PublicKey],
+    ) -> impl std::future::Future<Output = Result<HashMap<PublicKey, f64>, RepoError>> + std::marker::Send
+    {
+        async { panic!("Not implemented") }
+    }
+
+    /// Fetch up to `limit` of a pubkey's followers ranked by PageRank desc, plus
+    /// the total number of follower edges (counted from the graph, so a known
+    /// user always reports `Some`; `None` only when the user is unknown).
+    fn get_top_followers(
+        &self,
+        _pubkey: &PublicKey,
+        _limit: usize,
+    ) -> impl std::future::Future<Output = Result<TopFollowers, RepoError>> + std::marker::Send
     {
         async { panic!("Not implemented") }
     }
@@ -570,6 +599,108 @@ impl RepoTrait for Repo {
         Ok(recommendations)
     }
 
+    async fn get_pageranks(
+        &self,
+        pubkeys: &[PublicKey],
+    ) -> Result<HashMap<PublicKey, f64>, RepoError> {
+        if pubkeys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let statement = r#"
+            UNWIND $pubkeys AS pubkey
+            MATCH (user:User {pubkey: pubkey})
+            WHERE user.pagerank IS NOT NULL
+            RETURN user.pubkey AS pubkey, user.pagerank AS pagerank
+        "#;
+
+        let pubkeys_hex: Vec<String> = pubkeys.iter().map(PublicKey::to_hex).collect();
+        let query = query(statement).param("pubkeys", pubkeys_hex);
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::GetPageRank)?;
+
+        let mut pageranks = HashMap::new();
+        while let Ok(Some(row)) = records.next().await {
+            let pubkey = row.get::<String>("pubkey").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'pubkey' field")
+            })?;
+            let pagerank = row.get::<f64>("pagerank").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
+            })?;
+            let pubkey = PublicKey::from_hex(&pubkey).map_err(RepoError::GetPageRankPubkey)?;
+            pageranks.insert(pubkey, pagerank);
+        }
+
+        Ok(pageranks)
+    }
+
+    async fn get_top_followers(
+        &self,
+        pubkey: &PublicKey,
+        limit: usize,
+    ) -> Result<TopFollowers, RepoError> {
+        // Count `total` from the matched FOLLOWS edges rather than the cached
+        // `follower_count` property: that counter is null for users first seen
+        // as a follower (upsert_follow only increments a non-null counter), which
+        // would otherwise make a known user with real followers report total =
+        // None. Grouping by `target` keeps an unknown user at zero rows (total
+        // stays None), while a known user with no followers still yields one row
+        // carrying total = 0 (its follower_pubkey is null and skipped below).
+        let statement = r#"
+            MATCH (target:User {pubkey: $pubkey})
+            OPTIONAL MATCH (follower:User)-[:FOLLOWS]->(target)
+            WITH target, follower
+            ORDER BY coalesce(follower.pagerank, 0.0) DESC
+            WITH target,
+                 count(follower) AS total,
+                 collect(follower)[..$limit] AS top_followers
+            UNWIND (CASE WHEN size(top_followers) = 0 THEN [null] ELSE top_followers END) AS follower
+            RETURN total,
+                   follower.pubkey AS follower_pubkey,
+                   coalesce(follower.pagerank, 0.0) AS pagerank
+        "#;
+
+        let query = query(statement)
+            .param("pubkey", pubkey.to_hex())
+            .param("limit", limit as i64);
+
+        let mut records = self
+            .graph
+            .execute(query)
+            .await
+            .map_err(RepoError::GetTopFollowers)?;
+
+        let mut followers = Vec::new();
+        let mut total: Option<u64> = None;
+        while let Ok(Some(row)) = records.next().await {
+            if total.is_none() {
+                total = row.get::<Option<u64>>("total").map_err(|e| {
+                    RepoError::deserialization_with_context(e, "deserializing 'total' field")
+                })?;
+            }
+
+            let follower_pubkey = row.get::<Option<String>>("follower_pubkey").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'follower_pubkey' field")
+            })?;
+            let Some(follower_pubkey) = follower_pubkey else {
+                continue;
+            };
+
+            let pagerank = row.get::<f64>("pagerank").map_err(|e| {
+                RepoError::deserialization_with_context(e, "deserializing 'pagerank' field")
+            })?;
+            let follower_pubkey =
+                PublicKey::from_hex(&follower_pubkey).map_err(RepoError::GetTopFollowersPubkey)?;
+            followers.push((follower_pubkey, pagerank));
+        }
+
+        Ok((followers, total))
+    }
+
     async fn get_account_info(
         &self,
         public_key: &PublicKey,
@@ -758,6 +889,15 @@ pub enum RepoError {
     #[error("Failed to get pagerank: {0}")]
     GetPageRank(neo4rs::Error),
 
+    #[error("Failed to parse pubkey from pagerank query: {0}")]
+    GetPageRankPubkey(nostr_sdk::key::Error),
+
+    #[error("Failed to get top followers: {0}")]
+    GetTopFollowers(neo4rs::Error),
+
+    #[error("Failed to parse pubkey from top followers query: {0}")]
+    GetTopFollowersPubkey(nostr_sdk::key::Error),
+
     #[error("Failed to remove pubkey: {0}")]
     RemovePubkey(neo4rs::Error),
 
@@ -794,4 +934,184 @@ pub struct Recommendation {
     pub similarity: f64,
     pub pagerank: f64,
     pub reason_type: RecommendationReason,
+}
+
+/// Integration tests for the raw Cypher of the OpenRanking repo queries
+/// (`get_top_followers`, `get_pageranks`). They need a live Neo4j and are
+/// excluded from CI (which runs `--features ci`); run them locally against the
+/// `db` service in `compose.yaml` (`docker compose up -d db`). Override the
+/// connection with `TEST_NEO4J_URI` / `TEST_NEO4J_USER` / `TEST_NEO4J_PASSWORD`.
+#[cfg(all(test, not(feature = "ci")))]
+mod integration_tests {
+    use super::*;
+    use nostr_sdk::Keys;
+
+    async fn test_graph() -> Graph {
+        let uri = std::env::var("TEST_NEO4J_URI").unwrap_or_else(|_| "127.0.0.1:7687".to_string());
+        let user = std::env::var("TEST_NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
+        let password =
+            std::env::var("TEST_NEO4J_PASSWORD").unwrap_or_else(|_| "password".to_string());
+        Graph::new(&uri, &user, &password)
+            .await
+            .expect("connect to a test Neo4j (try `docker compose up -d db`)")
+    }
+
+    fn fresh_pubkey() -> PublicKey {
+        Keys::generate().public_key()
+    }
+
+    /// Create a FOLLOWS edge without touching `follower_count`, reproducing a
+    /// followee first seen as a follower (its cached counter stays null).
+    async fn seed_follow(graph: &Graph, follower: &PublicKey, followee: &PublicKey, pagerank: f64) {
+        let statement = r#"
+            MERGE (followee:User {pubkey: $followee})
+            MERGE (follower:User {pubkey: $follower})
+            SET follower.pagerank = $pagerank
+            MERGE (follower)-[:FOLLOWS]->(followee)
+        "#;
+        graph
+            .run(
+                query(statement)
+                    .param("followee", followee.to_hex())
+                    .param("follower", follower.to_hex())
+                    .param("pagerank", pagerank),
+            )
+            .await
+            .expect("seed follow edge");
+    }
+
+    async fn seed_user(graph: &Graph, pubkey: &PublicKey) {
+        graph
+            .run(query("MERGE (u:User {pubkey: $pubkey})").param("pubkey", pubkey.to_hex()))
+            .await
+            .expect("seed user");
+    }
+
+    async fn seed_user_with_pagerank(graph: &Graph, pubkey: &PublicKey, pagerank: f64) {
+        graph
+            .run(
+                query("MERGE (u:User {pubkey: $pubkey}) SET u.pagerank = $pagerank")
+                    .param("pubkey", pubkey.to_hex())
+                    .param("pagerank", pagerank),
+            )
+            .await
+            .expect("seed user with pagerank");
+    }
+
+    #[tokio::test]
+    async fn get_top_followers_counts_real_edges_when_follower_count_is_null() {
+        let graph = test_graph().await;
+        let target = fresh_pubkey();
+        let high = fresh_pubkey();
+        let low = fresh_pubkey();
+        seed_follow(&graph, &high, &target, 0.9).await;
+        seed_follow(&graph, &low, &target, 0.5).await;
+        let repo = Repo::new(graph);
+
+        let (followers, total) = repo
+            .get_top_followers(&target, 10)
+            .await
+            .expect("query succeeds");
+
+        assert_eq!(
+            total,
+            Some(2),
+            "total counts matched FOLLOWS edges, not the (null) cached follower_count"
+        );
+        let pubkeys: Vec<String> = followers.iter().map(|(p, _)| p.to_hex()).collect();
+        assert_eq!(
+            pubkeys,
+            vec![high.to_hex(), low.to_hex()],
+            "followers ranked by pagerank desc"
+        );
+        assert_eq!(followers[0].1, 0.9);
+    }
+
+    #[tokio::test]
+    async fn get_top_followers_reports_zero_total_for_known_user_without_followers() {
+        let graph = test_graph().await;
+        let target = fresh_pubkey();
+        seed_user(&graph, &target).await;
+        let repo = Repo::new(graph);
+
+        let (followers, total) = repo
+            .get_top_followers(&target, 10)
+            .await
+            .expect("query succeeds");
+
+        assert!(followers.is_empty());
+        assert_eq!(
+            total,
+            Some(0),
+            "a known user with no followers reports 0, not unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_top_followers_reports_no_total_for_unknown_user() {
+        let graph = test_graph().await;
+        let unknown = fresh_pubkey();
+        let repo = Repo::new(graph);
+
+        let (followers, total) = repo
+            .get_top_followers(&unknown, 10)
+            .await
+            .expect("query succeeds");
+
+        assert!(followers.is_empty());
+        assert_eq!(total, None, "an unknown user reports no total");
+    }
+
+    #[tokio::test]
+    async fn get_top_followers_honours_limit_but_total_reflects_all_edges() {
+        let graph = test_graph().await;
+        let target = fresh_pubkey();
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let c = fresh_pubkey();
+        seed_follow(&graph, &a, &target, 0.9).await;
+        seed_follow(&graph, &b, &target, 0.5).await;
+        seed_follow(&graph, &c, &target, 0.2).await;
+        let repo = Repo::new(graph);
+
+        let (followers, total) = repo
+            .get_top_followers(&target, 2)
+            .await
+            .expect("query succeeds");
+
+        assert_eq!(followers.len(), 2, "page respects the limit");
+        assert_eq!(total, Some(3), "total reflects every follower edge");
+        let pubkeys: Vec<String> = followers.iter().map(|(p, _)| p.to_hex()).collect();
+        assert_eq!(
+            pubkeys,
+            vec![a.to_hex(), b.to_hex()],
+            "the page keeps the top followers by pagerank desc"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_pageranks_returns_known_and_omits_null_and_unknown() {
+        let graph = test_graph().await;
+        let with_rank = fresh_pubkey();
+        let null_rank = fresh_pubkey();
+        let unknown = fresh_pubkey();
+        seed_user_with_pagerank(&graph, &with_rank, 0.7).await;
+        seed_user(&graph, &null_rank).await;
+        let repo = Repo::new(graph);
+
+        let ranks = repo
+            .get_pageranks(&[with_rank, null_rank, unknown])
+            .await
+            .expect("query succeeds");
+
+        assert_eq!(ranks.get(&with_rank).copied(), Some(0.7));
+        assert!(
+            !ranks.contains_key(&null_rank),
+            "a null pagerank is omitted (the caller coalesces it to 0)"
+        );
+        assert!(
+            !ranks.contains_key(&unknown),
+            "an unknown pubkey is omitted"
+        );
+    }
 }

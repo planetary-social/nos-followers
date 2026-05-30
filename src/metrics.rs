@@ -69,6 +69,14 @@ pub fn pagerank_seconds() -> Gauge {
     metrics::gauge!("pagerank_seconds")
 }
 
+pub fn recommend_cold_miss() -> Counter {
+    metrics::counter!("recommend_cold_miss")
+}
+
+pub fn recommend_warm_seconds() -> Histogram {
+    metrics::histogram!("recommend_warm_seconds")
+}
+
 pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
     describe_counter!(
         "pubsub_messages",
@@ -118,6 +126,15 @@ pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
         "Number of retained follow changes"
     );
     describe_gauge!("pagerank_seconds", "Seconds it takes to calculate pagerank");
+
+    describe_counter!(
+        "recommend_cold_miss",
+        "Number of /recommend responses served from the cold-miss warming path (empty result, short TTL)"
+    );
+    describe_histogram!(
+        "recommend_warm_seconds",
+        "Seconds a background recommendation warm-up compute takes"
+    );
 
     let prometheus_builder = PrometheusBuilder::new();
     let prometheus_handle = prometheus_builder.install_recorder()?;

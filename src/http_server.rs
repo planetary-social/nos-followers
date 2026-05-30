@@ -1,11 +1,10 @@
 mod handlers;
+mod open_ranking;
 mod router;
 mod trust_policy;
 
 use crate::{
-    config::Settings,
-    recommendation_queue::RecommendationQueue,
-    relay_subscriber::GetEventsOf,
+    config::Settings, recommendation_queue::RecommendationQueue, relay_subscriber::GetEventsOf,
     repo::RepoTrait,
 };
 use anyhow::{Context, Result};

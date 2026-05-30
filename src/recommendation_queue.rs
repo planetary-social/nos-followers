@@ -4,7 +4,7 @@ use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -25,6 +25,17 @@ pub struct RecommendationRequest {
     pub min_pagerank: Option<f64>,
     pub limit: Option<usize>,
     pub cache_key: String,
+}
+
+/// Cache key for a recommendation request. Shared by the async queue and the
+/// synchronous `/recommend` path so a result computed by either serves the other.
+fn cache_key_for(pubkey: &PublicKey, min_pagerank: Option<f64>, limit: Option<usize>) -> String {
+    format!(
+        "{}:{}:{}",
+        pubkey.to_hex(),
+        min_pagerank.unwrap_or(0.3),
+        limit.unwrap_or(10)
+    )
 }
 
 pub struct RecommendationQueue<T>
@@ -75,21 +86,21 @@ where
         min_pagerank: Option<f64>,
         limit: Option<usize>,
     ) -> Result<RecommendationStatus, String> {
-        let cache_key = format!(
-            "{}:{}:{}",
-            pubkey.to_hex(),
-            min_pagerank.unwrap_or(0.3),
-            limit.unwrap_or(10)
-        );
+        let cache_key = cache_key_for(&pubkey, min_pagerank, limit);
 
         // Check if we already have a result
         if let Some(recommendations) = self.result_cache.get(&cache_key).await {
             return Ok(RecommendationStatus::Completed(recommendations));
         }
 
-        // Check if there's already a pending request
+        // Join an in-flight request, but treat a cached Failed as a miss. A
+        // failure leaves no work running, so short-circuiting on it would wedge
+        // every retry on a stale, terminal Failed and never recompute; fall
+        // through instead to re-enqueue a fresh background warm-up.
         if let Some(status) = self.status_cache.get(&cache_key).await {
-            return Ok(status);
+            if !matches!(status, RecommendationStatus::Failed(_)) {
+                return Ok(status);
+            }
         }
 
         // Check if queue is full
@@ -195,11 +206,17 @@ where
                         );
 
                         // Calculate recommendations
+                        let started = Instant::now();
                         match repo
                             .get_recommendations(&request.pubkey, request.min_pagerank, request.limit)
                             .await
                         {
                             Ok(recommendations) => {
+                                // Record how long the warm-up compute took so
+                                // operators can watch warm latency.
+                                crate::metrics::recommend_warm_seconds()
+                                    .record(started.elapsed().as_secs_f64());
+
                                 info!(
                                     "Completed recommendation calculation for {}: {} results",
                                     request.pubkey.to_hex(),
