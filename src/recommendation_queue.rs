@@ -93,9 +93,14 @@ where
             return Ok(RecommendationStatus::Completed(recommendations));
         }
 
-        // Check if there's already a pending request
+        // Join an in-flight request, but treat a cached Failed as a miss. A
+        // failure leaves no work running, so short-circuiting on it would wedge
+        // every retry on a stale, terminal Failed and never recompute; fall
+        // through instead to re-enqueue a fresh background warm-up.
         if let Some(status) = self.status_cache.get(&cache_key).await {
-            return Ok(status);
+            if !matches!(status, RecommendationStatus::Failed(_)) {
+                return Ok(status);
+            }
         }
 
         // Check if queue is full

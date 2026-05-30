@@ -607,8 +607,13 @@ pub(crate) async fn recommend<T: RepoTrait>(
         | RecommendationStatus::Processing
         | RecommendationStatus::QueueFull => (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS),
         RecommendationStatus::Failed(reason) => {
-            error!("/recommend background computation failed: {reason}");
-            return Err(OpenRankingError::Internal);
+            // The queue self-heals (request_recommendations re-enqueues on a
+            // cached Failed), so a Failed reaching here is a transient blip: log
+            // it, then return the same empty + short-TTL warming response as the
+            // other in-flight states so the client retries per the
+            // retry-after-ttl contract instead of receiving a sustained 500.
+            error!("/recommend background computation failed, will retry: {reason}");
+            (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS)
         }
     };
 
@@ -700,6 +705,9 @@ mod tests {
         recommendations: HashMap<PublicKey, Vec<Recommendation>>,
         /// Counts calls to `get_recommendations`, to assert cache reuse.
         recommendation_calls: Arc<AtomicUsize>,
+        /// Number of leading `get_recommendations` calls that fail transiently
+        /// before recovering, to exercise the queue's self-healing Failed path.
+        recommendation_failures: Arc<AtomicUsize>,
         fail: bool,
     }
 
@@ -753,6 +761,12 @@ mod tests {
             self.recommendation_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
+            }
+            // A bounded run of transient failures that then recover, so a test
+            // can drive the queue Failed path and assert it self-heals.
+            if self.recommendation_failures.load(Ordering::Relaxed) > 0 {
+                self.recommendation_failures.fetch_sub(1, Ordering::Relaxed);
+                return Err(RepoError::InvalidParameter("transient boom".into()));
             }
             let recommendations = self
                 .recommendations
@@ -1232,6 +1246,41 @@ mod tests {
             calls.load(Ordering::Relaxed),
             1,
             "the heavy query ran exactly once, in the background"
+        );
+    }
+
+    #[tokio::test]
+    async fn recommend_recovers_from_a_transient_failure_instead_of_wedging_on_a_500() {
+        // A transient compute failure caches a Failed status. The queue must
+        // treat that Failed as a miss and re-enqueue on the next request, so a
+        // retry recomputes and warms the cache. Before the fix, the cached
+        // Failed short-circuited every retry into a sustained HTTP 500 until the
+        // status TTL expired, and /recommend never warmed.
+        let pov = fresh_pubkey();
+        let repo = MockRepo {
+            recommendations: HashMap::from([(pov, vec![recommendation(fresh_pubkey(), 0.8)])]),
+            // The first background compute fails, then recovers.
+            recommendation_failures: Arc::new(AtomicUsize::new(1)),
+            ..Default::default()
+        };
+        let queue = recommendation_queue(repo);
+
+        // Even while the compute is failing, the warming response is an empty
+        // result, never a 500.
+        let first = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+            .await
+            .expect("a transient failure yields the warming response, not a 500");
+        assert!(
+            first.profiles.is_empty(),
+            "the warming response carries no profiles"
+        );
+
+        // Retries re-enqueue and the recovered compute warms the cache.
+        let warmed = recommend_until_warm(&queue, &pov, None).await;
+        assert_eq!(
+            warmed.profiles.len(),
+            1,
+            "the recommendation warmed after the transient failure recovered"
         );
     }
 
