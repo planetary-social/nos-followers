@@ -81,6 +81,10 @@ pub fn recommendation_queue_depth() -> Gauge {
     metrics::gauge!("recommendation_queue_depth")
 }
 
+pub fn relay_subscription_up() -> Gauge {
+    metrics::gauge!("relay_subscription_up")
+}
+
 pub fn recommend_queue_full() -> Counter {
     metrics::counter!("recommend_queue_full")
 }
@@ -154,6 +158,10 @@ pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
     describe_gauge!(
         "recommendation_queue_depth",
         "Number of recommendation warm-ups currently queued"
+    );
+    describe_gauge!(
+        "relay_subscription_up",
+        "1 while the nostr relay subscription is connected and pumping events, 0 while it is down or retrying"
     );
     describe_counter!(
         "recommend_queue_full",

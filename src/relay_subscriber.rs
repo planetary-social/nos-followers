@@ -48,6 +48,11 @@ pub fn start_nostr_subscription(
     cancellation_token: CancellationToken,
 ) {
     task_tracker.spawn(async move {
+        // Publish the liveness series up front (not yet subscribed) so the gauge
+        // is present on /metrics from startup — a never-coming-up subscription is
+        // then alertable as `relay_subscription_up == 0`, not merely absent.
+        crate::metrics::relay_subscription_up().set(0.0);
+
         for relay in relays {
             info!("Connecting to relay: {}", relay);
             if let Err(e) = nostr_client.add_relay(relay.clone()).await {
@@ -112,6 +117,10 @@ async fn run_subscription(
         bail!("Failed to subscribe: {}", e);
     }
 
+    // Subscribed and about to pump notifications: the subscription is up. The
+    // retry loop drives it back to 0 when this attempt ends.
+    crate::metrics::relay_subscription_up().set(1.0);
+
     client
         .handle_notifications(|notification| async {
             if cancellation_token.is_cancelled() {
@@ -170,6 +179,12 @@ where
             // A failure must not cancel the shared token — log it and back off.
             Err(e) => error!("Relay subscription failed; retrying in {backoff:?}: {e:#}"),
         }
+
+        // The attempt has ended — the subscription is no longer up. Publish that
+        // before backing off so a persistent outage (or a dispatcher-death that
+        // keeps re-subscribing) stays observable as `relay_subscription_up == 0`
+        // on /metrics. This never cancels the shared token: the decoupling holds.
+        crate::metrics::relay_subscription_up().set(0.0);
 
         // Wait out the backoff, but wake immediately on shutdown.
         tokio::select! {
@@ -251,6 +266,79 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             0,
             "an already-cancelled token must skip the attempt entirely"
+        );
+    }
+
+    /// Render the metrics a closure emits against a test-local Prometheus
+    /// recorder, so a test can assert the relay-liveness gauge without touching
+    /// global metric state or racing other tests.
+    fn render_relay_metrics<F, Fut>(body: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime")
+                .block_on(body());
+        });
+        handle.render()
+    }
+
+    /// A failed attempt must drive `relay_subscription_up` to 0 before backing
+    /// off, so a persistent relay outage stays observable on /metrics even though
+    /// it no longer cancels the shared token (the decoupling must stay silent in
+    /// every other respect).
+    #[test]
+    fn a_failed_attempt_marks_the_subscription_down() {
+        let rendered = render_relay_metrics(|| async {
+            // Pretend the subscription had come up, then let one attempt fail.
+            crate::metrics::relay_subscription_up().set(1.0);
+            let token = CancellationToken::new();
+            let attempt_token = token.clone();
+            retry_until_cancelled(token.clone(), move || {
+                let attempt_token = attempt_token.clone();
+                async move {
+                    // Stop the loop after this single failed attempt.
+                    attempt_token.cancel();
+                    bail!("relay unavailable")
+                }
+            })
+            .await;
+        });
+
+        assert!(
+            rendered.contains("relay_subscription_up 0"),
+            "a failed attempt must mark the subscription down; got:\n{rendered}"
+        );
+    }
+
+    /// A clean return (the relay closed the stream, or no receivers remain) must
+    /// also drive the gauge to 0 before re-looping, so a dispatcher-death that
+    /// keeps re-subscribing is held at 0 and stays alertable.
+    #[test]
+    fn a_clean_return_marks_the_subscription_down() {
+        let rendered = render_relay_metrics(|| async {
+            crate::metrics::relay_subscription_up().set(1.0);
+            let token = CancellationToken::new();
+            let attempt_token = token.clone();
+            retry_until_cancelled(token.clone(), move || {
+                let attempt_token = attempt_token.clone();
+                async move {
+                    attempt_token.cancel();
+                    Ok(())
+                }
+            })
+            .await;
+        });
+
+        assert!(
+            rendered.contains("relay_subscription_up 0"),
+            "a clean return must mark the subscription down; got:\n{rendered}"
         );
     }
 }
