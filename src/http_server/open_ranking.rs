@@ -278,6 +278,30 @@ fn cached_json<T: Serialize>(body: T, ttl: Option<u64>) -> Response {
     response
 }
 
+/// Records the wall-clock latency of an open-ranking handler into the
+/// per-endpoint `openranking_request_seconds` histogram when dropped, so every
+/// exit path — success, validation error, or repo error — is measured.
+struct LatencyGuard {
+    endpoint: &'static str,
+    started: std::time::Instant,
+}
+
+impl LatencyGuard {
+    fn new(endpoint: &'static str) -> Self {
+        Self {
+            endpoint,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for LatencyGuard {
+    fn drop(&mut self) {
+        crate::metrics::openranking_request_seconds(self.endpoint)
+            .record(self.started.elapsed().as_secs_f64());
+    }
+}
+
 /// Server-side TTL for the synchronous read caches. Short by design: it only has
 /// to span a burst window, and PageRank is recomputed daily, so a minute of reuse
 /// bounds staleness well under that while still collapsing the herd.
@@ -450,6 +474,7 @@ where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(RANK_ENDPOINT);
     let request: RankRequest = parse_json_body(&body)?;
     let key = rank_cache_key(&request);
     let repo = state.repo.clone();
@@ -564,6 +589,7 @@ where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(REPUTATION_ENDPOINT);
     let request: ReputationRequest = parse_json_body(&body)?;
     let key = reputation_cache_key(&request);
     let repo = state.repo.clone();
@@ -654,6 +680,7 @@ where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(FOLLOWERS_ENDPOINT);
     let request: FollowersRequest = parse_json_body(&body)?;
     let key = followers_cache_key(&request);
     let repo = state.repo.clone();
@@ -748,7 +775,11 @@ pub(crate) async fn recommend<T: RepoTrait>(
             // other in-flight states so the client retries per the
             // retry-after-ttl contract instead of receiving a sustained 500.
             error!("/recommend background computation failed, will retry: {reason}");
-            crate::metrics::recommend_cold_miss().increment(1);
+            // Count as a failure, not a warming cold-miss, so the two are not
+            // conflated. (The worker already counts the failure when it occurs;
+            // request_recommendations self-heals a cached Failed into a re-enqueue,
+            // so this branch is rarely reached.)
+            crate::metrics::recommend_failed().increment(1);
             (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS)
         }
     };
@@ -776,6 +807,7 @@ where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(RECOMMEND_ENDPOINT);
     let request: RecommendRequest = parse_json_body(&body)?;
     let response = recommend(state.recommendation_queue.as_ref(), request).await?;
     let ttl = response.ttl;
@@ -1954,6 +1986,107 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "each request retried the repo; the failure was not cached"
+        );
+    }
+
+    // ---- observability metrics ----
+
+    #[test]
+    fn queue_depth_gauge_reflects_the_pending_count() {
+        let rendered = render_metrics_for(|| async move {
+            // No worker: nothing drains, so the gauge equals the number enqueued.
+            let result_cache = Cache::builder().build();
+            let (queue, _receiver) =
+                RecommendationQueue::new(Arc::new(MockRepo::default()), result_cache, 4096);
+            for _ in 0..3 {
+                queue
+                    .request_recommendations(fresh_pubkey(), None, Some(10))
+                    .await
+                    .expect("request accepted");
+            }
+        });
+        assert!(
+            rendered.contains("recommendation_queue_depth 3"),
+            "the queue-depth gauge must track the pending count:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn saturated_queue_emits_the_queue_full_counter() {
+        let rendered = render_metrics_for(|| async move {
+            // No worker: enqueue past max_queue_size (50) to force QueueFull.
+            let result_cache = Cache::builder().build();
+            let (queue, _receiver) =
+                RecommendationQueue::new(Arc::new(MockRepo::default()), result_cache, 4096);
+            for _ in 0..60 {
+                queue
+                    .request_recommendations(fresh_pubkey(), None, Some(10))
+                    .await
+                    .expect("request accepted");
+            }
+        });
+        assert!(
+            rendered.contains("recommend_queue_full"),
+            "shedding on a full queue must bump recommend_queue_full:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn worker_compute_failure_emits_recommend_failed() {
+        let pov = fresh_pubkey();
+        let rendered = render_metrics_for(|| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let repo = MockRepo {
+                recommendation_calls: calls.clone(),
+                // get_recommendations errors, so the background warm-up fails.
+                fail: true,
+                ..Default::default()
+            };
+            let queue = recommendation_queue(repo);
+            recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+                .await
+                .expect("the warming response is returned even while failing");
+            // Wait for the worker to attempt and fail the compute, then let its
+            // error branch (metric + status write) finish.
+            for _ in 0..1000 {
+                if calls.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        });
+        assert!(
+            rendered.contains("recommend_failed"),
+            "a failed background warm-up must bump recommend_failed:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn rank_records_the_per_endpoint_latency_histogram() {
+        let rendered = render_metrics_for(|| async move {
+            let pubkey = fresh_pubkey();
+            let repo = MockRepo {
+                pageranks: HashMap::from([(pubkey, 0.9)]),
+                ..Default::default()
+            };
+            let state = app_state(repo, idle_queue());
+            serve_rank(
+                State(state),
+                json_body(&serde_json::json!({ "pubkeys": [pubkey.to_hex()] })),
+            )
+            .await
+            .expect("rank succeeds");
+        });
+        assert!(
+            rendered.contains("openranking_request_seconds"),
+            "the endpoint must record a latency histogram:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint=\"/rank\""),
+            "the latency histogram must be labelled by endpoint:\n{rendered}"
         );
     }
 }

@@ -108,6 +108,7 @@ where
         // dedup is the single-flight entry below.
         let current_size = self.queue_size.load(Ordering::Relaxed);
         if current_size >= self.max_queue_size {
+            crate::metrics::recommend_queue_full().increment(1);
             return Ok(RecommendationStatus::QueueFull);
         }
 
@@ -140,6 +141,8 @@ where
             pending.len()
         };
         self.queue_size.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::recommendation_queue_depth()
+            .set(self.queue_size.load(Ordering::Relaxed) as f64);
 
         let pending_status = RecommendationStatus::Pending { position };
         self.status_cache
@@ -156,6 +159,8 @@ where
             // Dispatch failed: undo the reservation and clear the in-flight status
             // so a later retry re-enqueues instead of joining a phantom request.
             self.queue_size.fetch_sub(1, Ordering::Relaxed);
+            crate::metrics::recommendation_queue_depth()
+                .set(self.queue_size.load(Ordering::Relaxed) as f64);
             let mut pending = self.pending_requests.write().await;
             pending.retain(|k| k != &cache_key);
             self.status_cache.invalidate(&cache_key).await;
@@ -256,6 +261,10 @@ where
                                     e
                                 );
 
+                                // Count the failure distinctly from a warming
+                                // cold-miss so operators can tell them apart.
+                                crate::metrics::recommend_failed().increment(1);
+
                                 // Mark as failed
                                 status_cache
                                     .insert(cache_key, RecommendationStatus::Failed(e.to_string()))
@@ -265,6 +274,8 @@ where
 
                         // Update queue size
                         queue_size.fetch_sub(1, Ordering::Relaxed);
+                        crate::metrics::recommendation_queue_depth()
+                            .set(queue_size.load(Ordering::Relaxed) as f64);
                     }
                 }
             }
