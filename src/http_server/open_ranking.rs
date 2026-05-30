@@ -5,6 +5,7 @@
 //! and `/recommend` endpoints. See OREs 00-06 for the full specification.
 
 use super::AppState;
+use crate::recommendation_queue::RecommendationQueue;
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use axum::body::Bytes;
@@ -81,7 +82,7 @@ fn registry() -> Vec<(&'static str, Vec<AlgorithmSpec>)> {
             vec![AlgorithmSpec {
                 id: "for-you",
                 pov: true,
-                description: Some("Personalised follow recommendations from your social graph."),
+                description: Some("Personalised follow recommendations from your social graph; returns up to 10 profiles."),
             }],
         ),
     ]
@@ -112,10 +113,16 @@ const MAX_PUBKEYS: usize = 1000;
 /// a daily cron, so an hour is a safe "still fresh" hint for clients.
 const RANK_TTL_SECONDS: u64 = 3600;
 
-/// Default and maximum `limit` for endpoints that select their own candidates
-/// (`/followers`, `/recommend`).
+/// Default and maximum `limit` for `/followers`, which pages over its own
+/// candidate set.
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 1000;
+
+/// Default and maximum `limit` for `/recommend`. [`RepoTrait::get_recommendations`]
+/// caps results at 10 (the Jaccard-similarity query is expensive), so the
+/// endpoint advertises and enforces the same maximum rather than silently
+/// truncating larger requests.
+const RECOMMEND_MAX_LIMIT: usize = 10;
 
 /// An ORE-02 Profile: a ranked Nostr identity. Higher `rank` is always better.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -461,15 +468,19 @@ pub(crate) struct FollowersRequest {
     pub limit: Option<i64>,
 }
 
-/// Validate an optional `limit`, applying the provider default and maximum.
-fn resolve_limit(limit: Option<i64>, default: usize) -> Result<usize, OpenRankingError> {
+/// Validate an optional `limit`, applying the given default and maximum.
+fn resolve_limit(
+    limit: Option<i64>,
+    default: usize,
+    max: usize,
+) -> Result<usize, OpenRankingError> {
     match limit {
         None => Ok(default),
         Some(limit) if limit < 1 => Err(OpenRankingError::unprocessable(
             "limit must be a positive integer",
         )),
-        Some(limit) if limit as usize > MAX_LIMIT => Err(OpenRankingError::unprocessable(format!(
-            "limit exceeds the maximum of {MAX_LIMIT}"
+        Some(limit) if limit as usize > max => Err(OpenRankingError::unprocessable(format!(
+            "limit exceeds the maximum of {max}"
         ))),
         Some(limit) => Ok(limit as usize),
     }
@@ -482,7 +493,7 @@ pub(crate) async fn followers<T: RepoTrait>(
 ) -> Result<FollowersResponse, OpenRankingError> {
     resolve_algorithm(FOLLOWERS_ENDPOINT, request.algorithm.as_deref())?;
     let pubkey = parse_required_pubkey(request.pubkey.as_deref())?;
-    let limit = resolve_limit(request.limit, DEFAULT_LIMIT)?;
+    let limit = resolve_limit(request.limit, DEFAULT_LIMIT, MAX_LIMIT)?;
 
     let (top_followers, total) = repo.get_top_followers(&pubkey, limit).await.map_err(|e| {
         error!("/followers get_top_followers failed: {e}");
@@ -532,10 +543,13 @@ pub(crate) struct RecommendRequest {
 
 /// Core `/recommend` logic (ORE-03): personalised follow recommendations.
 ///
-/// Computed synchronously via [`RepoTrait::get_recommendations`] and bounded by
-/// the HTTP route timeout, since the protocol has no pending/processing state.
+/// Served from the shared recommendation result cache, computing synchronously
+/// on a miss (the protocol has no pending/processing state, so the async queue
+/// does not fit). Repeated requests are cheap and share results with the
+/// `/api/v1/recommendations` queue; the first compute for a cold account is
+/// still bounded by the HTTP route timeout.
 pub(crate) async fn recommend<T: RepoTrait>(
-    repo: &T,
+    queue: &RecommendationQueue<T>,
     request: RecommendRequest,
 ) -> Result<RankResponse, OpenRankingError> {
     let algorithm = resolve_algorithm(RECOMMEND_ENDPOINT, request.algorithm.as_deref())?;
@@ -559,10 +573,12 @@ pub(crate) async fn recommend<T: RepoTrait>(
         }
     };
 
-    let limit = resolve_limit(request.limit, DEFAULT_LIMIT)?;
+    // `Repo::get_recommendations` caps results at RECOMMEND_MAX_LIMIT, so enforce
+    // the same maximum here instead of silently truncating larger requests.
+    let limit = resolve_limit(request.limit, RECOMMEND_MAX_LIMIT, RECOMMEND_MAX_LIMIT)?;
 
-    let recommendations = repo
-        .get_recommendations(&pov, None, Some(limit))
+    let recommendations = queue
+        .get_cached_recommendations(&pov, None, Some(limit))
         .await
         .map_err(|e| {
             error!("/recommend get_recommendations failed: {e}");
@@ -593,7 +609,7 @@ where
     U: GetEventsOf,
 {
     let request: RecommendRequest = parse_json_body(&body)?;
-    let response = recommend(state.repo.as_ref(), request).await?;
+    let response = recommend(state.recommendation_queue.as_ref(), request).await?;
     Ok(Json(response))
 }
 
@@ -605,9 +621,19 @@ mod tests {
     use axum::http::StatusCode;
     use nostr_sdk::{Keys, PublicKey};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn fresh_pubkey() -> PublicKey {
         Keys::generate().public_key()
+    }
+
+    /// Wrap a `MockRepo` in a `RecommendationQueue` with an empty result cache,
+    /// so `recommend` can read through the same cache the real endpoint uses.
+    fn recommendation_queue(repo: MockRepo) -> RecommendationQueue<MockRepo> {
+        let result_cache = moka::future::Cache::builder().build();
+        let (queue, _receiver) = RecommendationQueue::new(Arc::new(repo), result_cache, 16);
+        queue
     }
 
     /// A repo stub that knows the PageRank of a fixed set of pubkeys and, like
@@ -620,6 +646,8 @@ mod tests {
         top_followers: HashMap<PublicKey, Vec<(PublicKey, f64)>>,
         /// Recommendations per pov pubkey, sorted by similarity desc.
         recommendations: HashMap<PublicKey, Vec<Recommendation>>,
+        /// Counts calls to `get_recommendations`, to assert cache reuse.
+        recommendation_calls: Arc<AtomicUsize>,
         fail: bool,
     }
 
@@ -670,6 +698,7 @@ mod tests {
             _min_pagerank: Option<f64>,
             limit: Option<usize>,
         ) -> Result<Vec<Recommendation>, RepoError> {
+            self.recommendation_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
             }
@@ -678,7 +707,8 @@ mod tests {
                 .get(pubkey)
                 .cloned()
                 .unwrap_or_default();
-            let limit = limit.unwrap_or(recommendations.len());
+            // Mirror Repo::get_recommendations: default 10, capped at 10.
+            let limit = limit.unwrap_or(10).min(10);
             Ok(recommendations.into_iter().take(limit).collect())
         }
     }
@@ -1129,9 +1159,12 @@ mod tests {
             ..Default::default()
         };
 
-        let response = recommend(&repo, recommend_request(Some(&pov.to_hex()), None))
-            .await
-            .expect("recommend succeeds");
+        let response = recommend(
+            &recommendation_queue(repo),
+            recommend_request(Some(&pov.to_hex()), None),
+        )
+        .await
+        .expect("recommend succeeds");
 
         let pubkeys: Vec<String> = response.profiles.iter().map(|p| p.pubkey.clone()).collect();
         assert_eq!(pubkeys, vec![a.to_hex(), b.to_hex()]);
@@ -1142,7 +1175,7 @@ mod tests {
     #[tokio::test]
     async fn recommend_without_pov_is_422() {
         let repo = MockRepo::default();
-        let error = recommend(&repo, recommend_request(None, None))
+        let error = recommend(&recommendation_queue(repo), recommend_request(None, None))
             .await
             .expect_err("missing pov rejected");
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -1151,9 +1184,12 @@ mod tests {
     #[tokio::test]
     async fn recommend_invalid_pov_is_422() {
         let repo = MockRepo::default();
-        let error = recommend(&repo, recommend_request(Some("not-a-pubkey"), None))
-            .await
-            .expect_err("invalid pov rejected");
+        let error = recommend(
+            &recommendation_queue(repo),
+            recommend_request(Some("not-a-pubkey"), None),
+        )
+        .await
+        .expect_err("invalid pov rejected");
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -1172,9 +1208,12 @@ mod tests {
             ..Default::default()
         };
 
-        let response = recommend(&repo, recommend_request(Some(&pov.to_hex()), Some(1)))
-            .await
-            .expect("recommend succeeds");
+        let response = recommend(
+            &recommendation_queue(repo),
+            recommend_request(Some(&pov.to_hex()), Some(1)),
+        )
+        .await
+        .expect("recommend succeeds");
 
         assert_eq!(response.profiles.len(), 1);
     }
@@ -1183,7 +1222,7 @@ mod tests {
     async fn recommend_non_positive_limit_is_422() {
         let repo = MockRepo::default();
         let error = recommend(
-            &repo,
+            &recommendation_queue(repo),
             recommend_request(Some(&fresh_pubkey().to_hex()), Some(0)),
         )
         .await
@@ -1199,9 +1238,77 @@ mod tests {
             pov: Some(fresh_pubkey().to_hex()),
             limit: None,
         };
-        let error = recommend(&repo, request)
+        let error = recommend(&recommendation_queue(repo), request)
             .await
             .expect_err("unknown algorithm rejected");
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn recommend_rejects_limit_above_cap_with_422() {
+        // Above RECOMMEND_MAX_LIMIT must be an explicit error, not silent
+        // truncation down to the cap.
+        let repo = MockRepo::default();
+        let error = recommend(
+            &recommendation_queue(repo),
+            recommend_request(
+                Some(&fresh_pubkey().to_hex()),
+                Some(RECOMMEND_MAX_LIMIT as i64 + 1),
+            ),
+        )
+        .await
+        .expect_err("limit above the recommend cap rejected");
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn recommend_default_limit_caps_results_at_the_maximum() {
+        // More recommendations available than the cap; the default limit must
+        // return at most RECOMMEND_MAX_LIMIT, never silently more.
+        let pov = fresh_pubkey();
+        let recommendations: Vec<Recommendation> = (0..RECOMMEND_MAX_LIMIT + 5)
+            .map(|i| recommendation(fresh_pubkey(), 0.9 - i as f64 * 0.01))
+            .collect();
+        let repo = MockRepo {
+            recommendations: HashMap::from([(pov, recommendations)]),
+            ..Default::default()
+        };
+
+        let response = recommend(
+            &recommendation_queue(repo),
+            recommend_request(Some(&pov.to_hex()), None),
+        )
+        .await
+        .expect("recommend succeeds");
+
+        assert_eq!(response.profiles.len(), RECOMMEND_MAX_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn recommend_serves_repeated_requests_from_cache() {
+        // The second identical request must hit the shared result cache rather
+        // than recomputing the expensive query.
+        let pov = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            recommendations: HashMap::from([(pov, vec![recommendation(fresh_pubkey(), 0.8)])]),
+            recommendation_calls: calls.clone(),
+            ..Default::default()
+        };
+        let queue = recommendation_queue(repo);
+
+        let first = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+            .await
+            .expect("first recommend succeeds");
+        let second = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+            .await
+            .expect("second recommend succeeds");
+
+        assert_eq!(first.profiles, second.profiles, "cached result matches");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "second identical request served from the shared result cache"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use crate::repo::{Recommendation, RepoTrait};
+use crate::repo::{Recommendation, RepoError, RepoTrait};
 use moka::future::Cache;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,17 @@ pub struct RecommendationRequest {
     pub min_pagerank: Option<f64>,
     pub limit: Option<usize>,
     pub cache_key: String,
+}
+
+/// Cache key for a recommendation request. Shared by the async queue and the
+/// synchronous `/recommend` path so a result computed by either serves the other.
+fn cache_key_for(pubkey: &PublicKey, min_pagerank: Option<f64>, limit: Option<usize>) -> String {
+    format!(
+        "{}:{}:{}",
+        pubkey.to_hex(),
+        min_pagerank.unwrap_or(0.3),
+        limit.unwrap_or(10)
+    )
 }
 
 pub struct RecommendationQueue<T>
@@ -75,12 +86,7 @@ where
         min_pagerank: Option<f64>,
         limit: Option<usize>,
     ) -> Result<RecommendationStatus, String> {
-        let cache_key = format!(
-            "{}:{}:{}",
-            pubkey.to_hex(),
-            min_pagerank.unwrap_or(0.3),
-            limit.unwrap_or(10)
-        );
+        let cache_key = cache_key_for(&pubkey, min_pagerank, limit);
 
         // Check if we already have a result
         if let Some(recommendations) = self.result_cache.get(&cache_key).await {
@@ -134,6 +140,36 @@ where
         }
 
         Ok(RecommendationStatus::Pending { position })
+    }
+
+    /// Return cached recommendations for these parameters, computing and caching
+    /// them synchronously on a miss.
+    ///
+    /// The OpenRanking `/recommend` endpoint (ORE-03) has no pending/processing
+    /// state, so it cannot use the async queue above; it shares `result_cache`
+    /// with the queue through this method, so a result computed by either path
+    /// serves the other and repeated requests are cheap. The first compute for a
+    /// cold account is still synchronous and bounded by the HTTP route timeout.
+    pub async fn get_cached_recommendations(
+        &self,
+        pubkey: &PublicKey,
+        min_pagerank: Option<f64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Recommendation>, RepoError> {
+        let cache_key = cache_key_for(pubkey, min_pagerank, limit);
+
+        if let Some(recommendations) = self.result_cache.get(&cache_key).await {
+            return Ok(recommendations);
+        }
+
+        let recommendations = self
+            .repo
+            .get_recommendations(pubkey, min_pagerank, limit)
+            .await?;
+        self.result_cache
+            .insert(cache_key, recommendations.clone())
+            .await;
+        Ok(recommendations)
     }
 
     pub async fn get_status(&self, cache_key: &str) -> Option<RecommendationStatus> {
