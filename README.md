@@ -48,7 +48,7 @@ Endpoints (the default algorithm is the first listed for each):
 - `POST /rank` — rank a set of pubkeys by global PageRank. Body: `{ "pubkeys": [..], "limit"?: n }`. Returns a `rank` for every requested pubkey (unknown pubkeys rank `0`), sorted descending: `{ "profiles": [{ "pubkey", "rank" }], "ttl" }`.
 - `POST /reputation` — structured reputation for one pubkey. Body: `{ "pubkey": ".." }`. Returns `{ "pubkey", "rank" (PageRank), "stats": { "followers", "follows" }, "x": { "trusted" }, "ttl" }`.
 - `POST /followers` — a pubkey's top followers by PageRank. Body: `{ "pubkey": ".." , "limit"?: n }`. Returns `{ "profiles", "total", "ttl" }`.
-- `POST /recommend` — personalised recommendations (`for-you` requires a `pov`). Body: `{ "pov": ".." , "limit"?: n }` (`limit` defaults to 10 and may not exceed 10; larger values are rejected). Returns `{ "profiles", "ttl" }` ranked by social-graph similarity.
+- `POST /recommend` — personalised recommendations (`for-you` requires a `pov`). Body: `{ "pov": ".." , "limit"?: n }` (`limit` defaults to 10 and may not exceed 10; larger values are rejected). Returns `{ "profiles", "ttl" }` ranked by social-graph similarity. The heavy similarity query is computed in the background (shared with the `/api/v1/recommendations` queue) so the endpoint never blocks: a cold account returns an empty `profiles` with a short `ttl`; retry after the `ttl` once the result is warmed.
 
 PageRank is recomputed on a daily cron, which the `ttl` hint reflects. `/search/profiles` (ORE-05) is not implemented as we do not maintain a profile text index.
 

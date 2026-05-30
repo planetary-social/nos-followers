@@ -5,7 +5,7 @@
 //! and `/recommend` endpoints. See OREs 00-06 for the full specification.
 
 use super::AppState;
-use crate::recommendation_queue::RecommendationQueue;
+use crate::recommendation_queue::{RecommendationQueue, RecommendationStatus};
 use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use axum::body::Bytes;
@@ -123,6 +123,12 @@ const MAX_LIMIT: usize = 1000;
 /// endpoint advertises and enforces the same maximum rather than silently
 /// truncating larger requests.
 const RECOMMEND_MAX_LIMIT: usize = 10;
+
+/// TTL hint (seconds) for a `/recommend` response that is still warming: the
+/// recommendations are being computed in the background (see [`recommend`]), so
+/// this empty result is only valid briefly and the client should retry soon, by
+/// which point the shared cache is populated.
+const RECOMMEND_WARMING_TTL_SECONDS: u64 = 10;
 
 /// An ORE-02 Profile: a ranked Nostr identity. Higher `rank` is always better.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -543,11 +549,15 @@ pub(crate) struct RecommendRequest {
 
 /// Core `/recommend` logic (ORE-03): personalised follow recommendations.
 ///
-/// Served from the shared recommendation result cache, computing synchronously
-/// on a miss (the protocol has no pending/processing state, so the async queue
-/// does not fit). Repeated requests are cheap and share results with the
-/// `/api/v1/recommendations` queue; the first compute for a cold account is
-/// still bounded by the HTTP route timeout.
+/// The protocol has no pending/processing state, so `/recommend` cannot return a
+/// 202 like `/api/v1/recommendations`. Rather than block on the heavy Jaccard
+/// query under the 5s route timeout — where a cold, heavy account could time out
+/// and, because the dropped request future never reaches the cache write, leave
+/// nothing cached and wedge every retry — the compute is routed through the
+/// shared [`RecommendationQueue`]: a cache hit returns the profiles, while a miss
+/// enqueues a background warm-up (run in the worker, immune to the route timeout,
+/// writing the shared cache on completion) and returns a fast partial result
+/// (empty profiles + a short TTL) so the client retries once the cache is warm.
 pub(crate) async fn recommend<T: RepoTrait>(
     queue: &RecommendationQueue<T>,
     request: RecommendRequest,
@@ -577,13 +587,30 @@ pub(crate) async fn recommend<T: RepoTrait>(
     // the same maximum here instead of silently truncating larger requests.
     let limit = resolve_limit(request.limit, RECOMMEND_MAX_LIMIT, RECOMMEND_MAX_LIMIT)?;
 
-    let recommendations = queue
-        .get_cached_recommendations(&pov, None, Some(limit))
+    // Enqueue (or join) a background compute via the shared queue. A hit returns
+    // the cached recommendations; anything else means a warm-up is in flight, so
+    // return a fast empty result rather than blocking on the heavy query.
+    let status = queue
+        .request_recommendations(pov, None, Some(limit))
         .await
         .map_err(|e| {
-            error!("/recommend get_recommendations failed: {e}");
+            error!("/recommend request_recommendations failed: {e}");
             OpenRankingError::Internal
         })?;
+
+    let (recommendations, ttl) = match status {
+        RecommendationStatus::Completed(recommendations) => (recommendations, RANK_TTL_SECONDS),
+        // Queued (Pending), running (Processing), or the queue is saturated
+        // (QueueFull): return an empty result and let the short TTL bring the
+        // client back once the shared cache is warm.
+        RecommendationStatus::Pending { .. }
+        | RecommendationStatus::Processing
+        | RecommendationStatus::QueueFull => (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS),
+        RecommendationStatus::Failed(reason) => {
+            error!("/recommend background computation failed: {reason}");
+            return Err(OpenRankingError::Internal);
+        }
+    };
 
     let profiles = recommendations
         .into_iter()
@@ -595,7 +622,7 @@ pub(crate) async fn recommend<T: RepoTrait>(
 
     Ok(RankResponse {
         profiles,
-        ttl: Some(RANK_TTL_SECONDS),
+        ttl: Some(ttl),
     })
 }
 
@@ -623,17 +650,42 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use tokio_util::task::TaskTracker;
 
     fn fresh_pubkey() -> PublicKey {
         Keys::generate().public_key()
     }
 
-    /// Wrap a `MockRepo` in a `RecommendationQueue` with an empty result cache,
-    /// so `recommend` can read through the same cache the real endpoint uses.
+    /// Wrap a `MockRepo` in a `RecommendationQueue` with an empty result cache and
+    /// a running background worker, so `recommend` exercises the same async warm-up
+    /// path as production: a cache miss enqueues a background compute that writes
+    /// the shared result cache rather than blocking the request.
     fn recommendation_queue(repo: MockRepo) -> RecommendationQueue<MockRepo> {
         let result_cache = moka::future::Cache::builder().build();
-        let (queue, _receiver) = RecommendationQueue::new(Arc::new(repo), result_cache, 16);
+        let (queue, receiver) = RecommendationQueue::new(Arc::new(repo), result_cache, 16);
+        queue.start_worker(TaskTracker::new(), receiver, CancellationToken::new());
         queue
+    }
+
+    /// Poll `/recommend` until the background worker has warmed the shared cache
+    /// and the endpoint returns a non-empty result. Used by the happy-path tests,
+    /// whose povs always have recommendations to compute.
+    async fn recommend_until_warm(
+        queue: &RecommendationQueue<MockRepo>,
+        pov: &PublicKey,
+        limit: Option<i64>,
+    ) -> RankResponse {
+        for _ in 0..1000 {
+            let response = recommend(queue, recommend_request(Some(&pov.to_hex()), limit))
+                .await
+                .expect("recommend succeeds");
+            if !response.profiles.is_empty() {
+                return response;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("background warm-up never populated the recommendation cache");
     }
 
     /// A repo stub that knows the PageRank of a fixed set of pubkeys and, like
@@ -1147,6 +1199,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recommend_does_not_block_on_a_cold_miss_and_warms_in_the_background() {
+        // A cold cache miss must NOT block on the heavy compute under the route
+        // timeout (which, on timeout, would also drop the result and cache
+        // nothing, wedging every retry). The first request returns immediately
+        // with a fast empty result; the background worker then warms the shared
+        // cache so a later request is served.
+        let pov = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            recommendations: HashMap::from([(pov, vec![recommendation(fresh_pubkey(), 0.8)])]),
+            recommendation_calls: calls.clone(),
+            ..Default::default()
+        };
+        let queue = recommendation_queue(repo);
+
+        let first = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+            .await
+            .expect("recommend succeeds");
+        assert!(
+            first.profiles.is_empty(),
+            "a cold miss returns a fast empty result instead of blocking on the compute"
+        );
+
+        let warmed = recommend_until_warm(&queue, &pov, None).await;
+        assert_eq!(
+            warmed.profiles.len(),
+            1,
+            "the background warm-up produced the recommendation"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the heavy query ran exactly once, in the background"
+        );
+    }
+
+    #[tokio::test]
     async fn recommend_maps_recommendations_to_profiles_ranked_by_similarity() {
         let pov = fresh_pubkey();
         let a = fresh_pubkey();
@@ -1159,12 +1248,8 @@ mod tests {
             ..Default::default()
         };
 
-        let response = recommend(
-            &recommendation_queue(repo),
-            recommend_request(Some(&pov.to_hex()), None),
-        )
-        .await
-        .expect("recommend succeeds");
+        let queue = recommendation_queue(repo);
+        let response = recommend_until_warm(&queue, &pov, None).await;
 
         let pubkeys: Vec<String> = response.profiles.iter().map(|p| p.pubkey.clone()).collect();
         assert_eq!(pubkeys, vec![a.to_hex(), b.to_hex()]);
@@ -1208,12 +1293,8 @@ mod tests {
             ..Default::default()
         };
 
-        let response = recommend(
-            &recommendation_queue(repo),
-            recommend_request(Some(&pov.to_hex()), Some(1)),
-        )
-        .await
-        .expect("recommend succeeds");
+        let queue = recommendation_queue(repo);
+        let response = recommend_until_warm(&queue, &pov, Some(1)).await;
 
         assert_eq!(response.profiles.len(), 1);
     }
@@ -1274,19 +1355,15 @@ mod tests {
             ..Default::default()
         };
 
-        let response = recommend(
-            &recommendation_queue(repo),
-            recommend_request(Some(&pov.to_hex()), None),
-        )
-        .await
-        .expect("recommend succeeds");
+        let queue = recommendation_queue(repo);
+        let response = recommend_until_warm(&queue, &pov, None).await;
 
         assert_eq!(response.profiles.len(), RECOMMEND_MAX_LIMIT);
     }
 
     #[tokio::test]
     async fn recommend_serves_repeated_requests_from_cache() {
-        // The second identical request must hit the shared result cache rather
+        // Once warmed, an identical request hits the shared result cache rather
         // than recomputing the expensive query.
         let pov = fresh_pubkey();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1297,18 +1374,16 @@ mod tests {
         };
         let queue = recommendation_queue(repo);
 
-        let first = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
-            .await
-            .expect("first recommend succeeds");
-        let second = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+        let warmed = recommend_until_warm(&queue, &pov, None).await;
+        let again = recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
             .await
             .expect("second recommend succeeds");
 
-        assert_eq!(first.profiles, second.profiles, "cached result matches");
+        assert_eq!(warmed.profiles, again.profiles, "cached result matches");
         assert_eq!(
             calls.load(Ordering::Relaxed),
             1,
-            "second identical request served from the shared result cache"
+            "the heavy query ran once; repeats hit the shared result cache"
         );
     }
 }
