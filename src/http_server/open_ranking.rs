@@ -10,7 +10,7 @@ use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header::CACHE_CONTROL, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nostr_sdk::PublicKey;
@@ -102,8 +102,10 @@ pub(crate) fn capability_document() -> serde_json::Value {
 }
 
 /// `GET /.well-known/open-ranking` (ORE-01). Always 200 with `application/json`.
-pub(crate) async fn serve_capability_document() -> impl IntoResponse {
-    axum::Json(capability_document())
+/// The discovery document is near-static config, so it carries the same hourly
+/// cache hint as the PageRank endpoints it advertises.
+pub(crate) async fn serve_capability_document() -> Response {
+    cached_json(capability_document(), Some(RANK_TTL_SECONDS))
 }
 
 /// Maximum number of pubkeys accepted by `/rank` in a single request (ORE-02).
@@ -258,6 +260,22 @@ fn parse_json_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Ope
         .map_err(|e| OpenRankingError::malformed_body(format!("invalid JSON body: {e}")))
 }
 
+/// Build a JSON success response that mirrors the ORE body `ttl` as an HTTP
+/// `Cache-Control` hint. Attached per successful response (never to errors), so a
+/// CDN/browser may reuse it for exactly the freshness window the body advertises
+/// — and crucially so a short-lived warming `/recommend` (ttl=10) is not pinned
+/// by a long max-age. The open-ranking group carries no blanket cache middleware
+/// precisely so each response can advertise its own TTL and errors stay uncached.
+fn cached_json<T: Serialize>(body: T, ttl: Option<u64>) -> Response {
+    let mut response = Json(body).into_response();
+    if let Some(ttl) = ttl {
+        if let Ok(value) = HeaderValue::from_str(&format!("public, max-age={ttl}")) {
+            response.headers_mut().insert(CACHE_CONTROL, value);
+        }
+    }
+    response
+}
+
 /// Core `/rank` logic (ORE-02): rank the requested pubkeys by global PageRank.
 pub(crate) async fn rank<T: RepoTrait>(
     repo: &T,
@@ -337,14 +355,15 @@ pub(crate) async fn rank<T: RepoTrait>(
 pub(crate) async fn serve_rank<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<RankResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
     let request: RankRequest = parse_json_body(&body)?;
     let response = rank(state.repo.as_ref(), request).await?;
-    Ok(Json(response))
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 /// An ORE-06 `stats` object: non-negative integer counts from our index.
@@ -443,14 +462,15 @@ pub(crate) async fn reputation<T: RepoTrait>(
 pub(crate) async fn serve_reputation<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<ReputationResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
     let request: ReputationRequest = parse_json_body(&body)?;
     let response = reputation(state.repo.as_ref(), request).await?;
-    Ok(Json(response))
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 /// Response body for `POST /followers` (ORE-04).
@@ -525,14 +545,15 @@ pub(crate) async fn followers<T: RepoTrait>(
 pub(crate) async fn serve_followers<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<FollowersResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
     let request: FollowersRequest = parse_json_body(&body)?;
     let response = followers(state.repo.as_ref(), request).await?;
-    Ok(Json(response))
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 /// Request body for `POST /recommend` (ORE-03). Unknown fields (e.g. `topic`,
@@ -639,14 +660,15 @@ pub(crate) async fn recommend<T: RepoTrait>(
 pub(crate) async fn serve_recommend<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<RankResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
     let request: RecommendRequest = parse_json_body(&body)?;
     let response = recommend(state.recommendation_queue.as_ref(), request).await?;
-    Ok(Json(response))
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 #[cfg(test)]
@@ -1495,6 +1517,174 @@ mod tests {
             calls.load(Ordering::Relaxed),
             1,
             "the heavy query ran once; repeats hit the shared result cache"
+        );
+    }
+
+    // ---- Cache-Control header: ORE body `ttl` mirrored as an HTTP cache hint ----
+
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::header::CACHE_CONTROL;
+    use axum::response::IntoResponse;
+
+    /// Minimal nostr client: the open-ranking handlers never call it, so an empty
+    /// stub is enough to satisfy `AppState`'s `GetEventsOf` bound.
+    #[derive(Default)]
+    struct StubNostrClient;
+
+    #[async_trait::async_trait]
+    impl GetEventsOf for StubNostrClient {
+        async fn get_events_of(
+            &self,
+            _filters: Vec<nostr_sdk::Filter>,
+            _timeout: Option<std::time::Duration>,
+        ) -> Result<Vec<nostr_sdk::Event>, nostr_sdk::client::Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn app_state(
+        repo: MockRepo,
+        queue: RecommendationQueue<MockRepo>,
+    ) -> Arc<AppState<MockRepo, StubNostrClient>> {
+        Arc::new(AppState::new(
+            Arc::new(repo),
+            Arc::new(StubNostrClient),
+            Arc::new(queue),
+        ))
+    }
+
+    fn idle_queue() -> RecommendationQueue<MockRepo> {
+        recommendation_queue(MockRepo::default())
+    }
+
+    fn cache_control(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get(CACHE_CONTROL)
+            .map(|value| value.to_str().expect("ascii header").to_string())
+    }
+
+    fn json_body<T: Serialize>(value: &T) -> Bytes {
+        Bytes::from(serde_json::to_vec(value).expect("request serializes"))
+    }
+
+    #[tokio::test]
+    async fn rank_response_carries_cache_control_matching_its_ttl() {
+        let pubkey = fresh_pubkey();
+        let repo = MockRepo {
+            pageranks: HashMap::from([(pubkey, 0.9)]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let response = serve_rank(
+            State(state),
+            json_body(&serde_json::json!({ "pubkeys": [pubkey.to_hex()] })),
+        )
+        .await
+        .expect("rank succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600"),
+            "/rank advertises ttl=3600 in the body; the HTTP cache hint must mirror it"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_response_carries_cache_control_matching_its_ttl() {
+        let pubkey = fresh_pubkey();
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 100, 20))]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let response = serve_reputation(
+            State(state),
+            json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() })),
+        )
+        .await
+        .expect("reputation succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600")
+        );
+    }
+
+    #[tokio::test]
+    async fn followers_response_carries_cache_control_matching_its_ttl() {
+        let target = fresh_pubkey();
+        let repo = MockRepo {
+            top_followers: HashMap::from([(target, vec![(fresh_pubkey(), 0.7)])]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let response = serve_followers(
+            State(state),
+            json_body(&serde_json::json!({ "pubkey": target.to_hex() })),
+        )
+        .await
+        .expect("followers succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600")
+        );
+    }
+
+    #[tokio::test]
+    async fn recommend_warming_response_carries_the_short_warming_cache_control() {
+        // A cold /recommend returns the warming response (empty + short ttl). The
+        // HTTP cache hint must mirror that SHORT ttl so a CDN/browser does not pin
+        // the empty result and starve the client of the warmed result.
+        let pov = fresh_pubkey();
+        let repo = MockRepo {
+            recommendations: HashMap::from([(pov, vec![recommendation(fresh_pubkey(), 0.8)])]),
+            ..Default::default()
+        };
+        let state = app_state(MockRepo::default(), recommendation_queue(repo));
+
+        let response = serve_recommend(
+            State(state),
+            json_body(&serde_json::json!({ "pov": pov.to_hex() })),
+        )
+        .await
+        .expect("recommend succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=10"),
+            "the warming response must carry the short warming ttl, not the 3600 hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_document_carries_cache_control() {
+        let response = serve_capability_document().await.into_response();
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600"),
+            "the discovery document is cacheable like the endpoints it advertises"
+        );
+    }
+
+    #[test]
+    fn open_ranking_errors_are_not_cacheable() {
+        // Errors must never carry a long-lived cache hint (regression guard for the
+        // decision to attach Cache-Control per successful response, not via a blunt
+        // group-wide middleware that would also cache 4xx/5xx).
+        let response = OpenRankingError::unprocessable("nope").into_response();
+        assert!(
+            cache_control(&response).is_none(),
+            "error responses must not carry a Cache-Control header"
         );
     }
 }
