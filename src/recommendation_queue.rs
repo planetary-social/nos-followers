@@ -93,58 +93,76 @@ where
             return Ok(RecommendationStatus::Completed(recommendations));
         }
 
-        // Join an in-flight request, but treat a cached Failed as a miss. A
-        // failure leaves no work running, so short-circuiting on it would wedge
+        // Join an already in-flight request, but treat a cached Failed as a miss.
+        // A failure leaves no work running, so short-circuiting on it would wedge
         // every retry on a stale, terminal Failed and never recompute; fall
-        // through instead to re-enqueue a fresh background warm-up.
+        // through instead so the single-flight below re-enqueues a fresh warm-up.
         if let Some(status) = self.status_cache.get(&cache_key).await {
             if !matches!(status, RecommendationStatus::Failed(_)) {
                 return Ok(status);
             }
         }
 
-        // Check if queue is full
+        // Best-effort backpressure: shed when the queue is already saturated.
+        // This is a soft signal (QueueFull is never cached); the authoritative
+        // dedup is the single-flight entry below.
         let current_size = self.queue_size.load(Ordering::Relaxed);
         if current_size >= self.max_queue_size {
             return Ok(RecommendationStatus::QueueFull);
         }
 
-        // Create new request
+        // Single-flight the cold-miss enqueue. `or_insert_with_if` atomically
+        // inserts a fresh `Pending` when the key is absent *or* holds a stale
+        // terminal `Failed` (self-heal), and coalesces a concurrent burst for the
+        // same key into one init: only the first caller gets `is_fresh() == true`
+        // and dispatches the heavy compute, while the rest join the resulting
+        // in-flight status. This closes the check-then-insert race where a cold
+        // burst each enqueued a redundant Jaccard compute.
+        let entry = self
+            .status_cache
+            .entry_by_ref(&cache_key)
+            .or_insert_with_if(
+                async { RecommendationStatus::Pending { position: 0 } },
+                |current| matches!(current, RecommendationStatus::Failed(_)),
+            )
+            .await;
+
+        if !entry.is_fresh() {
+            // Another caller already reserved this key; join its in-flight status.
+            return Ok(entry.into_value());
+        }
+
+        // We won the single-flight for this key: reserve the queue slot, record
+        // the real queue position, and dispatch the background warm-up.
+        let position = {
+            let mut pending = self.pending_requests.write().await;
+            pending.push(cache_key.clone());
+            pending.len()
+        };
+        self.queue_size.fetch_add(1, Ordering::Relaxed);
+
+        let pending_status = RecommendationStatus::Pending { position };
+        self.status_cache
+            .insert(cache_key.clone(), pending_status.clone())
+            .await;
+
         let request = RecommendationRequest {
             pubkey,
             min_pagerank,
             limit,
             cache_key: cache_key.clone(),
         };
-
-        // Add to pending requests and get position
-        let position = {
-            let mut pending = self.pending_requests.write().await;
-            pending.push(cache_key.clone());
-            pending.len()
-        };
-
-        // Update queue size
-        self.queue_size.fetch_add(1, Ordering::Relaxed);
-
-        // Mark as pending with position
-        self.status_cache
-            .insert(
-                cache_key.clone(),
-                RecommendationStatus::Pending { position },
-            )
-            .await;
-
-        // Send request to worker
         if self.request_sender.send(request).is_err() {
-            // If send fails, clean up
+            // Dispatch failed: undo the reservation and clear the in-flight status
+            // so a later retry re-enqueues instead of joining a phantom request.
             self.queue_size.fetch_sub(1, Ordering::Relaxed);
             let mut pending = self.pending_requests.write().await;
             pending.retain(|k| k != &cache_key);
+            self.status_cache.invalidate(&cache_key).await;
             return Err("Failed to queue recommendation request".into());
         }
 
-        Ok(RecommendationStatus::Pending { position })
+        Ok(pending_status)
     }
 
     pub async fn get_status(&self, cache_key: &str) -> Option<RecommendationStatus> {
@@ -251,5 +269,93 @@ where
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo::{Recommendation, RepoError};
+    use nostr_sdk::Keys;
+    use tokio::sync::Barrier;
+
+    /// A repo whose only job is to count how often the expensive recommendation
+    /// compute runs, so a test can prove the queue collapses a concurrent cold
+    /// burst for one key into a single compute rather than one per request.
+    #[derive(Default)]
+    struct CountingRepo {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RepoTrait for CountingRepo {
+        async fn get_recommendations(
+            &self,
+            _pubkey: &PublicKey,
+            _min_pagerank: Option<f64>,
+            _limit: Option<usize>,
+        ) -> Result<Vec<Recommendation>, RepoError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // A short compute so that, in a racy queue, redundant jobs stay
+            // queued long enough to be observed draining; a single-flight queue
+            // still runs this exactly once.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(Vec::new())
+        }
+    }
+
+    fn queue_with_worker(calls: Arc<AtomicUsize>) -> RecommendationQueue<CountingRepo> {
+        let repo = Arc::new(CountingRepo { calls });
+        let result_cache = Cache::builder().build();
+        let (queue, receiver) = RecommendationQueue::new(repo, result_cache, 64);
+        queue.start_worker(TaskTracker::new(), receiver, CancellationToken::new());
+        queue
+    }
+
+    /// Drain barrier: wait until the worker has finished every job that was
+    /// actually enqueued (each completed job decrements `queue_size`).
+    async fn wait_for_drain<T: RepoTrait + 'static>(queue: &RecommendationQueue<T>) {
+        for _ in 0..1000 {
+            if queue.queue_size.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("recommendation queue never drained");
+    }
+
+    /// A burst of concurrent cold requests for one key must enqueue a single
+    /// background compute, not one per request. Regression test for the
+    /// non-atomic check-then-insert in `request_recommendations`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_requests_for_one_key_compute_once() {
+        const BURST: usize = 24;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(queue_with_worker(calls.clone()));
+        let pov = Keys::generate().public_key();
+
+        let barrier = Arc::new(Barrier::new(BURST));
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let queue = queue.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                queue
+                    .request_recommendations(pov, None, Some(10))
+                    .await
+                    .expect("request is accepted");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("request task completes");
+        }
+
+        wait_for_drain(&queue).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a concurrent cold burst for one key must collapse to a single compute"
+        );
     }
 }
