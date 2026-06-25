@@ -840,7 +840,12 @@ mod tests {
     fn recommendation_queue(repo: MockRepo) -> RecommendationQueue<MockRepo> {
         let result_cache = moka::future::Cache::builder().build();
         let (queue, receiver) = RecommendationQueue::new(Arc::new(repo), result_cache, 16);
-        queue.start_worker(TaskTracker::new(), receiver, CancellationToken::new());
+        queue.start_workers(
+            TaskTracker::new(),
+            receiver,
+            CancellationToken::new(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        );
         queue
     }
 

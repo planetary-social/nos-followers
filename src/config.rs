@@ -26,6 +26,16 @@ pub struct Settings {
     pub http_cache_seconds: u32,
     pub burst: NonZeroU16,
     pub redis_url: String,
+    /// Size of the recommendation warm-up worker pool. A small pool lets distinct
+    /// cold warm-ups run in parallel instead of serializing behind one worker,
+    /// trading a little extra Neo4j load for lower warm latency. Defaults to 2 so
+    /// configs that predate this field keep working.
+    #[serde(default = "default_recommendation_workers")]
+    pub recommendation_workers: NonZeroUsize,
+}
+
+fn default_recommendation_workers() -> NonZeroUsize {
+    NonZeroUsize::new(2).expect("2 is non-zero")
 }
 
 impl Configurable for Settings {

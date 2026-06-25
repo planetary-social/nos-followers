@@ -17,3 +17,4 @@ followers:
   burst: 10 # Number of messages that get replenished after 24 hours of no messages. When available, they override min_seconds_between_messages
   pagerank_cron_expression: "0 0 0 * * *" # Daily at midnight
   http_cache_seconds: 86400 # 24 hours
+  recommendation_workers: 2 # warm-up pool size; distinct cold warm-ups run in parallel across these workers

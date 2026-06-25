@@ -2,13 +2,15 @@ use crate::repo::{Recommendation, RepoTrait};
 use moka::future::Cache;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RecommendationStatus {
@@ -238,11 +240,42 @@ where
         self.status_cache.get(cache_key).await
     }
 
-    pub fn start_worker(
+    /// Start the recommendation warm-up worker pool.
+    ///
+    /// A single worker would drain the queue serially, so distinct cold warm-ups
+    /// for different keys run one at a time. The queue's `request_sender` is a
+    /// `broadcast` channel, and a broadcast fan-out where every worker `recv()`s
+    /// the shared channel would run *each* job once per worker. So, mirroring
+    /// `WorkerPool`, a dispatcher round-robins the broadcast stream across
+    /// `num_workers` per-worker `mpsc` channels, letting `num_workers` distinct
+    /// warm-ups run in parallel while each job is still handled exactly once.
+    pub fn start_workers(
         &self,
         task_tracker: TaskTracker,
-        mut receiver: broadcast::Receiver<RecommendationRequest>,
+        receiver: broadcast::Receiver<RecommendationRequest>,
         cancellation_token: CancellationToken,
+        num_workers: NonZeroUsize,
+    ) {
+        let mut worker_txs = Vec::with_capacity(num_workers.get());
+        for index in 0..num_workers.get() {
+            // Depth 1: just enough to let the dispatcher stage the next job for a
+            // worker that is still computing, preserving round-robin spread.
+            let (worker_tx, worker_rx) = mpsc::channel::<RecommendationRequest>(1);
+            worker_txs.push(worker_tx);
+            self.spawn_worker(&task_tracker, worker_rx, cancellation_token.clone(), index);
+        }
+
+        spawn_dispatcher(&task_tracker, receiver, worker_txs, cancellation_token);
+    }
+
+    /// Spawn one pool worker: it pulls jobs handed to it by the dispatcher and
+    /// runs the warm-up compute for each.
+    fn spawn_worker(
+        &self,
+        task_tracker: &TaskTracker,
+        mut worker_rx: mpsc::Receiver<RecommendationRequest>,
+        cancellation_token: CancellationToken,
+        index: usize,
     ) {
         let repo = self.repo.clone();
         let status_cache = self.status_cache.clone();
@@ -251,98 +284,176 @@ where
         let queue_size = self.queue_size.clone();
 
         task_tracker.spawn(async move {
-            info!("Recommendation queue worker started");
+            info!("Recommendation queue worker {index} started");
 
             loop {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
-                        info!("Recommendation queue worker shutting down");
+                        info!("Recommendation queue worker {index} shutting down");
                         break;
                     }
-                    Ok(request) = receiver.recv() => {
-                        let cache_key = request.cache_key.clone();
-
-                        // Take over the queue-slot reservation the request path
-                        // handed off on dispatch. Its Drop releases the slot (and
-                        // republishes the depth gauge) when this job finishes, on
-                        // every arm below, so the gauge can never diverge from the
-                        // counter.
-                        let _slot = QueueSlot::adopt(queue_size.clone());
-
-                        // Remove from pending requests and update positions
-                        {
-                            let mut pending = pending_requests.write().await;
-                            pending.retain(|k| k != &cache_key);
-
-                            // Update positions for remaining requests
-                            for (index, key) in pending.iter().enumerate() {
-                                status_cache
-                                    .insert(key.clone(), RecommendationStatus::Pending { position: index + 1 })
-                                    .await;
+                    maybe_request = worker_rx.recv() => {
+                        match maybe_request {
+                            Some(request) => {
+                                Self::process_request(
+                                    request,
+                                    &repo,
+                                    &status_cache,
+                                    &result_cache,
+                                    &pending_requests,
+                                    &queue_size,
+                                )
+                                .await;
+                            }
+                            None => {
+                                info!("Recommendation queue worker {index} channel closed");
+                                break;
                             }
                         }
-
-                        // Mark as processing
-                        status_cache
-                            .insert(cache_key.clone(), RecommendationStatus::Processing)
-                            .await;
-
-                        info!(
-                            "Processing recommendation request for {} (cache_key: {})",
-                            request.pubkey.to_hex(),
-                            cache_key
-                        );
-
-                        // Calculate recommendations
-                        let started = Instant::now();
-                        match repo
-                            .get_recommendations(&request.pubkey, request.min_pagerank, request.limit)
-                            .await
-                        {
-                            Ok(recommendations) => {
-                                // Record how long the warm-up compute took so
-                                // operators can watch warm latency.
-                                crate::metrics::recommend_warm_seconds()
-                                    .record(started.elapsed().as_secs_f64());
-
-                                info!(
-                                    "Completed recommendation calculation for {}: {} results",
-                                    request.pubkey.to_hex(),
-                                    recommendations.len()
-                                );
-
-                                // Store in result cache (get_status checks this first)
-                                result_cache
-                                    .insert(cache_key.clone(), recommendations)
-                                    .await;
-
-                                // Remove transient status now that result is cached
-                                status_cache.remove(&cache_key).await;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to calculate recommendations for {}: {}",
-                                    request.pubkey.to_hex(),
-                                    e
-                                );
-
-                                // Count the failure distinctly from a warming
-                                // cold-miss so operators can tell them apart.
-                                crate::metrics::recommend_failed().increment(1);
-
-                                // Mark as failed
-                                status_cache
-                                    .insert(cache_key, RecommendationStatus::Failed(e.to_string()))
-                                    .await;
-                            }
-                        }
-                        // `_slot` drops here, releasing the reservation and
-                        // republishing the depth gauge.
                     }
                 }
             }
         });
     }
+
+    /// Run one warm-up: mark it processing, compute, and cache the result (or the
+    /// failure). Shared by every pool worker so the per-job semantics — slot
+    /// release, status bookkeeping, metrics — stay identical regardless of pool
+    /// size.
+    async fn process_request(
+        request: RecommendationRequest,
+        repo: &Arc<T>,
+        status_cache: &Cache<String, RecommendationStatus>,
+        result_cache: &Cache<String, Vec<Recommendation>>,
+        pending_requests: &Arc<RwLock<Vec<String>>>,
+        queue_size: &Arc<AtomicUsize>,
+    ) {
+        let cache_key = request.cache_key.clone();
+
+        // Take over the queue-slot reservation the request path handed off on
+        // dispatch. Its Drop releases the slot (and republishes the depth gauge)
+        // when this job finishes, on every arm below, so the gauge can never
+        // diverge from the counter.
+        let _slot = QueueSlot::adopt(queue_size.clone());
+
+        // Remove from pending requests and update positions
+        {
+            let mut pending = pending_requests.write().await;
+            pending.retain(|k| k != &cache_key);
+
+            // Update positions for remaining requests
+            for (index, key) in pending.iter().enumerate() {
+                status_cache
+                    .insert(
+                        key.clone(),
+                        RecommendationStatus::Pending {
+                            position: index + 1,
+                        },
+                    )
+                    .await;
+            }
+        }
+
+        // Mark as processing
+        status_cache
+            .insert(cache_key.clone(), RecommendationStatus::Processing)
+            .await;
+
+        info!(
+            "Processing recommendation request for {} (cache_key: {})",
+            request.pubkey.to_hex(),
+            cache_key
+        );
+
+        // Calculate recommendations
+        let started = Instant::now();
+        match repo
+            .get_recommendations(&request.pubkey, request.min_pagerank, request.limit)
+            .await
+        {
+            Ok(recommendations) => {
+                // Record how long the warm-up compute took so operators can watch
+                // warm latency.
+                crate::metrics::recommend_warm_seconds().record(started.elapsed().as_secs_f64());
+
+                info!(
+                    "Completed recommendation calculation for {}: {} results",
+                    request.pubkey.to_hex(),
+                    recommendations.len()
+                );
+
+                // Store in result cache (get_status checks this first)
+                result_cache
+                    .insert(cache_key.clone(), recommendations)
+                    .await;
+
+                // Remove transient status now that result is cached
+                status_cache.remove(&cache_key).await;
+            }
+            Err(e) => {
+                error!(
+                    "Failed to calculate recommendations for {}: {}",
+                    request.pubkey.to_hex(),
+                    e
+                );
+
+                // Count the failure distinctly from a warming cold-miss so
+                // operators can tell them apart.
+                crate::metrics::recommend_failed().increment(1);
+
+                // Mark as failed
+                status_cache
+                    .insert(cache_key, RecommendationStatus::Failed(e.to_string()))
+                    .await;
+            }
+        }
+        // `_slot` drops here, releasing the reservation and republishing the
+        // depth gauge.
+    }
+}
+
+/// Round-robin the broadcast request stream across the pool's per-worker `mpsc`
+/// channels — mirroring `WorkerPool`'s dispatcher — so each job is handed to
+/// exactly one worker (a broadcast fan-out would run every job once per worker).
+fn spawn_dispatcher(
+    task_tracker: &TaskTracker,
+    mut receiver: broadcast::Receiver<RecommendationRequest>,
+    worker_txs: Vec<mpsc::Sender<RecommendationRequest>>,
+    cancellation_token: CancellationToken,
+) {
+    task_tracker.spawn(async move {
+        let mut worker_txs_cycle = worker_txs.iter().cycle();
+
+        loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    info!("Recommendation queue dispatcher shutting down");
+                    break;
+                }
+                result = receiver.recv() => {
+                    match result {
+                        Ok(request) => {
+                            let Some(worker_tx) = worker_txs_cycle.next() else {
+                                error!("Recommendation queue dispatcher has no workers");
+                                break;
+                            };
+                            if let Err(e) = worker_tx.send(request).await {
+                                error!("Recommendation queue dispatcher failed to hand off to a worker: {e}");
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            warn!("Recommendation queue dispatcher lagged and missed {n} requests");
+                        }
+                        Err(RecvError::Closed) => {
+                            info!("Recommendation queue request channel closed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -350,6 +461,7 @@ mod tests {
     use super::*;
     use crate::repo::{Recommendation, RepoError};
     use nostr_sdk::Keys;
+    use std::num::NonZeroUsize;
     use tokio::sync::Barrier;
 
     /// A repo whose only job is to count how often the expensive recommendation
@@ -376,12 +488,66 @@ mod tests {
         }
     }
 
+    /// A repo that records the peak number of `get_recommendations` calls running
+    /// at once, so a test can prove distinct warm-ups run in parallel across a
+    /// worker pool (peak == pool size) rather than serially (peak == 1).
+    struct ConcurrencyRepo {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        hold: Duration,
+    }
+
+    impl RepoTrait for ConcurrencyRepo {
+        async fn get_recommendations(
+            &self,
+            _pubkey: &PublicKey,
+            _min_pagerank: Option<f64>,
+            _limit: Option<usize>,
+        ) -> Result<Vec<Recommendation>, RepoError> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            // Hold the "compute" long enough that genuinely parallel workers
+            // overlap inside this call before any of them releases.
+            tokio::time::sleep(self.hold).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
     fn queue_with_worker(calls: Arc<AtomicUsize>) -> RecommendationQueue<CountingRepo> {
         let repo = Arc::new(CountingRepo { calls });
         let result_cache = Cache::builder().build();
         let (queue, receiver) = RecommendationQueue::new(repo, result_cache, 64);
-        queue.start_worker(TaskTracker::new(), receiver, CancellationToken::new());
+        queue.start_workers(
+            TaskTracker::new(),
+            receiver,
+            CancellationToken::new(),
+            NonZeroUsize::new(1).unwrap(),
+        );
         queue
+    }
+
+    /// Build a queue backed by a `ConcurrencyRepo` with a `num_workers`-wide pool,
+    /// returning the queue plus the peak-concurrency counter the test asserts on.
+    fn queue_with_pool(
+        num_workers: usize,
+        hold: Duration,
+    ) -> (RecommendationQueue<ConcurrencyRepo>, Arc<AtomicUsize>) {
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let repo = Arc::new(ConcurrencyRepo {
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: max_active.clone(),
+            hold,
+        });
+        let result_cache = Cache::builder().build();
+        let (queue, receiver) = RecommendationQueue::new(repo, result_cache, 64);
+        queue.start_workers(
+            TaskTracker::new(),
+            receiver,
+            CancellationToken::new(),
+            NonZeroUsize::new(num_workers).unwrap(),
+        );
+        (queue, max_active)
     }
 
     /// Drain barrier: wait until the worker has finished every job that was
@@ -483,6 +649,62 @@ mod tests {
         assert!(
             released,
             "a cancelled request must release its reserved slot"
+        );
+    }
+
+    /// Two cold warm-ups for *distinct* keys must run at the same time when the
+    /// pool has more than one worker, instead of serializing behind a single
+    /// worker. Regression test for the single-worker drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_cold_warmups_run_in_parallel_across_the_pool() {
+        let (queue, max_active) = queue_with_pool(2, Duration::from_millis(80));
+        let queue = Arc::new(queue);
+        let pk1 = Keys::generate().public_key();
+        let pk2 = Keys::generate().public_key();
+
+        queue
+            .request_recommendations(pk1, None, Some(10))
+            .await
+            .expect("first request is accepted");
+        queue
+            .request_recommendations(pk2, None, Some(10))
+            .await
+            .expect("second request is accepted");
+
+        wait_for_drain(&queue).await;
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            2,
+            "distinct warm-ups must overlap with a 2-worker pool"
+        );
+    }
+
+    /// A pool sized to one worker still serializes distinct warm-ups, proving the
+    /// configured pool size is honored (and that the parallelism above is not an
+    /// artifact of the test always overlapping).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_worker_pool_serializes_distinct_warmups() {
+        let (queue, max_active) = queue_with_pool(1, Duration::from_millis(40));
+        let queue = Arc::new(queue);
+        let pk1 = Keys::generate().public_key();
+        let pk2 = Keys::generate().public_key();
+
+        queue
+            .request_recommendations(pk1, None, Some(10))
+            .await
+            .expect("first request is accepted");
+        queue
+            .request_recommendations(pk2, None, Some(10))
+            .await
+            .expect("second request is accepted");
+
+        wait_for_drain(&queue).await;
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "a single-worker pool must run distinct warm-ups one at a time"
         );
     }
 

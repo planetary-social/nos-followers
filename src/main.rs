@@ -83,11 +83,13 @@ async fn start_server(settings: Settings) -> Result<()> {
     );
     let recommendation_queue = Arc::new(recommendation_queue);
 
-    // Start recommendation queue worker
-    recommendation_queue.start_worker(
+    // Start the recommendation queue worker pool. A small pool lets distinct cold
+    // warm-ups run in parallel instead of serializing behind a single worker.
+    recommendation_queue.start_workers(
         task_tracker.clone(),
         recommendation_receiver,
         cancellation_token.clone(),
+        settings.recommendation_workers,
     );
 
     // Leave the http server at the top so the health endpoint is available quickly
