@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use std::marker::Send;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::Sender;
@@ -39,6 +40,22 @@ pub fn create_client() -> Client {
     ClientBuilder::default().opts(opts).build()
 }
 
+/// Mark the relay subscription up: set the shared readiness flag (read by
+/// `GET /health`) and the `relay_subscription_up` metric together, so the probe
+/// and the gauge can never disagree about whether we are subscribed.
+fn mark_subscription_up(relay_subscribed: &AtomicBool) {
+    relay_subscribed.store(true, Ordering::Relaxed);
+    crate::metrics::relay_subscription_up().set(1.0);
+}
+
+/// Mark the relay subscription down: the readiness flag and the metric move
+/// together (see [`mark_subscription_up`]).
+fn mark_subscription_down(relay_subscribed: &AtomicBool) {
+    relay_subscribed.store(false, Ordering::Relaxed);
+    crate::metrics::relay_subscription_up().set(0.0);
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn start_nostr_subscription(
     task_tracker: TaskTracker,
     nostr_client: Arc<Client>,
@@ -46,12 +63,15 @@ pub fn start_nostr_subscription(
     filters: Vec<Filter>,
     event_tx: Sender<Box<Event>>,
     cancellation_token: CancellationToken,
+    relay_subscribed: Arc<AtomicBool>,
 ) {
     task_tracker.spawn(async move {
         // Publish the liveness series up front (not yet subscribed) so the gauge
         // is present on /metrics from startup — a never-coming-up subscription is
-        // then alertable as `relay_subscription_up == 0`, not merely absent.
-        crate::metrics::relay_subscription_up().set(0.0);
+        // then alertable as `relay_subscription_up == 0`, not merely absent. The
+        // readiness flag starts false too, so `/health` reports not-ready until we
+        // actually subscribe.
+        mark_subscription_down(&relay_subscribed);
 
         for relay in relays {
             info!("Connecting to relay: {}", relay);
@@ -70,13 +90,27 @@ pub fn start_nostr_subscription(
         // Keep the subscription alive across transient relay failures. This loop
         // owns the relay lifecycle and never cancels the shared token, so a relay
         // outage can no longer take the HTTP server down with it.
-        retry_until_cancelled(cancellation_token.clone(), move || {
-            let client = nostr_client.clone();
-            let filters = filters.clone();
-            let event_tx = event_tx.clone();
-            let cancellation_token = cancellation_token.clone();
-            async move { run_subscription(&client, &filters, event_tx, &cancellation_token).await }
-        })
+        retry_until_cancelled(
+            cancellation_token.clone(),
+            relay_subscribed.clone(),
+            move || {
+                let client = nostr_client.clone();
+                let filters = filters.clone();
+                let event_tx = event_tx.clone();
+                let cancellation_token = cancellation_token.clone();
+                let relay_subscribed = relay_subscribed.clone();
+                async move {
+                    run_subscription(
+                        &client,
+                        &filters,
+                        event_tx,
+                        &cancellation_token,
+                        &relay_subscribed,
+                    )
+                    .await
+                }
+            },
+        )
         .await;
 
         info!("Relay subscription loop ended");
@@ -108,6 +142,7 @@ async fn run_subscription(
     filters: &[Filter],
     event_tx: Sender<Box<Event>>,
     cancellation_token: &CancellationToken,
+    relay_subscribed: &AtomicBool,
 ) -> Result<()> {
     info!("Subscribing to {:?}", filters);
 
@@ -118,8 +153,8 @@ async fn run_subscription(
     }
 
     // Subscribed and about to pump notifications: the subscription is up. The
-    // retry loop drives it back to 0 when this attempt ends.
-    crate::metrics::relay_subscription_up().set(1.0);
+    // retry loop drives it back down when this attempt ends.
+    mark_subscription_up(relay_subscribed);
 
     client
         .handle_notifications(|notification| async {
@@ -154,8 +189,11 @@ const MAX_RELAY_BACKOFF: Duration = Duration::from_secs(60);
 /// logged and retried — crucially it must NOT cancel the token, because the same
 /// token drives the HTTP server and the worker pools: a relay outage must never
 /// tear those down. Returns only when the token is cancelled.
-async fn retry_until_cancelled<F, Fut>(cancellation_token: CancellationToken, mut attempt: F)
-where
+async fn retry_until_cancelled<F, Fut>(
+    cancellation_token: CancellationToken,
+    relay_subscribed: Arc<AtomicBool>,
+    mut attempt: F,
+) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
@@ -181,10 +219,11 @@ where
         }
 
         // The attempt has ended — the subscription is no longer up. Publish that
-        // before backing off so a persistent outage (or a dispatcher-death that
-        // keeps re-subscribing) stays observable as `relay_subscription_up == 0`
-        // on /metrics. This never cancels the shared token: the decoupling holds.
-        crate::metrics::relay_subscription_up().set(0.0);
+        // before backing off (readiness flag + gauge together) so a persistent
+        // outage (or a dispatcher-death that keeps re-subscribing) stays
+        // observable as `relay_subscription_up == 0` on /metrics and as a 503 on
+        // /health. This never cancels the shared token: the decoupling holds.
+        mark_subscription_down(&relay_subscribed);
 
         // Wait out the backoff, but wake immediately on shutdown.
         tokio::select! {
@@ -199,7 +238,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -213,15 +252,19 @@ mod tests {
             let cancellation_token = cancellation_token.clone();
             let attempts = attempts.clone();
             async move {
-                retry_until_cancelled(cancellation_token, move || {
-                    let attempts = attempts.clone();
-                    let tx = tx.clone();
-                    async move {
-                        attempts.fetch_add(1, Ordering::SeqCst);
-                        let _ = tx.send(());
-                        bail!("relay unavailable")
-                    }
-                })
+                retry_until_cancelled(
+                    cancellation_token,
+                    Arc::new(AtomicBool::new(false)),
+                    move || {
+                        let attempts = attempts.clone();
+                        let tx = tx.clone();
+                        async move {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            let _ = tx.send(());
+                            bail!("relay unavailable")
+                        }
+                    },
+                )
                 .await
             }
         });
@@ -253,13 +296,17 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
 
         let attempts_clone = attempts.clone();
-        retry_until_cancelled(cancellation_token, move || {
-            let attempts = attempts_clone.clone();
-            async move {
-                attempts.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        })
+        retry_until_cancelled(
+            cancellation_token,
+            Arc::new(AtomicBool::new(false)),
+            move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -295,12 +342,14 @@ mod tests {
     /// every other respect).
     #[test]
     fn a_failed_attempt_marks_the_subscription_down() {
-        let rendered = render_relay_metrics(|| async {
+        let relay_subscribed = Arc::new(AtomicBool::new(true));
+        let flag = relay_subscribed.clone();
+        let rendered = render_relay_metrics(|| async move {
             // Pretend the subscription had come up, then let one attempt fail.
             crate::metrics::relay_subscription_up().set(1.0);
             let token = CancellationToken::new();
             let attempt_token = token.clone();
-            retry_until_cancelled(token.clone(), move || {
+            retry_until_cancelled(token.clone(), flag, move || {
                 let attempt_token = attempt_token.clone();
                 async move {
                     // Stop the loop after this single failed attempt.
@@ -315,6 +364,10 @@ mod tests {
             rendered.contains("relay_subscription_up 0"),
             "a failed attempt must mark the subscription down; got:\n{rendered}"
         );
+        assert!(
+            !relay_subscribed.load(Ordering::Relaxed),
+            "a failed attempt must also flip the /health readiness flag to not-ready"
+        );
     }
 
     /// A clean return (the relay closed the stream, or no receivers remain) must
@@ -322,11 +375,13 @@ mod tests {
     /// keeps re-subscribing is held at 0 and stays alertable.
     #[test]
     fn a_clean_return_marks_the_subscription_down() {
-        let rendered = render_relay_metrics(|| async {
+        let relay_subscribed = Arc::new(AtomicBool::new(true));
+        let flag = relay_subscribed.clone();
+        let rendered = render_relay_metrics(|| async move {
             crate::metrics::relay_subscription_up().set(1.0);
             let token = CancellationToken::new();
             let attempt_token = token.clone();
-            retry_until_cancelled(token.clone(), move || {
+            retry_until_cancelled(token.clone(), flag, move || {
                 let attempt_token = attempt_token.clone();
                 async move {
                     attempt_token.cancel();
@@ -339,6 +394,10 @@ mod tests {
         assert!(
             rendered.contains("relay_subscription_up 0"),
             "a clean return must mark the subscription down; got:\n{rendered}"
+        );
+        assert!(
+            !relay_subscribed.load(Ordering::Relaxed),
+            "a clean return must also flip the /health readiness flag to not-ready"
         );
     }
 }

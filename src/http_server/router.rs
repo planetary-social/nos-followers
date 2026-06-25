@@ -16,6 +16,7 @@ use axum::{
     Router,
 };
 use hyper::http::{header, HeaderValue, Method, Request};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tower_governor::{
@@ -32,6 +33,7 @@ use tracing::{error, Level};
 pub fn create_router<T, U>(
     state: Arc<AppState<T, U>>,
     settings: &Settings,
+    relay_subscribed: Arc<AtomicBool>,
 ) -> Result<Router, ApiError>
 where
     T: RepoTrait + 'static,
@@ -107,6 +109,7 @@ where
     Ok(Router::new()
         .route("/", get(serve_root_page))
         .route("/metrics", get(|| async move { metrics_handle.render() }))
+        .merge(health_route(relay_subscribed))
         .merge(open_ranking_routes)
         .nest(
             "/api/v1",
@@ -131,6 +134,29 @@ where
                 .with_state(state),
         )
         .layer(tracing_layer))
+}
+
+/// `GET /health` readiness probe. Returns 200 while the relay subscription is
+/// live and 503 while it is not, so a probe-driven deployment can hold traffic
+/// from — or restart — a pod whose relay subscription is stuck or down. This
+/// deployment currently alerts on the `relay_subscription_up` metric instead;
+/// the route is here so adopting probe-driven restarts needs no code change. It
+/// is a top-level route (no rate limiting, like `/metrics`) so a probe is never
+/// shed.
+fn health_route(relay_subscribed: Arc<AtomicBool>) -> Router {
+    Router::new().route(
+        "/health",
+        get(move || {
+            let relay_subscribed = relay_subscribed.clone();
+            async move {
+                if relay_subscribed.load(Ordering::Relaxed) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+        }),
+    )
 }
 
 async fn add_cache_header(
@@ -241,13 +267,60 @@ mod tests {
         ))
     }
 
+    /// `GET /health` must report the relay-subscription readiness: 503 before the
+    /// subscription is up (so a probe holds traffic / restarts) and 200 once it
+    /// is. Tested against the standalone route so it does not touch the
+    /// process-global metrics recorder.
+    #[tokio::test]
+    async fn health_route_reports_relay_subscription_readiness() {
+        let relay_subscribed = Arc::new(AtomicBool::new(false));
+
+        let response = health_route(relay_subscribed.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unsubscribed service must report not-ready"
+        );
+
+        relay_subscribed.store(true, Ordering::Relaxed);
+        let response = health_route(relay_subscribed)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a subscribed service must report ready"
+        );
+    }
+
     /// Regression test for the discovery document being served outside the
     /// CORS-layered group: it must carry `Access-Control-Allow-Origin` like the
     /// endpoints it advertises. `setup_metrics` installs a process-global
     /// recorder, so this is the only test that builds the full router.
     #[tokio::test]
     async fn capability_document_route_is_cors_enabled() {
-        let router = create_router(test_state(), &test_settings()).expect("router builds");
+        let router = create_router(
+            test_state(),
+            &test_settings(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("router builds");
 
         let response = router
             .oneshot(
