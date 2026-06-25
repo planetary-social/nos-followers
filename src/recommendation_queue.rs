@@ -479,6 +479,43 @@ where
     }
 }
 
+/// Hand `request` to the next live worker in round-robin order, dropping from
+/// `workers` any sender whose receiver has closed (a dead or shut-down worker) as
+/// it is found, and retrying the *same* request on the following worker. Returns
+/// `true` once a live worker accepts it, or `false` only when every worker
+/// channel is closed (the pool is gone). A single dead worker therefore reduces
+/// capacity but does not stop the dispatcher draining the broadcast stream.
+async fn dispatch_round_robin(
+    workers: &mut Vec<mpsc::Sender<RecommendationRequest>>,
+    next: &mut usize,
+    mut request: RecommendationRequest,
+) -> bool {
+    while !workers.is_empty() {
+        let index = *next % workers.len();
+        match workers[index].send(request).await {
+            Ok(()) => {
+                *next = index + 1;
+                return true;
+            }
+            Err(e) => {
+                // This worker's receiver is gone. Recover the request from the
+                // error, drop the dead sender from the rotation, and try the next
+                // live worker. `next` is left unchanged: after the removal the
+                // recomputed `*next % workers.len()` lands on a still-present
+                // worker, and the strictly shrinking Vec bounds the loop.
+                request = e.0;
+                workers.remove(index);
+                warn!(
+                    "Recommendation queue dispatcher dropped a closed worker channel; \
+                     {} worker(s) remain",
+                    workers.len()
+                );
+            }
+        }
+    }
+    false
+}
+
 /// Round-robin the broadcast request stream across the pool's per-worker `mpsc`
 /// channels — mirroring `WorkerPool`'s dispatcher — so each job is handed to
 /// exactly one worker (a broadcast fan-out would run every job once per worker).
@@ -489,7 +526,8 @@ fn spawn_dispatcher(
     cancellation_token: CancellationToken,
 ) {
     task_tracker.spawn(async move {
-        let mut worker_txs_cycle = worker_txs.iter().cycle();
+        let mut workers = worker_txs;
+        let mut next = 0usize;
 
         loop {
             tokio::select! {
@@ -500,12 +538,13 @@ fn spawn_dispatcher(
                 result = receiver.recv() => {
                     match result {
                         Ok(request) => {
-                            let Some(worker_tx) = worker_txs_cycle.next() else {
-                                error!("Recommendation queue dispatcher has no workers");
-                                break;
-                            };
-                            if let Err(e) = worker_tx.send(request).await {
-                                error!("Recommendation queue dispatcher failed to hand off to a worker: {e}");
+                            // A closed worker channel only reduces capacity; we
+                            // keep draining as long as one live worker remains.
+                            if !dispatch_round_robin(&mut workers, &mut next, request).await {
+                                error!(
+                                    "Recommendation queue dispatcher has no live workers left; \
+                                     stopping"
+                                );
                                 break;
                             }
                         }
@@ -952,6 +991,94 @@ mod tests {
             counter.load(Ordering::SeqCst),
             0,
             "the adopting owner releases the slot on drop"
+        );
+    }
+
+    // ---- dispatcher resilience to a dead worker ----
+
+    fn dispatch_request() -> RecommendationRequest {
+        let pubkey = Keys::generate().public_key();
+        RecommendationRequest {
+            pubkey,
+            min_pagerank: None,
+            limit: Some(10),
+            cache_key: cache_key_for(&pubkey, None, Some(10)),
+        }
+    }
+
+    /// One dead worker (its receiver dropped) must not wedge dispatch: the helper
+    /// drops it from the rotation and hands the request to a live worker, so the
+    /// pool keeps draining at reduced capacity. Regression for the dispatcher
+    /// breaking its whole loop on a single closed worker channel.
+    #[tokio::test]
+    async fn dispatch_skips_and_drops_a_dead_worker() {
+        let (tx_dead, rx_dead) = mpsc::channel(1);
+        let (tx_live, mut rx_live) = mpsc::channel(1);
+        drop(rx_dead); // worker 0 has shut down
+
+        let mut workers = vec![tx_dead, tx_live];
+        let mut next = 0usize;
+        let request = dispatch_request();
+
+        let dispatched = dispatch_round_robin(&mut workers, &mut next, request.clone()).await;
+
+        assert!(dispatched, "a live worker must accept the request");
+        assert_eq!(
+            workers.len(),
+            1,
+            "the dead worker is dropped from the rotation"
+        );
+        let got = rx_live
+            .recv()
+            .await
+            .expect("the live worker received the job");
+        assert_eq!(got.cache_key, request.cache_key);
+    }
+
+    /// When every worker channel is closed the helper returns `false` (signalling
+    /// the dispatcher to stop) and drains the rotation, rather than looping
+    /// forever or wedging on the first dead sender.
+    #[tokio::test]
+    async fn dispatch_returns_false_when_all_workers_are_dead() {
+        let (tx0, rx0) = mpsc::channel(1);
+        let (tx1, rx1) = mpsc::channel(1);
+        drop(rx0);
+        drop(rx1);
+
+        let mut workers = vec![tx0, tx1];
+        let mut next = 0usize;
+
+        let dispatched = dispatch_round_robin(&mut workers, &mut next, dispatch_request()).await;
+
+        assert!(!dispatched, "no live worker remains to accept the request");
+        assert!(
+            workers.is_empty(),
+            "every dead worker is dropped from the rotation"
+        );
+    }
+
+    /// With all workers live, consecutive dispatches advance round-robin across
+    /// the pool (no worker is starved and none is dropped).
+    #[tokio::test]
+    async fn dispatch_round_robins_across_live_workers() {
+        let (tx0, mut rx0) = mpsc::channel(1);
+        let (tx1, mut rx1) = mpsc::channel(1);
+        let mut workers = vec![tx0, tx1];
+        let mut next = 0usize;
+
+        let first = dispatch_request();
+        let second = dispatch_request();
+        assert!(dispatch_round_robin(&mut workers, &mut next, first.clone()).await);
+        assert!(dispatch_round_robin(&mut workers, &mut next, second.clone()).await);
+
+        assert_eq!(workers.len(), 2, "no live worker is dropped");
+        assert_eq!(
+            rx0.recv().await.expect("worker 0 got a job").cache_key,
+            first.cache_key
+        );
+        assert_eq!(
+            rx1.recv().await.expect("worker 1 got a job").cache_key,
+            second.cache_key
         );
     }
 }
