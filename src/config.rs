@@ -95,3 +95,30 @@ impl Config {
         self.config.get::<T>(T::key())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The committed `config/settings.yml` must let the binary boot with no
+    /// gitignored `settings.development.yml` override: every required field is
+    /// present and the values line up with `compose.yaml`, so `docker compose up`
+    /// works on a fresh checkout. Regression test for `redis_url` being absent
+    /// (it lived only in the gitignored override) and `neo4j_password` not
+    /// matching the database the compose file provisions.
+    #[test]
+    fn committed_settings_load_without_local_overrides() {
+        let settings: Settings = Config::new("config")
+            .expect("config builds")
+            .get()
+            .expect("settings.yml must provide every required field on its own");
+
+        // compose.yaml sets `NEO4J_AUTH=neo4j/password` (and the pagerank service
+        // overrides `neo4j_password=password`), so the committed default must match
+        // or auth fails out of the box.
+        assert_eq!(settings.neo4j_password, "password");
+        // Required field that previously existed only in the gitignored override;
+        // points at the compose `redis` service (mirroring `neo4j_uri: db:7687`).
+        assert_eq!(settings.redis_url, "redis://redis:6379");
+    }
+}
