@@ -20,7 +20,8 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::error;
+use tokio::sync::Semaphore;
+use tracing::{error, warn};
 
 /// Endpoint paths exposed by this provider. Each is a key in the capability
 /// document (ORE-01) and the route path for the corresponding handler.
@@ -311,6 +312,16 @@ const READ_CACHE_TTL_SECONDS: u64 = 60;
 /// for `/rank`, whose key is an arbitrary pubkey set.
 const READ_CACHE_CAPACITY: u64 = 1_000;
 
+/// Max concurrent detached read fills, shared across `/rank`, `/reputation` and
+/// `/followers`. Each [`cached_read`] runs its `try_get_with` in a spawned,
+/// uncancellable task; this bound caps how many such Neo4j reads can be in flight
+/// at once, so a burst of distinct cache-miss keys cannot spawn unbounded
+/// background queries. When the limit is saturated a read fails fast rather than
+/// piling on another query. Sized comfortably above the largest single-key
+/// thundering herd the read tests exercise so identical concurrent reads still
+/// single-flight to one query rather than being shed.
+const READ_FILL_CONCURRENCY: usize = 32;
+
 /// Short-lived per-endpoint result caches for the synchronous heavy reads
 /// (`/rank`, `/reputation`, `/followers`). Each `try_get_with` both single-flights
 /// — concurrent identical requests collapse to one Neo4j query — and reuses the
@@ -330,6 +341,9 @@ pub(crate) struct OpenRankingReadCache {
     rank: Cache<String, RankResponse>,
     reputation: Cache<String, ReputationResponse>,
     followers: Cache<String, FollowersResponse>,
+    /// Shared permit pool gating the detached fills in [`cached_read`] across all
+    /// three read endpoints (see [`READ_FILL_CONCURRENCY`]).
+    read_fill_semaphore: Arc<Semaphore>,
 }
 
 impl OpenRankingReadCache {
@@ -344,6 +358,7 @@ impl OpenRankingReadCache {
             rank: build(),
             reputation: build(),
             followers: build(),
+            read_fill_semaphore: Arc::new(Semaphore::new(READ_FILL_CONCURRENCY)),
         }
     }
 }
@@ -365,7 +380,17 @@ impl Default for OpenRankingReadCache {
 /// This is the minimal background-compute mitigation for the route-timeout limit
 /// noted on [`OpenRankingReadCache`]. It does not cap how long a runaway query
 /// may run; it only ensures a query that does finish is not thrown away.
+///
+/// A permit is acquired from `semaphore` *before* the task is spawned, so the
+/// number of in-flight detached fills (across all three read endpoints) is
+/// bounded by [`READ_FILL_CONCURRENCY`]: a burst of distinct cache-miss keys
+/// cannot launch unbounded uncancellable Neo4j reads. When no permit is
+/// available the read fails fast (sheds load) rather than piling another query
+/// onto an already-saturated database. The permit is moved into the spawned
+/// task and held for the whole fill, including the warm-on-timeout case where
+/// the handler future has been dropped but the task keeps running.
 async fn cached_read<V, F>(
+    semaphore: Arc<Semaphore>,
     cache: Cache<String, V>,
     key: String,
     compute: F,
@@ -374,7 +399,19 @@ where
     V: Clone + Send + Sync + 'static,
     F: std::future::Future<Output = Result<V, OpenRankingError>> + Send + 'static,
 {
-    match tokio::spawn(async move { cache.try_get_with(key, compute).await }).await {
+    let permit = match semaphore.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("open-ranking read fill rejected: concurrency limit reached");
+            return Err(OpenRankingError::Internal);
+        }
+    };
+    match tokio::spawn(async move {
+        let _permit = permit;
+        cache.try_get_with(key, compute).await
+    })
+    .await
+    {
         Ok(result) => result.map_err(|err| (*err).clone()),
         Err(join_err) => {
             error!("open-ranking cached read task failed: {join_err}");
@@ -513,6 +550,7 @@ where
     let key = rank_cache_key(&request);
     let repo = state.repo.clone();
     let response = cached_read(
+        state.open_ranking_read_cache.read_fill_semaphore.clone(),
         state.open_ranking_read_cache.rank.clone(),
         key,
         async move { rank(repo.as_ref(), request).await },
@@ -628,6 +666,7 @@ where
     let key = reputation_cache_key(&request);
     let repo = state.repo.clone();
     let response = cached_read(
+        state.open_ranking_read_cache.read_fill_semaphore.clone(),
         state.open_ranking_read_cache.reputation.clone(),
         key,
         async move { reputation(repo.as_ref(), request).await },
@@ -719,6 +758,7 @@ where
     let key = followers_cache_key(&request);
     let repo = state.repo.clone();
     let response = cached_read(
+        state.open_ranking_read_cache.read_fill_semaphore.clone(),
         state.open_ranking_read_cache.followers.clone(),
         key,
         async move { followers(repo.as_ref(), request).await },
@@ -2065,6 +2105,73 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "the detached fill must warm the cache so the retry does not recompute"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_fails_fast_when_the_fill_concurrency_limit_is_saturated() {
+        // With every fill permit already held, an additional read must shed load
+        // (fail fast) rather than spawn another uncancellable Neo4j query.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+
+        // Saturate the single permit so none is free for the fill below.
+        let _held = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("the only permit is free");
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_fill = ran.clone();
+        let result = cached_read(semaphore.clone(), cache, "k".to_string(), async move {
+            ran_in_fill.fetch_add(1, Ordering::SeqCst);
+            Ok::<i32, OpenRankingError>(42)
+        })
+        .await;
+
+        assert!(
+            matches!(result, Err(OpenRankingError::Internal)),
+            "a saturated read-fill limit must fail fast"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "no Neo4j read may be spawned when the limit is saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_runs_the_fill_when_a_permit_is_available() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+        let result = cached_read(semaphore, cache, "k".to_string(), async move {
+            Ok::<i32, OpenRankingError>(7)
+        })
+        .await;
+        assert_eq!(result.expect("permit available, fill runs"), 7);
+    }
+
+    #[tokio::test]
+    async fn cached_read_releases_the_permit_after_each_fill() {
+        // The permit is moved into the detached task, so it must be returned when
+        // the fill completes (including the warm-on-timeout detach) — otherwise the
+        // pool would leak a permit per request and eventually wedge.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+        for key in ["a", "b", "c"] {
+            cached_read(
+                semaphore.clone(),
+                cache.clone(),
+                key.to_string(),
+                async move { Ok::<i32, OpenRankingError>(1) },
+            )
+            .await
+            .expect("each sequential fill reuses the freed permit");
+        }
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the permit must be returned after each fill completes"
         );
     }
 
