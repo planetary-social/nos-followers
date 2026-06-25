@@ -317,11 +317,14 @@ const READ_CACHE_CAPACITY: u64 = 1_000;
 /// result for [`READ_CACHE_TTL_SECONDS`]. Errors are never cached, so a failed or
 /// timed-out query is retried rather than replayed.
 ///
-/// Known limits: this does not rescue a single query that exceeds the 5s route
-/// timeout (that future is dropped before it can populate the cache — mitigating
-/// it would need a background compute like `/recommend`, or a longer timeout).
-/// And because these endpoints are POST, standard shared HTTP caches will not
-/// reuse them; this server-side cache is what actually collapses the herd.
+/// A single query that exceeds the 5s route timeout is handled by [`cached_read`],
+/// which runs the fill in a detached task so it survives the handler being
+/// dropped and warms the cache for the retry. It still does not *bound* a runaway
+/// query — that would need a query budget on the repo side.
+///
+/// Known limit: because these endpoints are POST, standard shared HTTP caches
+/// will not reuse them; this server-side cache is what actually collapses the
+/// herd.
 #[derive(Clone)]
 pub(crate) struct OpenRankingReadCache {
     rank: Cache<String, RankResponse>,
@@ -348,6 +351,35 @@ impl OpenRankingReadCache {
 impl Default for OpenRankingReadCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Run a cache-backed read so the cache fill outlives the request future.
+///
+/// The `try_get_with` compute runs in a detached task. If the 5s route timeout
+/// cancels the handler, that task keeps running, completes the query, and fills
+/// the cache — so the client's retry hits the warm cache instead of re-running
+/// the full query. Without detaching, the timeout drops the compute future
+/// before it can populate the cache and every retry recomputes from scratch.
+///
+/// This is the minimal background-compute mitigation for the route-timeout limit
+/// noted on [`OpenRankingReadCache`]. It does not cap how long a runaway query
+/// may run; it only ensures a query that does finish is not thrown away.
+async fn cached_read<V, F>(
+    cache: Cache<String, V>,
+    key: String,
+    compute: F,
+) -> Result<V, OpenRankingError>
+where
+    V: Clone + Send + Sync + 'static,
+    F: std::future::Future<Output = Result<V, OpenRankingError>> + Send + 'static,
+{
+    match tokio::spawn(async move { cache.try_get_with(key, compute).await }).await {
+        Ok(result) => result.map_err(|err| (*err).clone()),
+        Err(join_err) => {
+            error!("open-ranking cached read task failed: {join_err}");
+            Err(OpenRankingError::Internal)
+        }
     }
 }
 
@@ -480,12 +512,12 @@ where
     let request: RankRequest = parse_json_body(&body)?;
     let key = rank_cache_key(&request);
     let repo = state.repo.clone();
-    let response = state
-        .open_ranking_read_cache
-        .rank
-        .try_get_with(key, async move { rank(repo.as_ref(), request).await })
-        .await
-        .map_err(|err| (*err).clone())?;
+    let response = cached_read(
+        state.open_ranking_read_cache.rank.clone(),
+        key,
+        async move { rank(repo.as_ref(), request).await },
+    )
+    .await?;
     let ttl = response.ttl;
     Ok(cached_json(response, ttl))
 }
@@ -595,12 +627,12 @@ where
     let request: ReputationRequest = parse_json_body(&body)?;
     let key = reputation_cache_key(&request);
     let repo = state.repo.clone();
-    let response = state
-        .open_ranking_read_cache
-        .reputation
-        .try_get_with(key, async move { reputation(repo.as_ref(), request).await })
-        .await
-        .map_err(|err| (*err).clone())?;
+    let response = cached_read(
+        state.open_ranking_read_cache.reputation.clone(),
+        key,
+        async move { reputation(repo.as_ref(), request).await },
+    )
+    .await?;
     let ttl = response.ttl;
     Ok(cached_json(response, ttl))
 }
@@ -686,12 +718,12 @@ where
     let request: FollowersRequest = parse_json_body(&body)?;
     let key = followers_cache_key(&request);
     let repo = state.repo.clone();
-    let response = state
-        .open_ranking_read_cache
-        .followers
-        .try_get_with(key, async move { followers(repo.as_ref(), request).await })
-        .await
-        .map_err(|err| (*err).clone())?;
+    let response = cached_read(
+        state.open_ranking_read_cache.followers.clone(),
+        key,
+        async move { followers(repo.as_ref(), request).await },
+    )
+    .await?;
     let ttl = response.ttl;
     Ok(cached_json(response, ttl))
 }
@@ -912,6 +944,9 @@ mod tests {
         /// before recovering, to exercise the queue's self-healing Failed path.
         recommendation_failures: Arc<AtomicUsize>,
         fail: bool,
+        /// Artificial latency for the synchronous heavy reads, so a test can model
+        /// a query that outlives the route timeout. Zero (the default) is a no-op.
+        query_delay: Duration,
     }
 
     impl RepoTrait for MockRepo {
@@ -936,6 +971,9 @@ mod tests {
             self.account_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
+            }
+            if !self.query_delay.is_zero() {
+                tokio::time::sleep(self.query_delay).await;
             }
             Ok(self.accounts.get(pubkey).cloned())
         }
@@ -1985,6 +2023,48 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "the repeated identical request must be served from the result cache"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_dropped_by_the_route_timeout_still_warms_the_cache() {
+        // A single heavy read that runs past the 5s route timeout used to lose its
+        // work: the timeout drops the handler future, which dropped the cache-fill
+        // future, so the result was never cached and every retry re-ran the full
+        // query. The fill now runs in a detached task that outlives the handler,
+        // so the query completes once in the background and the retry is served
+        // from the warm cache.
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 10, 2))]),
+            account_calls: calls.clone(),
+            query_delay: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() }));
+
+        // Model the route timeout: give up on the slow first read well before its
+        // 150ms query can return, dropping the handler future.
+        let first = serve_reputation(State(state.clone()), body.clone());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), first)
+                .await
+                .is_err(),
+            "the slow first read is dropped before it returns (route timeout)"
+        );
+
+        // Let the detached cache fill finish in the background, then retry.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        serve_reputation(State(state), body)
+            .await
+            .expect("the retry succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the detached fill must warm the cache so the retry does not recompute"
         );
     }
 
