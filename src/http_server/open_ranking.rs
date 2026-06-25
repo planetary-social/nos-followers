@@ -431,43 +431,39 @@ fn reputation_cache_key(request: &ReputationRequest) -> String {
     )
 }
 
-/// Cache key for `/followers`: pubkey + limit + algorithm.
-fn followers_cache_key(request: &FollowersRequest) -> String {
+/// Cache key for `/followers`, computed from the *validated* request (see
+/// [`NormalizedFollowers`]): the canonical 64-char hex pubkey (which never
+/// contains the `|` separator), the effective limit (default applied), and the
+/// resolved algorithm id. Keying after validation means a malformed pubkey is
+/// rejected before it can read or populate the cache.
+fn followers_cache_key(normalized: &NormalizedFollowers) -> String {
     format!(
         "{}|{}|{}",
-        request.pubkey.as_deref().unwrap_or(""),
-        request.limit.map(|l| l.to_string()).unwrap_or_default(),
-        request.algorithm.as_deref().unwrap_or("")
+        normalized.pubkey.to_hex(),
+        normalized.limit,
+        normalized.algorithm,
     )
 }
 
-/// Cache key for `/rank`: the order-independent pubkey set plus the algorithm
-/// and limit, rendered as a canonical string (mirroring `reputation_cache_key`
-/// and `followers_cache_key`). The response is determined by the set (it is
-/// sorted by rank and unknowns rank 0), so request order must not split the
-/// cache. Keying on the canonical representation rather than a 64-bit hash keeps
-/// distinct requests in distinct entries: a digest could collide and serve one
-/// request's ranks for another's.
-fn rank_cache_key(request: &RankRequest) -> String {
-    let mut pubkeys: Vec<&str> = request.pubkeys.iter().map(String::as_str).collect();
-    pubkeys.sort_unstable();
-    pubkeys.dedup();
-
-    format!(
-        "{}|{}|{}",
-        pubkeys.join(","),
-        request.algorithm.as_deref().unwrap_or(""),
-        request.limit.map(|l| l.to_string()).unwrap_or_default(),
-    )
+/// A validated `/rank` request: the parsed, de-duplicated pubkey set (request
+/// order preserved), the resolved algorithm id, and the *effective* limit (the
+/// `min(default_limit)` clamp `rank` applies). Both the cache key and the query
+/// derive from this single validated form, so the key can never disagree with the
+/// response it caches, and a malformed request is rejected before it can read or
+/// write the cache.
+struct NormalizedRank {
+    pubkeys: Vec<PublicKey>,
+    algorithm: &'static str,
+    limit: usize,
 }
 
-/// Core `/rank` logic (ORE-02): rank the requested pubkeys by global PageRank.
-pub(crate) async fn rank<T: RepoTrait>(
-    repo: &T,
-    request: RankRequest,
-) -> Result<RankResponse, OpenRankingError> {
+/// Validate and normalize a raw `/rank` body (ORE-01/02). The single authority
+/// for `/rank` validation: both `serve_rank` (to key + gate before the cache) and
+/// `rank` (the core compute) go through it, so the key and the response cannot
+/// drift.
+fn normalize_rank(request: &RankRequest) -> Result<NormalizedRank, OpenRankingError> {
     // ORE-01: validate the requested algorithm (defaults to the first listed).
-    resolve_algorithm(RANK_ENDPOINT, request.algorithm.as_deref())?;
+    let algorithm = resolve_algorithm(RANK_ENDPOINT, request.algorithm.as_deref())?;
 
     // ORE-02: pubkeys MUST contain at least one entry.
     if request.pubkeys.is_empty() {
@@ -492,15 +488,6 @@ pub(crate) async fn rank<T: RepoTrait>(
         }
     }
 
-    // ORE-02: the default limit is the number of requested pubkeys, and a larger
-    // limit is silently clamped to that count.
-    let default_limit = request.pubkeys.len();
-    let limit = request
-        .limit
-        .map(|limit| limit as usize)
-        .unwrap_or(default_limit)
-        .min(default_limit);
-
     // Parse and de-duplicate the pubkeys, preserving request order.
     let mut seen = HashSet::new();
     let mut pubkeys = Vec::with_capacity(request.pubkeys.len());
@@ -513,13 +500,61 @@ pub(crate) async fn rank<T: RepoTrait>(
         }
     }
 
-    let pageranks = repo.get_pageranks(&pubkeys).await.map_err(|e| {
+    // ORE-02: the default limit is the number of (distinct) requested pubkeys, and
+    // a larger limit is silently clamped to that count. Clamping to the effective
+    // value here means requests whose limits differ only *above* that bound share
+    // one cache entry instead of splitting it. The de-duplicated count is
+    // equivalent to the raw count for the response (only that many profiles exist
+    // to truncate) and keeps the key canonical.
+    let default_limit = pubkeys.len();
+    let limit = request
+        .limit
+        .map(|limit| limit as usize)
+        .unwrap_or(default_limit)
+        .min(default_limit);
+
+    Ok(NormalizedRank {
+        pubkeys,
+        algorithm: algorithm.id,
+        limit,
+    })
+}
+
+/// Cache key for `/rank`, computed from the *validated* request so distinct
+/// requests always land in distinct entries. The pubkeys are canonical 64-char
+/// hex (which never contain the `,` separator), sorted so request order does not
+/// split the cache, and joined with the resolved algorithm id and the effective
+/// limit. Because the key is built only after validation, a malformed request
+/// (e.g. a single token containing a comma) is rejected before it could collide
+/// with a multi-element set's entry — and a 64-bit hash, which the previous
+/// implementation used, could silently collide and serve one request's ranks for
+/// another's.
+fn rank_cache_key(normalized: &NormalizedRank) -> String {
+    let mut pubkeys: Vec<String> = normalized.pubkeys.iter().map(PublicKey::to_hex).collect();
+    pubkeys.sort_unstable();
+
+    format!(
+        "{}|{}|{}",
+        pubkeys.join(","),
+        normalized.algorithm,
+        normalized.limit,
+    )
+}
+
+/// Run the `/rank` query for an already-validated request (ORE-02): rank the
+/// requested pubkeys by global PageRank.
+async fn rank_with<T: RepoTrait>(
+    repo: &T,
+    normalized: NormalizedRank,
+) -> Result<RankResponse, OpenRankingError> {
+    let pageranks = repo.get_pageranks(&normalized.pubkeys).await.map_err(|e| {
         error!("/rank get_pageranks failed: {e}");
         OpenRankingError::Internal
     })?;
 
     // ORE-02: return a rank for every requested pubkey; unknown pubkeys rank 0.
-    let mut profiles: Vec<Profile> = pubkeys
+    let mut profiles: Vec<Profile> = normalized
+        .pubkeys
         .iter()
         .map(|pubkey| Profile {
             pubkey: pubkey.to_hex(),
@@ -528,7 +563,7 @@ pub(crate) async fn rank<T: RepoTrait>(
         .collect();
 
     profiles.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(Ordering::Equal));
-    profiles.truncate(limit);
+    profiles.truncate(normalized.limit);
 
     Ok(RankResponse {
         profiles,
@@ -547,13 +582,16 @@ where
 {
     let _latency = LatencyGuard::new(RANK_ENDPOINT);
     let request: RankRequest = parse_json_body(&body)?;
-    let key = rank_cache_key(&request);
+    // Validate first, then key: a malformed request errors here, before it can
+    // read or populate the cache, and the key derives from the canonical form.
+    let normalized = normalize_rank(&request)?;
+    let key = rank_cache_key(&normalized);
     let repo = state.repo.clone();
     let response = cached_read(
         state.open_ranking_read_cache.read_fill_semaphore.clone(),
         state.open_ranking_read_cache.rank.clone(),
         key,
-        async move { rank(repo.as_ref(), request).await },
+        async move { rank_with(repo.as_ref(), normalized).await },
     )
     .await?;
     let ttl = response.ttl;
@@ -715,19 +753,45 @@ fn resolve_limit(
     }
 }
 
-/// Core `/followers` logic (ORE-04): a pubkey's top followers by PageRank.
-pub(crate) async fn followers<T: RepoTrait>(
-    repo: &T,
-    request: FollowersRequest,
-) -> Result<FollowersResponse, OpenRankingError> {
-    resolve_algorithm(FOLLOWERS_ENDPOINT, request.algorithm.as_deref())?;
+/// A validated `/followers` request: the parsed canonical pubkey, the resolved
+/// algorithm id, and the effective limit (default applied). Both the cache key
+/// and the query derive from this single validated form (mirroring
+/// [`NormalizedRank`]).
+struct NormalizedFollowers {
+    pubkey: PublicKey,
+    algorithm: &'static str,
+    limit: usize,
+}
+
+/// Validate and normalize a raw `/followers` body (ORE-01/04). The single
+/// authority for `/followers` validation, shared by `serve_followers` (to key +
+/// gate before the cache) and `followers` (the core compute).
+fn normalize_followers(
+    request: &FollowersRequest,
+) -> Result<NormalizedFollowers, OpenRankingError> {
+    let algorithm = resolve_algorithm(FOLLOWERS_ENDPOINT, request.algorithm.as_deref())?;
     let pubkey = parse_required_pubkey(request.pubkey.as_deref())?;
     let limit = resolve_limit(request.limit, DEFAULT_LIMIT, MAX_LIMIT)?;
+    Ok(NormalizedFollowers {
+        pubkey,
+        algorithm: algorithm.id,
+        limit,
+    })
+}
 
-    let (top_followers, total) = repo.get_top_followers(&pubkey, limit).await.map_err(|e| {
-        error!("/followers get_top_followers failed: {e}");
-        OpenRankingError::Internal
-    })?;
+/// Run the `/followers` query for an already-validated request (ORE-04): a
+/// pubkey's top followers by PageRank.
+async fn followers_with<T: RepoTrait>(
+    repo: &T,
+    normalized: NormalizedFollowers,
+) -> Result<FollowersResponse, OpenRankingError> {
+    let (top_followers, total) = repo
+        .get_top_followers(&normalized.pubkey, normalized.limit)
+        .await
+        .map_err(|e| {
+            error!("/followers get_top_followers failed: {e}");
+            OpenRankingError::Internal
+        })?;
 
     let profiles = top_followers
         .into_iter()
@@ -755,13 +819,16 @@ where
 {
     let _latency = LatencyGuard::new(FOLLOWERS_ENDPOINT);
     let request: FollowersRequest = parse_json_body(&body)?;
-    let key = followers_cache_key(&request);
+    // Validate first, then key: a malformed request errors here, before it can
+    // read or populate the cache, and the key derives from the canonical form.
+    let normalized = normalize_followers(&request)?;
+    let key = followers_cache_key(&normalized);
     let repo = state.repo.clone();
     let response = cached_read(
         state.open_ranking_read_cache.read_fill_semaphore.clone(),
         state.open_ranking_read_cache.followers.clone(),
         key,
-        async move { followers(repo.as_ref(), request).await },
+        async move { followers_with(repo.as_ref(), normalized).await },
     )
     .await?;
     let ttl = response.ttl;
@@ -1071,6 +1138,25 @@ mod tests {
         }
     }
 
+    /// Validate and run `/rank` in one call, exercising the same
+    /// `normalize_rank` then `rank_with` path the handler uses. (The handler keys
+    /// between the two steps; tests that only assert on the response use this
+    /// shorthand.)
+    async fn rank<T: RepoTrait>(
+        repo: &T,
+        request: RankRequest,
+    ) -> Result<RankResponse, OpenRankingError> {
+        rank_with(repo, normalize_rank(&request)?).await
+    }
+
+    /// Validate + run `/followers` in one call (see `rank`).
+    async fn followers<T: RepoTrait>(
+        repo: &T,
+        request: FollowersRequest,
+    ) -> Result<FollowersResponse, OpenRankingError> {
+        followers_with(repo, normalize_followers(&request)?).await
+    }
+
     // ---- capability document (ORE-01) ----
 
     #[test]
@@ -1258,75 +1344,165 @@ mod tests {
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // ---- /rank cache key (canonical, collision-safe — not a 64-bit hash) ----
+    // ---- /rank cache key (validated, canonical, collision-safe) ----
 
     #[test]
-    fn rank_cache_key_is_canonical_sorted_and_deduplicated() {
-        // The key is the canonical request representation — the sorted,
-        // de-duplicated pubkey set plus algorithm and limit — so distinct
-        // requests always land in distinct cache entries. A 64-bit hash digest
-        // (the previous implementation) risks silent collisions that would
-        // serve one request's ranks for another's.
-        let key = rank_cache_key(&RankRequest {
-            pubkeys: vec!["bbbb".into(), "aaaa".into(), "bbbb".into()],
+    fn rank_cache_key_is_canonical_sorted_deduplicated_and_clamped() {
+        // The key is built from the validated request: canonical hex pubkeys,
+        // sorted and de-duplicated, plus the resolved algorithm and the effective
+        // (clamped) limit. Here limit 5 clamps to the 2 distinct pubkeys.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let normalized = normalize_rank(&RankRequest {
+            pubkeys: vec![b.to_hex(), a.to_hex(), b.to_hex()],
             algorithm: Some("pagerank".into()),
             limit: Some(5),
-        });
+        })
+        .expect("a well-formed request normalizes");
 
-        assert_eq!(key, "aaaa,bbbb|pagerank|5");
+        let mut hexes = [a.to_hex(), b.to_hex()];
+        hexes.sort();
+        assert_eq!(
+            rank_cache_key(&normalized),
+            format!("{}|pagerank|2", hexes.join(","))
+        );
     }
 
     #[test]
-    fn rank_cache_key_renders_absent_algorithm_and_limit_as_empty_fields() {
-        // Absent optionals render as empty fields (mirroring the sibling keys),
-        // and a present limit is always >= 1 (smaller values are rejected before
-        // caching), so `None` can never collide with a real limit.
-        let key = rank_cache_key(&RankRequest {
-            pubkeys: vec!["aaaa".into()],
+    fn rank_cache_key_fills_absent_algorithm_and_limit_with_resolved_defaults() {
+        // Absent optionals are normalized before keying: the algorithm resolves
+        // to the endpoint default and the limit to the distinct pubkey count —
+        // canonical values, never empty fields.
+        let a = fresh_pubkey();
+        let normalized = normalize_rank(&RankRequest {
+            pubkeys: vec![a.to_hex()],
             algorithm: None,
             limit: None,
-        });
+        })
+        .expect("a well-formed request normalizes");
 
-        assert_eq!(key, "aaaa||");
+        assert_eq!(
+            rank_cache_key(&normalized),
+            format!("{}|pagerank|1", a.to_hex())
+        );
     }
 
     #[test]
-    fn rank_cache_key_distinguishes_requests_that_differ_in_any_field() {
-        let base = RankRequest {
-            pubkeys: vec!["aaaa".into(), "bbbb".into()],
-            algorithm: Some("pagerank".into()),
-            limit: Some(5),
-        };
-        let key = rank_cache_key(&base);
+    fn rank_cache_key_distinguishes_a_different_set_or_effective_limit() {
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let c = fresh_pubkey();
 
-        // A different pubkey set, algorithm, or limit must each change the key:
-        // no field may be lost to a collision.
+        let key = rank_cache_key(&normalize_rank(&rank_request(&[a, b], None)).unwrap());
+
+        // A different pubkey set must change the key.
         assert_ne!(
-            rank_cache_key(&RankRequest {
-                pubkeys: vec!["aaaa".into(), "cccc".into()],
-                algorithm: Some("pagerank".into()),
-                limit: Some(5),
-            }),
+            rank_cache_key(&normalize_rank(&rank_request(&[a, c], None)).unwrap()),
             key,
             "a different pubkey set must change the key"
         );
+
+        // A different *effective* limit must change the key: [a,b,c] with limit 2
+        // clamps to 2, while the default clamps to 3.
         assert_ne!(
-            rank_cache_key(&RankRequest {
-                pubkeys: vec!["aaaa".into(), "bbbb".into()],
-                algorithm: Some("followers".into()),
-                limit: Some(5),
-            }),
-            key,
-            "a different algorithm must change the key"
+            rank_cache_key(&normalize_rank(&rank_request(&[a, b, c], Some(2))).unwrap()),
+            rank_cache_key(&normalize_rank(&rank_request(&[a, b, c], None)).unwrap()),
+            "a different effective limit must change the key"
         );
-        assert_ne!(
-            rank_cache_key(&RankRequest {
-                pubkeys: vec!["aaaa".into(), "bbbb".into()],
-                algorithm: Some("pagerank".into()),
-                limit: Some(6),
-            }),
-            key,
-            "a different limit must change the key"
+    }
+
+    #[test]
+    fn rank_cache_key_clamps_so_oversized_limits_share_one_entry() {
+        // Two requests for the same set whose limits both exceed the effective
+        // bound must share a single cache entry, not split into redundant ones.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let five = rank_cache_key(&normalize_rank(&rank_request(&[a, b], Some(5))).unwrap());
+        let hundred = rank_cache_key(&normalize_rank(&rank_request(&[a, b], Some(100))).unwrap());
+        let default = rank_cache_key(&normalize_rank(&rank_request(&[a, b], None)).unwrap());
+
+        assert_eq!(
+            five, hundred,
+            "limits above the effective bound share one key"
+        );
+        assert_eq!(five, default, "the default limit equals the clamped limit");
+    }
+
+    #[test]
+    fn rank_normalization_rejects_a_comma_spliced_token() {
+        // A single token that splices two valid hex keys with the `,` separator is
+        // the exact shape a raw comma-join could let collide with the valid
+        // two-element set. Validating first rejects it, so it never reaches the
+        // cache to collide.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let spliced = format!("{},{}", a.to_hex(), b.to_hex());
+        let malformed = RankRequest {
+            pubkeys: vec![spliced],
+            algorithm: None,
+            limit: None,
+        };
+        assert!(
+            normalize_rank(&malformed).is_err(),
+            "a comma-spliced token is not a valid pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_comma_request_is_not_served_a_cached_rank_response() {
+        // End-to-end: a valid two-element request warms the cache; a malformed
+        // request whose single token splices the same two hexes with a comma must
+        // be rejected, never served the cached valid response.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let repo = MockRepo {
+            pageranks: HashMap::from([(a, 0.9), (b, 0.1)]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let valid_body = json_body(&serde_json::json!({ "pubkeys": [a.to_hex(), b.to_hex()] }));
+        serve_rank(State(state.clone()), valid_body)
+            .await
+            .expect("the valid two-element request succeeds");
+
+        let spliced = format!("{},{}", a.to_hex(), b.to_hex());
+        let malformed_body = json_body(&serde_json::json!({ "pubkeys": [spliced] }));
+        let error = serve_rank(State(state), malformed_body)
+            .await
+            .expect_err("the malformed comma request must be rejected, not served from cache");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn followers_cache_key_is_canonical_and_uses_the_effective_limit() {
+        // Absent limit normalizes to DEFAULT_LIMIT and absent algorithm to the
+        // resolved default before keying — canonical, not empty fields — on a
+        // canonical hex pubkey.
+        let p = fresh_pubkey();
+        let normalized = normalize_followers(&FollowersRequest {
+            pubkey: Some(p.to_hex()),
+            algorithm: None,
+            limit: None,
+        })
+        .expect("a well-formed request normalizes");
+
+        assert_eq!(
+            followers_cache_key(&normalized),
+            format!("{}|{}|pagerank", p.to_hex(), DEFAULT_LIMIT)
+        );
+    }
+
+    #[test]
+    fn followers_normalization_rejects_a_malformed_pubkey() {
+        let normalized = normalize_followers(&FollowersRequest {
+            pubkey: Some("not-a-pubkey".into()),
+            algorithm: None,
+            limit: None,
+        });
+        assert!(
+            normalized.is_err(),
+            "a malformed pubkey is rejected before it can be keyed or cached"
         );
     }
 
