@@ -65,33 +65,73 @@ where
 /// On a successful dispatch the request path hands the single pending release to
 /// the worker: it `disarm`s its local guard and the worker `adopt`s the
 /// reservation, so the slot is released exactly once, when the compute finishes.
+///
+/// The request path's guard also carries [`SlotCleanup`]: if its future is
+/// dropped/cancelled *before* a successful dispatch (e.g. the client disconnects
+/// or the route timeout fires mid-await), the in-flight `Pending` status and the
+/// `pending_requests` entry have already been recorded but no request will ever
+/// run, so the guard's Drop clears them — otherwise every retry for that key
+/// would join a phantom `Pending` and wedge until the status TTL expires. The
+/// worker's adopted guard carries no cleanup: its Drop is the normal completion
+/// release and must not touch the status the worker is legitimately managing.
 struct QueueSlot {
     queue_size: Arc<AtomicUsize>,
+    /// Phantom-state cleanup to run if this guard releases the slot itself (the
+    /// request-path reservation was dropped before a successful dispatch). `None`
+    /// for the worker's adopted slot.
+    cleanup: Option<SlotCleanup>,
     armed: bool,
 }
 
+/// The state a cancelled request-path reservation must roll back: the `Pending`
+/// status entry and the `pending_requests` bookkeeping entry for its key.
+struct SlotCleanup {
+    status_cache: Cache<String, RecommendationStatus>,
+    pending_requests: Arc<RwLock<Vec<String>>>,
+    cache_key: String,
+}
+
+impl SlotCleanup {
+    /// Remove the phantom `Pending` status and the `pending_requests` entry,
+    /// mirroring the send-failure cleanup, so a later retry re-enqueues instead of
+    /// joining a request that will never run.
+    async fn run(self) {
+        {
+            let mut pending = self.pending_requests.write().await;
+            pending.retain(|k| k != &self.cache_key);
+        }
+        self.status_cache.invalidate(&self.cache_key).await;
+    }
+}
+
 impl QueueSlot {
-    /// Reserve a fresh slot (counter += 1) and publish the new depth.
-    fn reserve(queue_size: Arc<AtomicUsize>) -> Self {
+    /// Reserve a fresh slot (counter += 1) and publish the new depth. `cleanup`
+    /// rolls back the phantom `Pending`/`pending_requests` state if this guard is
+    /// dropped before its reservation is disarmed on a successful dispatch.
+    fn reserve(queue_size: Arc<AtomicUsize>, cleanup: SlotCleanup) -> Self {
         let depth = queue_size.fetch_add(1, Ordering::Relaxed) + 1;
         crate::metrics::recommendation_queue_depth().set(depth as f64);
         Self {
             queue_size,
+            cleanup: Some(cleanup),
             armed: true,
         }
     }
 
     /// Adopt an already-reserved slot without changing the counter, so its single
     /// release happens when this guard drops. Pairs with `disarm` on the handoff.
+    /// Carries no cleanup: the worker owns the status from here on.
     fn adopt(queue_size: Arc<AtomicUsize>) -> Self {
         Self {
             queue_size,
+            cleanup: None,
             armed: true,
         }
     }
 
-    /// Hand the pending release to another owner: this guard will not release on
-    /// drop. Consumes the guard so it cannot be used afterwards.
+    /// Hand the pending release to another owner: this guard will not release the
+    /// slot or run its cleanup on drop. Consumes the guard so it cannot be used
+    /// afterwards.
     fn disarm(mut self) {
         self.armed = false;
     }
@@ -104,6 +144,24 @@ impl Drop for QueueSlot {
         }
         let depth = self.queue_size.fetch_sub(1, Ordering::Relaxed) - 1;
         crate::metrics::recommendation_queue_depth().set(depth as f64);
+
+        // Released by this guard before a successful dispatch (cancellation or
+        // send failure): roll back the phantom status/pending state. The rollback
+        // is async (moka + the pending lock) but Drop is sync, so spawn it.
+        if let Some(cleanup) = self.cleanup.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(cleanup.run());
+                }
+                Err(_) => {
+                    warn!(
+                        "queue slot dropped outside a runtime; phantom recommendation status \
+                         for {} not cleared",
+                        cleanup.cache_key
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -192,8 +250,18 @@ where
         // We won the single-flight for this key. Reserve the queue slot *first*,
         // via an RAII guard, so the reservation is released on every exit path
         // below — including a dropped/cancelled future between here and dispatch.
-        // The guard also keeps the depth gauge in lockstep with the counter.
-        let slot = QueueSlot::reserve(self.queue_size.clone());
+        // The guard also keeps the depth gauge in lockstep with the counter and,
+        // until it is disarmed on a successful dispatch, rolls back the phantom
+        // `Pending`/`pending_requests` state we are about to record if this future
+        // is dropped before the request is sent.
+        let slot = QueueSlot::reserve(
+            self.queue_size.clone(),
+            SlotCleanup {
+                status_cache: self.status_cache.clone(),
+                pending_requests: self.pending_requests.clone(),
+                cache_key: cache_key.clone(),
+            },
+        );
 
         // Record the real queue position and dispatch the background warm-up.
         let position = {
@@ -214,12 +282,11 @@ where
             cache_key: cache_key.clone(),
         };
         if self.request_sender.send(request).is_err() {
-            // Dispatch failed: clear the in-flight status so a later retry
-            // re-enqueues instead of joining a phantom request. The `slot` guard
-            // releases the reservation as it drops on return.
-            let mut pending = self.pending_requests.write().await;
-            pending.retain(|k| k != &cache_key);
-            self.status_cache.invalidate(&cache_key).await;
+            // Dispatch failed: returning here drops the still-armed `slot` guard,
+            // whose Drop releases the reservation *and* runs its cleanup — clearing
+            // the in-flight status and the pending_requests entry so a later retry
+            // re-enqueues instead of joining a phantom request. This is the same
+            // rollback a dropped/cancelled future gets, via one code path.
             return Err("Failed to queue recommendation request".into());
         }
 
@@ -652,6 +719,134 @@ mod tests {
         );
     }
 
+    /// Beyond releasing the slot, a request future dropped after it recorded its
+    /// in-flight `Pending` status but before it dispatched must also clear that
+    /// phantom status (and its pending_requests entry). Otherwise every later
+    /// retry for the key would join a `Pending` that no worker will ever complete
+    /// and wedge until the 5-minute status TTL expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_cancelled_before_dispatch_clears_the_phantom_pending_status() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(queue_with_worker(calls));
+        let pov = Keys::generate().public_key();
+        let cache_key = cache_key_for(&pov, None, Some(10));
+
+        // Park the winning request after it reserves its slot and records
+        // `Pending` but before it can dispatch, by holding the pending lock.
+        let lock = queue.pending_requests.write().await;
+
+        let request = {
+            let queue = queue.clone();
+            tokio::spawn(async move { queue.request_recommendations(pov, None, Some(10)).await })
+        };
+
+        // Wait until it has parked (slot reserved == Pending already recorded).
+        let mut reserved = false;
+        for _ in 0..500 {
+            if queue.queue_size.load(Ordering::SeqCst) == 1 {
+                reserved = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            reserved,
+            "the winning request reserves its slot and records Pending before the await"
+        );
+        assert!(
+            matches!(
+                queue.status_cache.get(&cache_key).await,
+                Some(RecommendationStatus::Pending { .. })
+            ),
+            "a Pending status is recorded before dispatch"
+        );
+
+        // Cancel mid-await, then release the lock so the spawned cleanup can run.
+        request.abort();
+        let _ = request.await;
+        drop(lock);
+
+        // The guard's cleanup must clear the phantom Pending, the pending entry,
+        // and the slot.
+        let mut cleared = false;
+        for _ in 0..500 {
+            if queue.status_cache.get(&cache_key).await.is_none()
+                && queue.pending_requests.read().await.is_empty()
+                && queue.queue_size.load(Ordering::SeqCst) == 0
+            {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            cleared,
+            "a cancelled request must clear its phantom Pending status, pending entry, and slot"
+        );
+
+        // A fresh request for the same key must re-enqueue a new warm-up rather
+        // than join the (now cleared) phantom — proving the wedge is gone.
+        let status = queue
+            .request_recommendations(pov, None, Some(10))
+            .await
+            .expect("the retry re-enqueues");
+        assert!(
+            matches!(status, RecommendationStatus::Pending { .. }),
+            "the retry starts a new warm-up instead of joining a phantom"
+        );
+    }
+
+    /// A disarmed slot is the successful-dispatch handoff: the worker now owns the
+    /// status, so the request-path guard must NOT clear it (nor release the slot —
+    /// the worker's adopted guard does that on completion).
+    #[tokio::test]
+    async fn a_disarmed_queue_slot_keeps_the_pending_status() {
+        let status_cache: Cache<String, RecommendationStatus> = Cache::builder().build();
+        let pending: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+        let queue_size = Arc::new(AtomicUsize::new(0));
+        let key = "k".to_string();
+
+        status_cache
+            .insert(key.clone(), RecommendationStatus::Pending { position: 1 })
+            .await;
+        pending.write().await.push(key.clone());
+
+        let slot = QueueSlot::reserve(
+            queue_size.clone(),
+            SlotCleanup {
+                status_cache: status_cache.clone(),
+                pending_requests: pending.clone(),
+                cache_key: key.clone(),
+            },
+        );
+        assert_eq!(queue_size.load(Ordering::Relaxed), 1);
+
+        // Successful dispatch hands the release to the worker.
+        slot.disarm();
+
+        // Give any (erroneously) spawned cleanup a chance to run before asserting.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            matches!(
+                status_cache.get(&key).await,
+                Some(RecommendationStatus::Pending { .. })
+            ),
+            "a disarmed slot must not clear the status the worker now owns"
+        );
+        assert!(
+            !pending.read().await.is_empty(),
+            "a disarmed slot must not touch pending_requests"
+        );
+        assert_eq!(
+            queue_size.load(Ordering::Relaxed),
+            1,
+            "a disarmed slot leaves the counter for the worker's adopted release"
+        );
+    }
+
     /// Two cold warm-ups for *distinct* keys must run at the same time when the
     /// pool has more than one worker, instead of serializing behind a single
     /// worker. Regression test for the single-worker drain.
@@ -708,11 +903,21 @@ mod tests {
         );
     }
 
+    /// A throwaway cleanup for the counter-focused slot tests, which do not
+    /// exercise the phantom-state rollback.
+    fn unused_cleanup() -> SlotCleanup {
+        SlotCleanup {
+            status_cache: Cache::builder().build(),
+            pending_requests: Arc::new(RwLock::new(Vec::new())),
+            cache_key: "unused".to_string(),
+        }
+    }
+
     #[test]
     fn reserve_then_drop_conserves_the_slot_counter() {
         let counter = Arc::new(AtomicUsize::new(0));
         {
-            let _slot = QueueSlot::reserve(counter.clone());
+            let _slot = QueueSlot::reserve(counter.clone(), unused_cleanup());
             assert_eq!(counter.load(Ordering::SeqCst), 1, "reserve takes a slot");
         }
         assert_eq!(counter.load(Ordering::SeqCst), 0, "drop releases the slot");
@@ -721,7 +926,7 @@ mod tests {
     #[test]
     fn a_disarmed_slot_does_not_release_on_drop() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let slot = QueueSlot::reserve(counter.clone());
+        let slot = QueueSlot::reserve(counter.clone(), unused_cleanup());
         slot.disarm();
         assert_eq!(
             counter.load(Ordering::SeqCst),
