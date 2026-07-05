@@ -133,10 +133,39 @@ fn spawn_subscription_shutdown(client: Arc<Client>, cancellation_token: Cancella
     });
 }
 
+/// How a notification-pump attempt ended, so [`retry_until_cancelled`] can tell a
+/// clean stream end from a dispatcher-death with no receivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpOutcome {
+    /// The relay closed the stream (or shutdown was requested) with receivers
+    /// still attached — reconnect promptly.
+    StreamEnded,
+    /// The dispatcher fan-out has no receivers left. Re-subscribing immediately
+    /// would hot-spin (the retry loop resets the backoff on a clean `Ok`), so this
+    /// is surfaced as an error to trigger backoff instead.
+    ReceiversGone,
+}
+
+impl PumpOutcome {
+    /// Map the outcome onto the retry loop's `Result` contract: a clean stream end
+    /// is `Ok` (backoff resets, reconnect promptly); no receivers is `Err` (backoff
+    /// grows, so a persistent dispatcher-death backs off rather than re-subscribing
+    /// every second). Never cancels the shared token either way.
+    fn into_result(self) -> Result<()> {
+        match self {
+            PumpOutcome::StreamEnded => Ok(()),
+            PumpOutcome::ReceiversGone => {
+                bail!("relay subscription dropped: no event receivers remain")
+            }
+        }
+    }
+}
+
 /// One subscription attempt: (re)subscribe and pump notifications until the relay
 /// stream ends or the shared token is cancelled. Returns `Err` on a subscribe
-/// failure so the retry loop can back off — but never cancels the shared token,
-/// so a relay problem cannot tear down the HTTP server or the worker pools.
+/// failure *or* when the dispatcher fan-out has no receivers left, so the retry
+/// loop backs off instead of re-subscribing tightly — but never cancels the shared
+/// token, so a relay problem cannot tear down the HTTP server or the worker pools.
 async fn run_subscription(
     client: &Client,
     filters: &[Filter],
@@ -156,6 +185,10 @@ async fn run_subscription(
     // retry loop drives it back down when this attempt ends.
     mark_subscription_up(relay_subscribed);
 
+    // Set when the pump leaves because the dispatcher fan-out has no receivers, so
+    // we can back off instead of re-subscribing tightly (see [`PumpOutcome`]).
+    let receivers_gone = AtomicBool::new(false);
+
     client
         .handle_notifications(|notification| async {
             if cancellation_token.is_cancelled() {
@@ -165,9 +198,10 @@ async fn run_subscription(
             if let RelayPoolNotification::Event { event, .. } = notification {
                 debug!("Received event: {}", event.id);
                 if let Err(e) = event_tx.send(event) {
-                    // No receivers left; leave the notification loop so the retry
-                    // loop can re-establish later. Do NOT cancel the shared token.
+                    // No receivers left; leave the notification loop and flag it so
+                    // the retry loop backs off. Do NOT cancel the shared token.
                     error!("Failed to send nostr event: {}", e);
+                    receivers_gone.store(true, Ordering::Relaxed);
                     return Ok(true);
                 }
             }
@@ -177,7 +211,14 @@ async fn run_subscription(
         })
         .await?;
 
-    Ok(())
+    // Distinguish a no-receivers exit (back off) from a clean stream end (reconnect
+    // promptly). A cancelled token also lands here as `StreamEnded`; the retry loop
+    // then observes the cancellation and returns without another attempt.
+    if receivers_gone.load(Ordering::Relaxed) {
+        PumpOutcome::ReceiversGone.into_result()
+    } else {
+        PumpOutcome::StreamEnded.into_result()
+    }
 }
 
 /// Backoff bounds for re-establishing a dropped relay subscription.
@@ -398,6 +439,23 @@ mod tests {
         assert!(
             !relay_subscribed.load(Ordering::Relaxed),
             "a clean return must also flip the /health readiness flag to not-ready"
+        );
+    }
+
+    /// The retry loop resets the backoff to 1s on `Ok(())` and grows it on `Err`.
+    /// So the pump outcome must map a genuine clean stream end to `Ok` (reconnect
+    /// promptly) but a no-receivers exit to `Err` — otherwise a dispatcher-death
+    /// hot-spins re-subscribing every ~1s instead of backing off. This locks that
+    /// contract.
+    #[test]
+    fn pump_outcome_maps_receivers_gone_to_error_and_stream_end_to_ok() {
+        assert!(
+            PumpOutcome::StreamEnded.into_result().is_ok(),
+            "a clean stream end must reconnect promptly (Ok resets the backoff)"
+        );
+        assert!(
+            PumpOutcome::ReceiversGone.into_result().is_err(),
+            "no receivers must back off (Err grows the backoff), not re-subscribe tightly"
         );
     }
 }
