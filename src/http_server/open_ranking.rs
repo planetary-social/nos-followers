@@ -173,6 +173,9 @@ pub(crate) enum OpenRankingError {
     PayloadTooLarge(String),
     /// 422: the request is well-formed but semantically invalid.
     Unprocessable(String),
+    /// 503: the service is temporarily overloaded (the read-fill concurrency
+    /// limit is saturated); the caller should retry after backing off.
+    Overloaded,
     /// 500: an internal error (e.g. the graph database is unavailable).
     Internal,
 }
@@ -195,6 +198,7 @@ impl OpenRankingError {
             Self::MalformedBody(_) => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -204,6 +208,7 @@ impl OpenRankingError {
             Self::MalformedBody(reason)
             | Self::PayloadTooLarge(reason)
             | Self::Unprocessable(reason) => reason,
+            Self::Overloaded => "service overloaded",
             Self::Internal => "internal server error",
         }
     }
@@ -379,16 +384,32 @@ impl Default for OpenRankingReadCache {
 ///
 /// This is the minimal background-compute mitigation for the route-timeout limit
 /// noted on [`OpenRankingReadCache`]. It does not cap how long a runaway query
-/// may run; it only ensures a query that does finish is not thrown away.
+/// may run; it only ensures a query that does finish is not thrown away. A true
+/// per-query wall-clock budget can only be enforced server-side by Neo4j: the
+/// `neo4rs` 0.8 driver exposes no API to set a transaction/query timeout on an
+/// autocommit read (it cannot send `tx_timeout` metadata), and a client-side
+/// `tokio::time::timeout` would only drop the local future while the server keeps
+/// executing the query. Neo4j's `db.transaction.timeout` *is* server-side, but it
+/// is **global** — it would also abort the legitimate long-running batch jobs on
+/// the same instance (`Repo::update_pagerank`, `Repo::update_memory_graph`), so it
+/// cannot be set to a read-sized budget without breaking them. A safe per-read
+/// budget therefore needs per-transaction `tx_timeout` metadata (a `neo4rs`
+/// upgrade) or a read/write split; until then the [`READ_FILL_CONCURRENCY`] permit
+/// below is the effective bound — it caps how *many* such reads run at once, not
+/// how long each runs.
 ///
-/// A permit is acquired from `semaphore` *before* the task is spawned, so the
-/// number of in-flight detached fills (across all three read endpoints) is
-/// bounded by [`READ_FILL_CONCURRENCY`]: a burst of distinct cache-miss keys
-/// cannot launch unbounded uncancellable Neo4j reads. When no permit is
-/// available the read fails fast (sheds load) rather than piling another query
-/// onto an already-saturated database. The permit is moved into the spawned
-/// task and held for the whole fill, including the warm-on-timeout case where
-/// the handler future has been dropped but the task keeps running.
+/// The cache is checked *before* any permit is acquired: a warm hit returns
+/// immediately without a permit, so a burst of cache hits can never exhaust the
+/// pool and starve genuine miss-fills. Only a cache miss — a real Neo4j read —
+/// acquires a permit from `semaphore`, so the number of in-flight detached fills
+/// (across all three read endpoints) is bounded by [`READ_FILL_CONCURRENCY`]: a
+/// burst of distinct cache-miss keys cannot launch unbounded uncancellable Neo4j
+/// reads. When no permit is available the fill sheds load with a 503
+/// ([`OpenRankingError::Overloaded`]) rather than piling another query onto an
+/// already-saturated database. The permit is moved into the spawned task and held
+/// for the whole fill, including the warm-on-timeout case where the handler future
+/// has been dropped but the task keeps running. Single-flight (`try_get_with`)
+/// still collapses concurrent misses on the same key to one Neo4j query.
 async fn cached_read<V, F>(
     semaphore: Arc<Semaphore>,
     cache: Cache<String, V>,
@@ -399,11 +420,17 @@ where
     V: Clone + Send + Sync + 'static,
     F: std::future::Future<Output = Result<V, OpenRankingError>> + Send + 'static,
 {
+    // Cache hit: serve without spending a fill permit.
+    if let Some(hit) = cache.get(&key).await {
+        return Ok(hit);
+    }
+
+    // Cache miss: a genuine Neo4j read — gate it on a permit.
     let permit = match semaphore.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             warn!("open-ranking read fill rejected: concurrency limit reached");
-            return Err(OpenRankingError::Internal);
+            return Err(OpenRankingError::Overloaded);
         }
     };
     match tokio::spawn(async move {
@@ -1225,6 +1252,10 @@ mod tests {
         assert_eq!(
             OpenRankingError::unprocessable("x").status(),
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            OpenRankingError::Overloaded.status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
@@ -2286,8 +2317,9 @@ mod tests {
 
     #[tokio::test]
     async fn cached_read_fails_fast_when_the_fill_concurrency_limit_is_saturated() {
-        // With every fill permit already held, an additional read must shed load
-        // (fail fast) rather than spawn another uncancellable Neo4j query.
+        // With every fill permit already held, an additional *miss* must shed load
+        // (fail fast with a 503) rather than spawn another uncancellable Neo4j
+        // query. The empty cache below forces the miss path that acquires a permit.
         let semaphore = Arc::new(Semaphore::new(1));
         let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
 
@@ -2306,13 +2338,48 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(OpenRankingError::Internal)),
-            "a saturated read-fill limit must fail fast"
+            matches!(result, Err(OpenRankingError::Overloaded)),
+            "a saturated read-fill limit must shed load with a 503 (Overloaded)"
         );
         assert_eq!(
             ran.load(Ordering::SeqCst),
             0,
             "no Neo4j read may be spawned when the limit is saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_serves_a_cache_hit_without_a_permit() {
+        // A warm cache entry must be returned without acquiring a fill permit, so
+        // a burst of cache hits can never exhaust the pool and starve genuine
+        // Neo4j miss-fills. The permit gates fills, not reads served from cache.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+        cache.insert("k".to_string(), 99).await;
+
+        // Hold the only permit so any attempt to acquire one below would fail.
+        let _held = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("the only permit is free");
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_fill = ran.clone();
+        let result = cached_read(semaphore.clone(), cache, "k".to_string(), async move {
+            ran_in_fill.fetch_add(1, Ordering::SeqCst);
+            Ok::<i32, OpenRankingError>(-1)
+        })
+        .await;
+
+        assert_eq!(
+            result.expect("a cache hit is served without a permit"),
+            99,
+            "the warm cached value must be returned"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a cache hit must not run (or spawn) the fill"
         );
     }
 
