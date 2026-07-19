@@ -18,6 +18,7 @@ use nostr_sdk::prelude::*;
 use rustls::crypto::ring;
 use signal::unix::{signal, SignalKind};
 use std::num::NonZeroUsize;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -83,12 +84,19 @@ async fn start_server(settings: Settings) -> Result<()> {
     );
     let recommendation_queue = Arc::new(recommendation_queue);
 
-    // Start recommendation queue worker
-    recommendation_queue.start_worker(
+    // Start the recommendation queue worker pool. A small pool lets distinct cold
+    // warm-ups run in parallel instead of serializing behind a single worker.
+    recommendation_queue.start_workers(
         task_tracker.clone(),
         recommendation_receiver,
         cancellation_token.clone(),
+        settings.recommendation_workers,
     );
+
+    // Shared relay-subscription readiness flag: the relay loop flips it, and the
+    // HTTP server's GET /health reads it (503 until subscribed). Starts false so
+    // the service reports not-ready until the first successful subscribe.
+    let relay_subscribed = Arc::new(AtomicBool::new(false));
 
     // Leave the http server at the top so the health endpoint is available quickly
     info!("Starting HTTP server at port {}", settings.http_port);
@@ -99,6 +107,7 @@ async fn start_server(settings: Settings) -> Result<()> {
         shared_nostr_client.clone(),
         recommendation_queue,
         cancellation_token.clone(),
+        relay_subscribed.clone(),
     )?;
 
     info!("Initializing workers for follower list diff calculation");
@@ -155,6 +164,7 @@ async fn start_server(settings: Settings) -> Result<()> {
         filters,
         event_sender.clone(),
         cancellation_token.clone(),
+        relay_subscribed,
     );
 
     info!("Starting tcp listener for jsonl contact streams");

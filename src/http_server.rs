@@ -13,6 +13,7 @@ use axum_server::Handle;
 use moka::future::Cache;
 use router::create_router;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -27,6 +28,9 @@ where
     pub nostr_client: Arc<U>,
     pub trust_cache: Cache<String, bool>,
     pub recommendation_queue: Arc<RecommendationQueue<T>>,
+    /// Short-lived single-flight result caches for the synchronous open-ranking
+    /// reads (`/rank`, `/reputation`, `/followers`); see [`open_ranking::OpenRankingReadCache`].
+    pub(crate) open_ranking_read_cache: open_ranking::OpenRankingReadCache,
 }
 
 impl<T, U> AppState<T, U>
@@ -49,12 +53,14 @@ where
             nostr_client,
             trust_cache,
             recommendation_queue,
+            open_ranking_read_cache: open_ranking::OpenRankingReadCache::new(),
         }
     }
 }
 
 pub struct HttpServer;
 impl HttpServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn start<T, U>(
         task_tracker: TaskTracker,
         settings: &Settings,
@@ -62,13 +68,14 @@ impl HttpServer {
         nostr_client: Arc<U>,
         recommendation_queue: Arc<RecommendationQueue<T>>,
         cancellation_token: CancellationToken,
+        relay_subscribed: Arc<AtomicBool>,
     ) -> Result<()>
     where
         T: RepoTrait + 'static,
         U: GetEventsOf + 'static,
     {
         let state = Arc::new(AppState::new(repo, nostr_client, recommendation_queue));
-        let router = create_router(state, settings)?;
+        let router = create_router(state, settings, relay_subscribed)?;
 
         start_http_server(task_tracker, settings.http_port, router, cancellation_token);
 

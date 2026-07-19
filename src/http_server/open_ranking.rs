@@ -10,15 +10,18 @@ use crate::relay_subscriber::GetEventsOf;
 use crate::repo::RepoTrait;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header::CACHE_CONTROL, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use moka::future::Cache;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::error;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use tracing::{error, warn};
 
 /// Endpoint paths exposed by this provider. Each is a key in the capability
 /// document (ORE-01) and the route path for the corresponding handler.
@@ -102,8 +105,10 @@ pub(crate) fn capability_document() -> serde_json::Value {
 }
 
 /// `GET /.well-known/open-ranking` (ORE-01). Always 200 with `application/json`.
-pub(crate) async fn serve_capability_document() -> impl IntoResponse {
-    axum::Json(capability_document())
+/// The discovery document is near-static config, so it carries the same hourly
+/// cache hint as the PageRank endpoints it advertises.
+pub(crate) async fn serve_capability_document() -> Response {
+    cached_json(capability_document(), Some(RANK_TTL_SECONDS))
 }
 
 /// Maximum number of pubkeys accepted by `/rank` in a single request (ORE-02).
@@ -139,7 +144,7 @@ pub(crate) struct Profile {
 }
 
 /// The shared `/rank`-shaped response: profiles sorted by rank desc + a TTL hint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct RankResponse {
     pub profiles: Vec<Profile>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,7 +165,7 @@ pub(crate) struct RankRequest {
 
 /// Errors returned by OpenRanking endpoints, mapped to their HTTP status codes.
 /// The human-readable reason is also sent in the `X-Reason` header (ORE-00).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum OpenRankingError {
     /// 400: the request body is malformed or not valid JSON.
     MalformedBody(String),
@@ -168,6 +173,9 @@ pub(crate) enum OpenRankingError {
     PayloadTooLarge(String),
     /// 422: the request is well-formed but semantically invalid.
     Unprocessable(String),
+    /// 503: the service is temporarily overloaded (the read-fill concurrency
+    /// limit is saturated); the caller should retry after backing off.
+    Overloaded,
     /// 500: an internal error (e.g. the graph database is unavailable).
     Internal,
 }
@@ -190,6 +198,7 @@ impl OpenRankingError {
             Self::MalformedBody(_) => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -199,6 +208,7 @@ impl OpenRankingError {
             Self::MalformedBody(reason)
             | Self::PayloadTooLarge(reason)
             | Self::Unprocessable(reason) => reason,
+            Self::Overloaded => "service overloaded",
             Self::Internal => "internal server error",
         }
     }
@@ -258,13 +268,229 @@ fn parse_json_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Ope
         .map_err(|e| OpenRankingError::malformed_body(format!("invalid JSON body: {e}")))
 }
 
-/// Core `/rank` logic (ORE-02): rank the requested pubkeys by global PageRank.
-pub(crate) async fn rank<T: RepoTrait>(
-    repo: &T,
-    request: RankRequest,
-) -> Result<RankResponse, OpenRankingError> {
+/// Build a JSON success response that mirrors the ORE body `ttl` as an HTTP
+/// `Cache-Control` hint. Attached per successful response (never to errors), so a
+/// CDN/browser may reuse it for exactly the freshness window the body advertises
+/// — and crucially so a short-lived warming `/recommend` (ttl=10) is not pinned
+/// by a long max-age. The open-ranking group carries no blanket cache middleware
+/// precisely so each response can advertise its own TTL and errors stay uncached.
+fn cached_json<T: Serialize>(body: T, ttl: Option<u64>) -> Response {
+    let mut response = Json(body).into_response();
+    if let Some(ttl) = ttl {
+        if let Ok(value) = HeaderValue::from_str(&format!("public, max-age={ttl}")) {
+            response.headers_mut().insert(CACHE_CONTROL, value);
+        }
+    }
+    response
+}
+
+/// Records the wall-clock latency of an open-ranking handler into the
+/// per-endpoint `openranking_request_seconds` histogram when dropped, so every
+/// exit path — success, validation error, or repo error — is measured.
+struct LatencyGuard {
+    endpoint: &'static str,
+    started: std::time::Instant,
+}
+
+impl LatencyGuard {
+    fn new(endpoint: &'static str) -> Self {
+        Self {
+            endpoint,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for LatencyGuard {
+    fn drop(&mut self) {
+        crate::metrics::openranking_request_seconds(self.endpoint)
+            .record(self.started.elapsed().as_secs_f64());
+    }
+}
+
+/// Server-side TTL for the synchronous read caches. Short by design: it only has
+/// to span a burst window, and PageRank is recomputed daily, so a minute of reuse
+/// bounds staleness well under that while still collapsing the herd.
+const READ_CACHE_TTL_SECONDS: u64 = 60;
+
+/// Max distinct cached read responses per endpoint (LRU-evicted). Bounds memory
+/// for `/rank`, whose key is an arbitrary pubkey set.
+const READ_CACHE_CAPACITY: u64 = 1_000;
+
+/// Max concurrent detached read fills, shared across `/rank`, `/reputation` and
+/// `/followers`. Each [`cached_read`] runs its `try_get_with` in a spawned,
+/// uncancellable task; this bound caps how many such Neo4j reads can be in flight
+/// at once, so a burst of distinct cache-miss keys cannot spawn unbounded
+/// background queries. When the limit is saturated a read fails fast rather than
+/// piling on another query. Sized comfortably above the largest single-key
+/// thundering herd the read tests exercise so identical concurrent reads still
+/// single-flight to one query rather than being shed.
+const READ_FILL_CONCURRENCY: usize = 32;
+
+/// Short-lived per-endpoint result caches for the synchronous heavy reads
+/// (`/rank`, `/reputation`, `/followers`). Each `try_get_with` both single-flights
+/// — concurrent identical requests collapse to one Neo4j query — and reuses the
+/// result for [`READ_CACHE_TTL_SECONDS`]. Errors are never cached, so a failed or
+/// timed-out query is retried rather than replayed.
+///
+/// A single query that exceeds the 5s route timeout is handled by [`cached_read`],
+/// which runs the fill in a detached task so it survives the handler being
+/// dropped and warms the cache for the retry. It still does not *bound* a runaway
+/// query — that would need a query budget on the repo side.
+///
+/// Known limit: because these endpoints are POST, standard shared HTTP caches
+/// will not reuse them; this server-side cache is what actually collapses the
+/// herd.
+#[derive(Clone)]
+pub(crate) struct OpenRankingReadCache {
+    rank: Cache<String, RankResponse>,
+    reputation: Cache<String, ReputationResponse>,
+    followers: Cache<String, FollowersResponse>,
+    /// Shared permit pool gating the detached fills in [`cached_read`] across all
+    /// three read endpoints (see [`READ_FILL_CONCURRENCY`]).
+    read_fill_semaphore: Arc<Semaphore>,
+}
+
+impl OpenRankingReadCache {
+    pub(crate) fn new() -> Self {
+        fn build<V: Clone + Send + Sync + 'static>() -> Cache<String, V> {
+            Cache::builder()
+                .time_to_live(Duration::from_secs(READ_CACHE_TTL_SECONDS))
+                .max_capacity(READ_CACHE_CAPACITY)
+                .build()
+        }
+        Self {
+            rank: build(),
+            reputation: build(),
+            followers: build(),
+            read_fill_semaphore: Arc::new(Semaphore::new(READ_FILL_CONCURRENCY)),
+        }
+    }
+}
+
+impl Default for OpenRankingReadCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Run a cache-backed read so the cache fill outlives the request future.
+///
+/// The `try_get_with` compute runs in a detached task. If the 5s route timeout
+/// cancels the handler, that task keeps running, completes the query, and fills
+/// the cache — so the client's retry hits the warm cache instead of re-running
+/// the full query. Without detaching, the timeout drops the compute future
+/// before it can populate the cache and every retry recomputes from scratch.
+///
+/// This is the minimal background-compute mitigation for the route-timeout limit
+/// noted on [`OpenRankingReadCache`]. It does not cap how long a runaway query
+/// may run; it only ensures a query that does finish is not thrown away. A true
+/// per-query wall-clock budget can only be enforced server-side by Neo4j: the
+/// `neo4rs` 0.8 driver exposes no API to set a transaction/query timeout on an
+/// autocommit read (it cannot send `tx_timeout` metadata), and a client-side
+/// `tokio::time::timeout` would only drop the local future while the server keeps
+/// executing the query. Neo4j's `db.transaction.timeout` *is* server-side, but it
+/// is **global** — it would also abort the legitimate long-running batch jobs on
+/// the same instance (`Repo::update_pagerank`, `Repo::update_memory_graph`), so it
+/// cannot be set to a read-sized budget without breaking them. A safe per-read
+/// budget therefore needs per-transaction `tx_timeout` metadata (a `neo4rs`
+/// upgrade) or a read/write split; until then the [`READ_FILL_CONCURRENCY`] permit
+/// below is the effective bound — it caps how *many* such reads run at once, not
+/// how long each runs.
+///
+/// The cache is checked *before* any permit is acquired: a warm hit returns
+/// immediately without a permit, so a burst of cache hits can never exhaust the
+/// pool and starve genuine miss-fills. Only a cache miss — a real Neo4j read —
+/// acquires a permit from `semaphore`, so the number of in-flight detached fills
+/// (across all three read endpoints) is bounded by [`READ_FILL_CONCURRENCY`]: a
+/// burst of distinct cache-miss keys cannot launch unbounded uncancellable Neo4j
+/// reads. When no permit is available the fill sheds load with a 503
+/// ([`OpenRankingError::Overloaded`]) rather than piling another query onto an
+/// already-saturated database. The permit is moved into the spawned task and held
+/// for the whole fill, including the warm-on-timeout case where the handler future
+/// has been dropped but the task keeps running. Single-flight (`try_get_with`)
+/// still collapses concurrent misses on the same key to one Neo4j query.
+async fn cached_read<V, F>(
+    semaphore: Arc<Semaphore>,
+    cache: Cache<String, V>,
+    key: String,
+    compute: F,
+) -> Result<V, OpenRankingError>
+where
+    V: Clone + Send + Sync + 'static,
+    F: std::future::Future<Output = Result<V, OpenRankingError>> + Send + 'static,
+{
+    // Cache hit: serve without spending a fill permit.
+    if let Some(hit) = cache.get(&key).await {
+        return Ok(hit);
+    }
+
+    // Cache miss: a genuine Neo4j read — gate it on a permit.
+    let permit = match semaphore.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("open-ranking read fill rejected: concurrency limit reached");
+            return Err(OpenRankingError::Overloaded);
+        }
+    };
+    match tokio::spawn(async move {
+        let _permit = permit;
+        cache.try_get_with(key, compute).await
+    })
+    .await
+    {
+        Ok(result) => result.map_err(|err| (*err).clone()),
+        Err(join_err) => {
+            error!("open-ranking cached read task failed: {join_err}");
+            Err(OpenRankingError::Internal)
+        }
+    }
+}
+
+/// Cache key for `/reputation`: pubkey + algorithm. A missing/invalid pubkey
+/// errors before the repo call (and errors are never cached), so the empty
+/// placeholder for `None` is harmless.
+fn reputation_cache_key(request: &ReputationRequest) -> String {
+    format!(
+        "{}|{}",
+        request.pubkey.as_deref().unwrap_or(""),
+        request.algorithm.as_deref().unwrap_or("")
+    )
+}
+
+/// Cache key for `/followers`, computed from the *validated* request (see
+/// [`NormalizedFollowers`]): the canonical 64-char hex pubkey (which never
+/// contains the `|` separator), the effective limit (default applied), and the
+/// resolved algorithm id. Keying after validation means a malformed pubkey is
+/// rejected before it can read or populate the cache.
+fn followers_cache_key(normalized: &NormalizedFollowers) -> String {
+    format!(
+        "{}|{}|{}",
+        normalized.pubkey.to_hex(),
+        normalized.limit,
+        normalized.algorithm,
+    )
+}
+
+/// A validated `/rank` request: the parsed, de-duplicated pubkey set (request
+/// order preserved), the resolved algorithm id, and the *effective* limit (the
+/// `min(default_limit)` clamp `rank` applies). Both the cache key and the query
+/// derive from this single validated form, so the key can never disagree with the
+/// response it caches, and a malformed request is rejected before it can read or
+/// write the cache.
+struct NormalizedRank {
+    pubkeys: Vec<PublicKey>,
+    algorithm: &'static str,
+    limit: usize,
+}
+
+/// Validate and normalize a raw `/rank` body (ORE-01/02). The single authority
+/// for `/rank` validation: both `serve_rank` (to key + gate before the cache) and
+/// `rank` (the core compute) go through it, so the key and the response cannot
+/// drift.
+fn normalize_rank(request: &RankRequest) -> Result<NormalizedRank, OpenRankingError> {
     // ORE-01: validate the requested algorithm (defaults to the first listed).
-    resolve_algorithm(RANK_ENDPOINT, request.algorithm.as_deref())?;
+    let algorithm = resolve_algorithm(RANK_ENDPOINT, request.algorithm.as_deref())?;
 
     // ORE-02: pubkeys MUST contain at least one entry.
     if request.pubkeys.is_empty() {
@@ -289,15 +515,6 @@ pub(crate) async fn rank<T: RepoTrait>(
         }
     }
 
-    // ORE-02: the default limit is the number of requested pubkeys, and a larger
-    // limit is silently clamped to that count.
-    let default_limit = request.pubkeys.len();
-    let limit = request
-        .limit
-        .map(|limit| limit as usize)
-        .unwrap_or(default_limit)
-        .min(default_limit);
-
     // Parse and de-duplicate the pubkeys, preserving request order.
     let mut seen = HashSet::new();
     let mut pubkeys = Vec::with_capacity(request.pubkeys.len());
@@ -310,13 +527,61 @@ pub(crate) async fn rank<T: RepoTrait>(
         }
     }
 
-    let pageranks = repo.get_pageranks(&pubkeys).await.map_err(|e| {
+    // ORE-02: the default limit is the number of (distinct) requested pubkeys, and
+    // a larger limit is silently clamped to that count. Clamping to the effective
+    // value here means requests whose limits differ only *above* that bound share
+    // one cache entry instead of splitting it. The de-duplicated count is
+    // equivalent to the raw count for the response (only that many profiles exist
+    // to truncate) and keeps the key canonical.
+    let default_limit = pubkeys.len();
+    let limit = request
+        .limit
+        .map(|limit| limit as usize)
+        .unwrap_or(default_limit)
+        .min(default_limit);
+
+    Ok(NormalizedRank {
+        pubkeys,
+        algorithm: algorithm.id,
+        limit,
+    })
+}
+
+/// Cache key for `/rank`, computed from the *validated* request so distinct
+/// requests always land in distinct entries. The pubkeys are canonical 64-char
+/// hex (which never contain the `,` separator), sorted so request order does not
+/// split the cache, and joined with the resolved algorithm id and the effective
+/// limit. Because the key is built only after validation, a malformed request
+/// (e.g. a single token containing a comma) is rejected before it could collide
+/// with a multi-element set's entry — and a 64-bit hash, which the previous
+/// implementation used, could silently collide and serve one request's ranks for
+/// another's.
+fn rank_cache_key(normalized: &NormalizedRank) -> String {
+    let mut pubkeys: Vec<String> = normalized.pubkeys.iter().map(PublicKey::to_hex).collect();
+    pubkeys.sort_unstable();
+
+    format!(
+        "{}|{}|{}",
+        pubkeys.join(","),
+        normalized.algorithm,
+        normalized.limit,
+    )
+}
+
+/// Run the `/rank` query for an already-validated request (ORE-02): rank the
+/// requested pubkeys by global PageRank.
+async fn rank_with<T: RepoTrait>(
+    repo: &T,
+    normalized: NormalizedRank,
+) -> Result<RankResponse, OpenRankingError> {
+    let pageranks = repo.get_pageranks(&normalized.pubkeys).await.map_err(|e| {
         error!("/rank get_pageranks failed: {e}");
         OpenRankingError::Internal
     })?;
 
     // ORE-02: return a rank for every requested pubkey; unknown pubkeys rank 0.
-    let mut profiles: Vec<Profile> = pubkeys
+    let mut profiles: Vec<Profile> = normalized
+        .pubkeys
         .iter()
         .map(|pubkey| Profile {
             pubkey: pubkey.to_hex(),
@@ -325,7 +590,7 @@ pub(crate) async fn rank<T: RepoTrait>(
         .collect();
 
     profiles.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(Ordering::Equal));
-    profiles.truncate(limit);
+    profiles.truncate(normalized.limit);
 
     Ok(RankResponse {
         profiles,
@@ -337,18 +602,31 @@ pub(crate) async fn rank<T: RepoTrait>(
 pub(crate) async fn serve_rank<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<RankResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(RANK_ENDPOINT);
     let request: RankRequest = parse_json_body(&body)?;
-    let response = rank(state.repo.as_ref(), request).await?;
-    Ok(Json(response))
+    // Validate first, then key: a malformed request errors here, before it can
+    // read or populate the cache, and the key derives from the canonical form.
+    let normalized = normalize_rank(&request)?;
+    let key = rank_cache_key(&normalized);
+    let repo = state.repo.clone();
+    let response = cached_read(
+        state.open_ranking_read_cache.read_fill_semaphore.clone(),
+        state.open_ranking_read_cache.rank.clone(),
+        key,
+        async move { rank_with(repo.as_ref(), normalized).await },
+    )
+    .await?;
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 /// An ORE-06 `stats` object: non-negative integer counts from our index.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReputationStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub followers: Option<u64>,
@@ -357,7 +635,7 @@ pub(crate) struct ReputationStats {
 }
 
 /// Provider-specific `x` extensions for `/reputation` (ORE-06).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReputationExtensions {
     /// Our boolean trust verdict (PageRank-based; see `AccountInfo::is_trusted`).
     pub trusted: bool,
@@ -365,7 +643,7 @@ pub(crate) struct ReputationExtensions {
 
 /// Response body for `POST /reputation` (ORE-06). `pubkey` and `rank` are
 /// always present; the rest are omitted when we have no data.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ReputationResponse {
     pub pubkey: String,
     pub rank: f64,
@@ -443,18 +721,28 @@ pub(crate) async fn reputation<T: RepoTrait>(
 pub(crate) async fn serve_reputation<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<ReputationResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(REPUTATION_ENDPOINT);
     let request: ReputationRequest = parse_json_body(&body)?;
-    let response = reputation(state.repo.as_ref(), request).await?;
-    Ok(Json(response))
+    let key = reputation_cache_key(&request);
+    let repo = state.repo.clone();
+    let response = cached_read(
+        state.open_ranking_read_cache.read_fill_semaphore.clone(),
+        state.open_ranking_read_cache.reputation.clone(),
+        key,
+        async move { reputation(repo.as_ref(), request).await },
+    )
+    .await?;
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 /// Response body for `POST /followers` (ORE-04).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct FollowersResponse {
     pub profiles: Vec<Profile>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -492,19 +780,45 @@ fn resolve_limit(
     }
 }
 
-/// Core `/followers` logic (ORE-04): a pubkey's top followers by PageRank.
-pub(crate) async fn followers<T: RepoTrait>(
-    repo: &T,
-    request: FollowersRequest,
-) -> Result<FollowersResponse, OpenRankingError> {
-    resolve_algorithm(FOLLOWERS_ENDPOINT, request.algorithm.as_deref())?;
+/// A validated `/followers` request: the parsed canonical pubkey, the resolved
+/// algorithm id, and the effective limit (default applied). Both the cache key
+/// and the query derive from this single validated form (mirroring
+/// [`NormalizedRank`]).
+struct NormalizedFollowers {
+    pubkey: PublicKey,
+    algorithm: &'static str,
+    limit: usize,
+}
+
+/// Validate and normalize a raw `/followers` body (ORE-01/04). The single
+/// authority for `/followers` validation, shared by `serve_followers` (to key +
+/// gate before the cache) and `followers` (the core compute).
+fn normalize_followers(
+    request: &FollowersRequest,
+) -> Result<NormalizedFollowers, OpenRankingError> {
+    let algorithm = resolve_algorithm(FOLLOWERS_ENDPOINT, request.algorithm.as_deref())?;
     let pubkey = parse_required_pubkey(request.pubkey.as_deref())?;
     let limit = resolve_limit(request.limit, DEFAULT_LIMIT, MAX_LIMIT)?;
+    Ok(NormalizedFollowers {
+        pubkey,
+        algorithm: algorithm.id,
+        limit,
+    })
+}
 
-    let (top_followers, total) = repo.get_top_followers(&pubkey, limit).await.map_err(|e| {
-        error!("/followers get_top_followers failed: {e}");
-        OpenRankingError::Internal
-    })?;
+/// Run the `/followers` query for an already-validated request (ORE-04): a
+/// pubkey's top followers by PageRank.
+async fn followers_with<T: RepoTrait>(
+    repo: &T,
+    normalized: NormalizedFollowers,
+) -> Result<FollowersResponse, OpenRankingError> {
+    let (top_followers, total) = repo
+        .get_top_followers(&normalized.pubkey, normalized.limit)
+        .await
+        .map_err(|e| {
+            error!("/followers get_top_followers failed: {e}");
+            OpenRankingError::Internal
+        })?;
 
     let profiles = top_followers
         .into_iter()
@@ -525,14 +839,27 @@ pub(crate) async fn followers<T: RepoTrait>(
 pub(crate) async fn serve_followers<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<FollowersResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(FOLLOWERS_ENDPOINT);
     let request: FollowersRequest = parse_json_body(&body)?;
-    let response = followers(state.repo.as_ref(), request).await?;
-    Ok(Json(response))
+    // Validate first, then key: a malformed request errors here, before it can
+    // read or populate the cache, and the key derives from the canonical form.
+    let normalized = normalize_followers(&request)?;
+    let key = followers_cache_key(&normalized);
+    let repo = state.repo.clone();
+    let response = cached_read(
+        state.open_ranking_read_cache.read_fill_semaphore.clone(),
+        state.open_ranking_read_cache.followers.clone(),
+        key,
+        async move { followers_with(repo.as_ref(), normalized).await },
+    )
+    .await?;
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 /// Request body for `POST /recommend` (ORE-03). Unknown fields (e.g. `topic`,
@@ -616,7 +943,11 @@ pub(crate) async fn recommend<T: RepoTrait>(
             // other in-flight states so the client retries per the
             // retry-after-ttl contract instead of receiving a sustained 500.
             error!("/recommend background computation failed, will retry: {reason}");
-            crate::metrics::recommend_cold_miss().increment(1);
+            // Count as a failure, not a warming cold-miss, so the two are not
+            // conflated. (The worker already counts the failure when it occurs;
+            // request_recommendations self-heals a cached Failed into a re-enqueue,
+            // so this branch is rarely reached.)
+            crate::metrics::recommend_failed().increment(1);
             (Vec::new(), RECOMMEND_WARMING_TTL_SECONDS)
         }
     };
@@ -639,14 +970,16 @@ pub(crate) async fn recommend<T: RepoTrait>(
 pub(crate) async fn serve_recommend<T, U>(
     State(state): State<Arc<AppState<T, U>>>,
     body: Bytes,
-) -> Result<Json<RankResponse>, OpenRankingError>
+) -> Result<Response, OpenRankingError>
 where
     T: RepoTrait,
     U: GetEventsOf,
 {
+    let _latency = LatencyGuard::new(RECOMMEND_ENDPOINT);
     let request: RecommendRequest = parse_json_body(&body)?;
     let response = recommend(state.recommendation_queue.as_ref(), request).await?;
-    Ok(Json(response))
+    let ttl = response.ttl;
+    Ok(cached_json(response, ttl))
 }
 
 #[cfg(test)]
@@ -673,7 +1006,12 @@ mod tests {
     fn recommendation_queue(repo: MockRepo) -> RecommendationQueue<MockRepo> {
         let result_cache = moka::future::Cache::builder().build();
         let (queue, receiver) = RecommendationQueue::new(Arc::new(repo), result_cache, 16);
-        queue.start_worker(TaskTracker::new(), receiver, CancellationToken::new());
+        queue.start_workers(
+            TaskTracker::new(),
+            receiver,
+            CancellationToken::new(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        );
         queue
     }
 
@@ -730,10 +1068,19 @@ mod tests {
         recommendations: HashMap<PublicKey, Vec<Recommendation>>,
         /// Counts calls to `get_recommendations`, to assert cache reuse.
         recommendation_calls: Arc<AtomicUsize>,
+        /// Counts calls to the synchronous heavy reads, to assert the
+        /// single-flight + result cache collapses identical concurrent/repeat
+        /// requests into one Neo4j query.
+        pagerank_calls: Arc<AtomicUsize>,
+        account_calls: Arc<AtomicUsize>,
+        top_followers_calls: Arc<AtomicUsize>,
         /// Number of leading `get_recommendations` calls that fail transiently
         /// before recovering, to exercise the queue's self-healing Failed path.
         recommendation_failures: Arc<AtomicUsize>,
         fail: bool,
+        /// Artificial latency for the synchronous heavy reads, so a test can model
+        /// a query that outlives the route timeout. Zero (the default) is a no-op.
+        query_delay: Duration,
     }
 
     impl RepoTrait for MockRepo {
@@ -741,6 +1088,7 @@ mod tests {
             &self,
             pubkeys: &[PublicKey],
         ) -> Result<HashMap<PublicKey, f64>, RepoError> {
+            self.pagerank_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
             }
@@ -754,8 +1102,12 @@ mod tests {
             &self,
             pubkey: &PublicKey,
         ) -> Result<Option<AccountInfo>, RepoError> {
+            self.account_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
+            }
+            if !self.query_delay.is_zero() {
+                tokio::time::sleep(self.query_delay).await;
             }
             Ok(self.accounts.get(pubkey).cloned())
         }
@@ -765,6 +1117,7 @@ mod tests {
             pubkey: &PublicKey,
             limit: usize,
         ) -> Result<TopFollowers, RepoError> {
+            self.top_followers_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(RepoError::InvalidParameter("boom".into()));
             }
@@ -810,6 +1163,25 @@ mod tests {
             algorithm: None,
             limit,
         }
+    }
+
+    /// Validate and run `/rank` in one call, exercising the same
+    /// `normalize_rank` then `rank_with` path the handler uses. (The handler keys
+    /// between the two steps; tests that only assert on the response use this
+    /// shorthand.)
+    async fn rank<T: RepoTrait>(
+        repo: &T,
+        request: RankRequest,
+    ) -> Result<RankResponse, OpenRankingError> {
+        rank_with(repo, normalize_rank(&request)?).await
+    }
+
+    /// Validate + run `/followers` in one call (see `rank`).
+    async fn followers<T: RepoTrait>(
+        repo: &T,
+        request: FollowersRequest,
+    ) -> Result<FollowersResponse, OpenRankingError> {
+        followers_with(repo, normalize_followers(&request)?).await
     }
 
     // ---- capability document (ORE-01) ----
@@ -880,6 +1252,10 @@ mod tests {
         assert_eq!(
             OpenRankingError::unprocessable("x").status(),
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            OpenRankingError::Overloaded.status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
@@ -997,6 +1373,168 @@ mod tests {
             .await
             .expect_err("repo failure surfaces");
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- /rank cache key (validated, canonical, collision-safe) ----
+
+    #[test]
+    fn rank_cache_key_is_canonical_sorted_deduplicated_and_clamped() {
+        // The key is built from the validated request: canonical hex pubkeys,
+        // sorted and de-duplicated, plus the resolved algorithm and the effective
+        // (clamped) limit. Here limit 5 clamps to the 2 distinct pubkeys.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let normalized = normalize_rank(&RankRequest {
+            pubkeys: vec![b.to_hex(), a.to_hex(), b.to_hex()],
+            algorithm: Some("pagerank".into()),
+            limit: Some(5),
+        })
+        .expect("a well-formed request normalizes");
+
+        let mut hexes = [a.to_hex(), b.to_hex()];
+        hexes.sort();
+        assert_eq!(
+            rank_cache_key(&normalized),
+            format!("{}|pagerank|2", hexes.join(","))
+        );
+    }
+
+    #[test]
+    fn rank_cache_key_fills_absent_algorithm_and_limit_with_resolved_defaults() {
+        // Absent optionals are normalized before keying: the algorithm resolves
+        // to the endpoint default and the limit to the distinct pubkey count —
+        // canonical values, never empty fields.
+        let a = fresh_pubkey();
+        let normalized = normalize_rank(&RankRequest {
+            pubkeys: vec![a.to_hex()],
+            algorithm: None,
+            limit: None,
+        })
+        .expect("a well-formed request normalizes");
+
+        assert_eq!(
+            rank_cache_key(&normalized),
+            format!("{}|pagerank|1", a.to_hex())
+        );
+    }
+
+    #[test]
+    fn rank_cache_key_distinguishes_a_different_set_or_effective_limit() {
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let c = fresh_pubkey();
+
+        let key = rank_cache_key(&normalize_rank(&rank_request(&[a, b], None)).unwrap());
+
+        // A different pubkey set must change the key.
+        assert_ne!(
+            rank_cache_key(&normalize_rank(&rank_request(&[a, c], None)).unwrap()),
+            key,
+            "a different pubkey set must change the key"
+        );
+
+        // A different *effective* limit must change the key: [a,b,c] with limit 2
+        // clamps to 2, while the default clamps to 3.
+        assert_ne!(
+            rank_cache_key(&normalize_rank(&rank_request(&[a, b, c], Some(2))).unwrap()),
+            rank_cache_key(&normalize_rank(&rank_request(&[a, b, c], None)).unwrap()),
+            "a different effective limit must change the key"
+        );
+    }
+
+    #[test]
+    fn rank_cache_key_clamps_so_oversized_limits_share_one_entry() {
+        // Two requests for the same set whose limits both exceed the effective
+        // bound must share a single cache entry, not split into redundant ones.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let five = rank_cache_key(&normalize_rank(&rank_request(&[a, b], Some(5))).unwrap());
+        let hundred = rank_cache_key(&normalize_rank(&rank_request(&[a, b], Some(100))).unwrap());
+        let default = rank_cache_key(&normalize_rank(&rank_request(&[a, b], None)).unwrap());
+
+        assert_eq!(
+            five, hundred,
+            "limits above the effective bound share one key"
+        );
+        assert_eq!(five, default, "the default limit equals the clamped limit");
+    }
+
+    #[test]
+    fn rank_normalization_rejects_a_comma_spliced_token() {
+        // A single token that splices two valid hex keys with the `,` separator is
+        // the exact shape a raw comma-join could let collide with the valid
+        // two-element set. Validating first rejects it, so it never reaches the
+        // cache to collide.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let spliced = format!("{},{}", a.to_hex(), b.to_hex());
+        let malformed = RankRequest {
+            pubkeys: vec![spliced],
+            algorithm: None,
+            limit: None,
+        };
+        assert!(
+            normalize_rank(&malformed).is_err(),
+            "a comma-spliced token is not a valid pubkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_comma_request_is_not_served_a_cached_rank_response() {
+        // End-to-end: a valid two-element request warms the cache; a malformed
+        // request whose single token splices the same two hexes with a comma must
+        // be rejected, never served the cached valid response.
+        let a = fresh_pubkey();
+        let b = fresh_pubkey();
+        let repo = MockRepo {
+            pageranks: HashMap::from([(a, 0.9), (b, 0.1)]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let valid_body = json_body(&serde_json::json!({ "pubkeys": [a.to_hex(), b.to_hex()] }));
+        serve_rank(State(state.clone()), valid_body)
+            .await
+            .expect("the valid two-element request succeeds");
+
+        let spliced = format!("{},{}", a.to_hex(), b.to_hex());
+        let malformed_body = json_body(&serde_json::json!({ "pubkeys": [spliced] }));
+        let error = serve_rank(State(state), malformed_body)
+            .await
+            .expect_err("the malformed comma request must be rejected, not served from cache");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn followers_cache_key_is_canonical_and_uses_the_effective_limit() {
+        // Absent limit normalizes to DEFAULT_LIMIT and absent algorithm to the
+        // resolved default before keying — canonical, not empty fields — on a
+        // canonical hex pubkey.
+        let p = fresh_pubkey();
+        let normalized = normalize_followers(&FollowersRequest {
+            pubkey: Some(p.to_hex()),
+            algorithm: None,
+            limit: None,
+        })
+        .expect("a well-formed request normalizes");
+
+        assert_eq!(
+            followers_cache_key(&normalized),
+            format!("{}|{}|pagerank", p.to_hex(), DEFAULT_LIMIT)
+        );
+    }
+
+    #[test]
+    fn followers_normalization_rejects_a_malformed_pubkey() {
+        let normalized = normalize_followers(&FollowersRequest {
+            pubkey: Some("not-a-pubkey".into()),
+            algorithm: None,
+            limit: None,
+        });
+        assert!(
+            normalized.is_err(),
+            "a malformed pubkey is rejected before it can be keyed or cached"
+        );
     }
 
     // ---- /reputation (ORE-06) ----
@@ -1495,6 +2033,569 @@ mod tests {
             calls.load(Ordering::Relaxed),
             1,
             "the heavy query ran once; repeats hit the shared result cache"
+        );
+    }
+
+    // ---- Cache-Control header: ORE body `ttl` mirrored as an HTTP cache hint ----
+
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::header::CACHE_CONTROL;
+    use axum::response::IntoResponse;
+
+    /// Minimal nostr client: the open-ranking handlers never call it, so an empty
+    /// stub is enough to satisfy `AppState`'s `GetEventsOf` bound.
+    #[derive(Default)]
+    struct StubNostrClient;
+
+    #[async_trait::async_trait]
+    impl GetEventsOf for StubNostrClient {
+        async fn get_events_of(
+            &self,
+            _filters: Vec<nostr_sdk::Filter>,
+            _timeout: Option<std::time::Duration>,
+        ) -> Result<Vec<nostr_sdk::Event>, nostr_sdk::client::Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn app_state(
+        repo: MockRepo,
+        queue: RecommendationQueue<MockRepo>,
+    ) -> Arc<AppState<MockRepo, StubNostrClient>> {
+        Arc::new(AppState::new(
+            Arc::new(repo),
+            Arc::new(StubNostrClient),
+            Arc::new(queue),
+        ))
+    }
+
+    fn idle_queue() -> RecommendationQueue<MockRepo> {
+        recommendation_queue(MockRepo::default())
+    }
+
+    fn cache_control(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get(CACHE_CONTROL)
+            .map(|value| value.to_str().expect("ascii header").to_string())
+    }
+
+    fn json_body<T: Serialize>(value: &T) -> Bytes {
+        Bytes::from(serde_json::to_vec(value).expect("request serializes"))
+    }
+
+    #[tokio::test]
+    async fn rank_response_carries_cache_control_matching_its_ttl() {
+        let pubkey = fresh_pubkey();
+        let repo = MockRepo {
+            pageranks: HashMap::from([(pubkey, 0.9)]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let response = serve_rank(
+            State(state),
+            json_body(&serde_json::json!({ "pubkeys": [pubkey.to_hex()] })),
+        )
+        .await
+        .expect("rank succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600"),
+            "/rank advertises ttl=3600 in the body; the HTTP cache hint must mirror it"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_response_carries_cache_control_matching_its_ttl() {
+        let pubkey = fresh_pubkey();
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 100, 20))]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let response = serve_reputation(
+            State(state),
+            json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() })),
+        )
+        .await
+        .expect("reputation succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600")
+        );
+    }
+
+    #[tokio::test]
+    async fn followers_response_carries_cache_control_matching_its_ttl() {
+        let target = fresh_pubkey();
+        let repo = MockRepo {
+            top_followers: HashMap::from([(target, vec![(fresh_pubkey(), 0.7)])]),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+
+        let response = serve_followers(
+            State(state),
+            json_body(&serde_json::json!({ "pubkey": target.to_hex() })),
+        )
+        .await
+        .expect("followers succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600")
+        );
+    }
+
+    #[tokio::test]
+    async fn recommend_warming_response_carries_the_short_warming_cache_control() {
+        // A cold /recommend returns the warming response (empty + short ttl). The
+        // HTTP cache hint must mirror that SHORT ttl so a CDN/browser does not pin
+        // the empty result and starve the client of the warmed result.
+        let pov = fresh_pubkey();
+        let repo = MockRepo {
+            recommendations: HashMap::from([(pov, vec![recommendation(fresh_pubkey(), 0.8)])]),
+            ..Default::default()
+        };
+        let state = app_state(MockRepo::default(), recommendation_queue(repo));
+
+        let response = serve_recommend(
+            State(state),
+            json_body(&serde_json::json!({ "pov": pov.to_hex() })),
+        )
+        .await
+        .expect("recommend succeeds")
+        .into_response();
+
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=10"),
+            "the warming response must carry the short warming ttl, not the 3600 hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_document_carries_cache_control() {
+        let response = serve_capability_document().await.into_response();
+        assert_eq!(
+            cache_control(&response).as_deref(),
+            Some("public, max-age=3600"),
+            "the discovery document is cacheable like the endpoints it advertises"
+        );
+    }
+
+    #[test]
+    fn open_ranking_errors_are_not_cacheable() {
+        // Errors must never carry a long-lived cache hint (regression guard for the
+        // decision to attach Cache-Control per successful response, not via a blunt
+        // group-wide middleware that would also cache 4xx/5xx).
+        let response = OpenRankingError::unprocessable("nope").into_response();
+        assert!(
+            cache_control(&response).is_none(),
+            "error responses must not carry a Cache-Control header"
+        );
+    }
+
+    // ---- single-flight + short result cache for the synchronous heavy reads ----
+
+    use tokio::sync::Barrier;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_identical_reputation_requests_hit_the_repo_once() {
+        // A thundering herd of identical /reputation requests must collapse to a
+        // single Neo4j query (single-flight), not one query per request.
+        const BURST: usize = 16;
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 10, 2))]),
+            account_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() }));
+
+        let barrier = Arc::new(Barrier::new(BURST));
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let state = state.clone();
+            let body = body.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                serve_reputation(State(state), body)
+                    .await
+                    .expect("reputation succeeds");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("request task completes");
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "identical concurrent /reputation reads must single-flight to one query"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_reputation_request_is_served_from_cache() {
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 10, 2))]),
+            account_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() }));
+
+        serve_reputation(State(state.clone()), body.clone())
+            .await
+            .expect("first reputation succeeds");
+        serve_reputation(State(state), body)
+            .await
+            .expect("second reputation succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the repeated identical request must be served from the result cache"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_dropped_by_the_route_timeout_still_warms_the_cache() {
+        // A single heavy read that runs past the 5s route timeout used to lose its
+        // work: the timeout drops the handler future, which dropped the cache-fill
+        // future, so the result was never cached and every retry re-ran the full
+        // query. The fill now runs in a detached task that outlives the handler,
+        // so the query completes once in the background and the retry is served
+        // from the warm cache.
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            accounts: HashMap::from([(pubkey, account(pubkey, 0.5, 10, 2))]),
+            account_calls: calls.clone(),
+            query_delay: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": pubkey.to_hex() }));
+
+        // Model the route timeout: give up on the slow first read well before its
+        // 150ms query can return, dropping the handler future.
+        let first = serve_reputation(State(state.clone()), body.clone());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), first)
+                .await
+                .is_err(),
+            "the slow first read is dropped before it returns (route timeout)"
+        );
+
+        // Let the detached cache fill finish in the background, then retry.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        serve_reputation(State(state), body)
+            .await
+            .expect("the retry succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the detached fill must warm the cache so the retry does not recompute"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_fails_fast_when_the_fill_concurrency_limit_is_saturated() {
+        // With every fill permit already held, an additional *miss* must shed load
+        // (fail fast with a 503) rather than spawn another uncancellable Neo4j
+        // query. The empty cache below forces the miss path that acquires a permit.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+
+        // Saturate the single permit so none is free for the fill below.
+        let _held = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("the only permit is free");
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_fill = ran.clone();
+        let result = cached_read(semaphore.clone(), cache, "k".to_string(), async move {
+            ran_in_fill.fetch_add(1, Ordering::SeqCst);
+            Ok::<i32, OpenRankingError>(42)
+        })
+        .await;
+
+        assert!(
+            matches!(result, Err(OpenRankingError::Overloaded)),
+            "a saturated read-fill limit must shed load with a 503 (Overloaded)"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "no Neo4j read may be spawned when the limit is saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_serves_a_cache_hit_without_a_permit() {
+        // A warm cache entry must be returned without acquiring a fill permit, so
+        // a burst of cache hits can never exhaust the pool and starve genuine
+        // Neo4j miss-fills. The permit gates fills, not reads served from cache.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+        cache.insert("k".to_string(), 99).await;
+
+        // Hold the only permit so any attempt to acquire one below would fail.
+        let _held = semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("the only permit is free");
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_fill = ran.clone();
+        let result = cached_read(semaphore.clone(), cache, "k".to_string(), async move {
+            ran_in_fill.fetch_add(1, Ordering::SeqCst);
+            Ok::<i32, OpenRankingError>(-1)
+        })
+        .await;
+
+        assert_eq!(
+            result.expect("a cache hit is served without a permit"),
+            99,
+            "the warm cached value must be returned"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a cache hit must not run (or spawn) the fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_read_runs_the_fill_when_a_permit_is_available() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+        let result = cached_read(semaphore, cache, "k".to_string(), async move {
+            Ok::<i32, OpenRankingError>(7)
+        })
+        .await;
+        assert_eq!(result.expect("permit available, fill runs"), 7);
+    }
+
+    #[tokio::test]
+    async fn cached_read_releases_the_permit_after_each_fill() {
+        // The permit is moved into the detached task, so it must be returned when
+        // the fill completes (including the warm-on-timeout detach) — otherwise the
+        // pool would leak a permit per request and eventually wedge.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let cache: moka::future::Cache<String, i32> = moka::future::Cache::builder().build();
+        for key in ["a", "b", "c"] {
+            cached_read(
+                semaphore.clone(),
+                cache.clone(),
+                key.to_string(),
+                async move { Ok::<i32, OpenRankingError>(1) },
+            )
+            .await
+            .expect("each sequential fill reuses the freed permit");
+        }
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the permit must be returned after each fill completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_followers_request_is_served_from_cache() {
+        let target = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            top_followers: HashMap::from([(target, vec![(fresh_pubkey(), 0.7)])]),
+            top_followers_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": target.to_hex() }));
+
+        serve_followers(State(state.clone()), body.clone())
+            .await
+            .expect("first followers succeeds");
+        serve_followers(State(state), body)
+            .await
+            .expect("second followers succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second request hits the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_rank_request_is_served_from_cache() {
+        let pubkey = fresh_pubkey();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            pageranks: HashMap::from([(pubkey, 0.9)]),
+            pagerank_calls: calls.clone(),
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkeys": [pubkey.to_hex()] }));
+
+        serve_rank(State(state.clone()), body.clone())
+            .await
+            .expect("first rank succeeds");
+        serve_rank(State(state), body)
+            .await
+            .expect("second rank succeeds");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second request hits the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn reputation_repo_errors_are_not_cached() {
+        // A failed query must not poison the cache: try_get_with never caches the
+        // error, so the next request retries the repo instead of replaying a 500.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = MockRepo {
+            account_calls: calls.clone(),
+            fail: true,
+            ..Default::default()
+        };
+        let state = app_state(repo, idle_queue());
+        let body = json_body(&serde_json::json!({ "pubkey": fresh_pubkey().to_hex() }));
+
+        let first = serve_reputation(State(state.clone()), body.clone()).await;
+        let second = serve_reputation(State(state), body).await;
+
+        assert!(first.is_err(), "a repo failure surfaces as an error");
+        assert!(
+            second.is_err(),
+            "the retry also errors (nothing was cached)"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "each request retried the repo; the failure was not cached"
+        );
+    }
+
+    // ---- observability metrics ----
+
+    #[test]
+    fn queue_depth_gauge_reflects_the_pending_count() {
+        let rendered = render_metrics_for(|| async move {
+            // No worker: nothing drains, so the gauge equals the number enqueued.
+            let result_cache = Cache::builder().build();
+            let (queue, _receiver) =
+                RecommendationQueue::new(Arc::new(MockRepo::default()), result_cache, 4096);
+            for _ in 0..3 {
+                queue
+                    .request_recommendations(fresh_pubkey(), None, Some(10))
+                    .await
+                    .expect("request accepted");
+            }
+        });
+        assert!(
+            rendered.contains("recommendation_queue_depth 3"),
+            "the queue-depth gauge must track the pending count:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn saturated_queue_emits_the_queue_full_counter() {
+        let rendered = render_metrics_for(|| async move {
+            // No worker: enqueue past max_queue_size (50) to force QueueFull.
+            let result_cache = Cache::builder().build();
+            let (queue, _receiver) =
+                RecommendationQueue::new(Arc::new(MockRepo::default()), result_cache, 4096);
+            for _ in 0..60 {
+                queue
+                    .request_recommendations(fresh_pubkey(), None, Some(10))
+                    .await
+                    .expect("request accepted");
+            }
+        });
+        assert!(
+            rendered.contains("recommend_queue_full"),
+            "shedding on a full queue must bump recommend_queue_full:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn worker_compute_failure_emits_recommend_failed() {
+        let pov = fresh_pubkey();
+        let rendered = render_metrics_for(|| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let repo = MockRepo {
+                recommendation_calls: calls.clone(),
+                // get_recommendations errors, so the background warm-up fails.
+                fail: true,
+                ..Default::default()
+            };
+            let queue = recommendation_queue(repo);
+            recommend(&queue, recommend_request(Some(&pov.to_hex()), None))
+                .await
+                .expect("the warming response is returned even while failing");
+            // Wait for the worker to attempt and fail the compute, then let its
+            // error branch (metric + status write) finish.
+            for _ in 0..1000 {
+                if calls.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        });
+        assert!(
+            rendered.contains("recommend_failed"),
+            "a failed background warm-up must bump recommend_failed:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn rank_records_the_per_endpoint_latency_histogram() {
+        let rendered = render_metrics_for(|| async move {
+            let pubkey = fresh_pubkey();
+            let repo = MockRepo {
+                pageranks: HashMap::from([(pubkey, 0.9)]),
+                ..Default::default()
+            };
+            let state = app_state(repo, idle_queue());
+            serve_rank(
+                State(state),
+                json_body(&serde_json::json!({ "pubkeys": [pubkey.to_hex()] })),
+            )
+            .await
+            .expect("rank succeeds");
+        });
+        assert!(
+            rendered.contains("openranking_request_seconds"),
+            "the endpoint must record a latency histogram:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint=\"/rank\""),
+            "the latency histogram must be labelled by endpoint:\n{rendered}"
         );
     }
 }

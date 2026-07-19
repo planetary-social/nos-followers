@@ -77,6 +77,26 @@ pub fn recommend_warm_seconds() -> Histogram {
     metrics::histogram!("recommend_warm_seconds")
 }
 
+pub fn recommendation_queue_depth() -> Gauge {
+    metrics::gauge!("recommendation_queue_depth")
+}
+
+pub fn relay_subscription_up() -> Gauge {
+    metrics::gauge!("relay_subscription_up")
+}
+
+pub fn recommend_queue_full() -> Counter {
+    metrics::counter!("recommend_queue_full")
+}
+
+pub fn recommend_failed() -> Counter {
+    metrics::counter!("recommend_failed")
+}
+
+pub fn openranking_request_seconds(endpoint: &'static str) -> Histogram {
+    metrics::histogram!("openranking_request_seconds", "endpoint" => endpoint)
+}
+
 pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
     describe_counter!(
         "pubsub_messages",
@@ -134,6 +154,26 @@ pub fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
     describe_histogram!(
         "recommend_warm_seconds",
         "Seconds a background recommendation warm-up compute takes"
+    );
+    describe_gauge!(
+        "recommendation_queue_depth",
+        "Number of recommendation warm-ups currently queued"
+    );
+    describe_gauge!(
+        "relay_subscription_up",
+        "1 while the nostr relay subscription is connected and pumping events, 0 while it is down or retrying"
+    );
+    describe_counter!(
+        "recommend_queue_full",
+        "Number of /recommend requests shed because the warm-up queue was full"
+    );
+    describe_counter!(
+        "recommend_failed",
+        "Number of background recommendation warm-up computes that failed"
+    );
+    describe_histogram!(
+        "openranking_request_seconds",
+        "Latency of OpenRanking endpoint handlers, labelled by endpoint"
     );
 
     let prometheus_builder = PrometheusBuilder::new();
